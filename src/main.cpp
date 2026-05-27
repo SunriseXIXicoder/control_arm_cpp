@@ -1,0 +1,442 @@
+#include "control_arm/density.hpp"
+#include "control_arm/geometry.hpp"
+#include "control_arm/petsc_utils.hpp"
+#include "control_arm/vtk.hpp"
+
+#include <petscksp.h>
+
+using namespace control_arm;
+
+static char help[] =
+    "C++/PETSc control-arm topology-optimization migration driver.\n"
+    "\n"
+    "This first C++ stage provides a distributed geometry/density Vec path and\n"
+    "a low_order PETSc solve for WSL/Slurm validation.  The true H8\n"
+    "matrix-free FEM, ANN material model, and MMA optimizer are explicit next\n"
+    "stage interfaces and are not silently approximated here.\n"
+    "\n"
+    "Main options:\n"
+    "  -mode geometry|solve\n"
+    "  -nx -ny -nz\n"
+    "  -operator low_order|h8_matrix_free\n"
+    "  -output_prefix <path>\n"
+    "  -control_arm_mask true|false\n"
+    "  -write_solid_vtk true|false\n"
+    "  -write_structured_vtk true|false\n"
+    "  -write_density_binary true|false\n";
+
+namespace {
+
+PetscErrorCode assemble_low_order_matrix(const Grid &grid,
+                                         const DensityOptions &density_options,
+                                         Mat *A) {
+  PetscInt ndof = dof_count(grid);
+  const PetscInt nxy = grid.nx * grid.ny;
+  PetscInt local_rows = PETSC_DECIDE;
+  PetscInt rstart = 0;
+  PetscInt rend = 0;
+  PetscInt *d_nnz = nullptr;
+  PetscInt *o_nnz = nullptr;
+
+  PetscCall(PetscSplitOwnership(PETSC_COMM_WORLD, &local_rows, &ndof));
+  {
+    PetscInt scan_end = 0;
+    PetscCallMPI(MPI_Scan(&local_rows, &scan_end, 1, MPIU_INT, MPI_SUM,
+                          PETSC_COMM_WORLD));
+    rstart = scan_end - local_rows;
+    rend = scan_end;
+  }
+
+  PetscCall(PetscMalloc2(local_rows, &d_nnz, local_rows, &o_nnz));
+  for (PetscInt row = rstart; row < rend; ++row) {
+    const PetscInt local = row - rstart;
+    const PetscInt c = row % 3;
+    const PetscInt node = row / 3;
+    const PetscInt k = node / nxy;
+    const PetscInt rem = node - k * nxy;
+    const PetscInt j = rem / grid.nx;
+    const PetscInt i = rem - j * grid.nx;
+    const PetscInt di[6] = {-1, 1, 0, 0, 0, 0};
+    const PetscInt dj[6] = {0, 0, -1, 1, 0, 0};
+    const PetscInt dk[6] = {0, 0, 0, 0, -1, 1};
+
+    d_nnz[local] = 0;
+    o_nnz[local] = 0;
+    count_prealloc_column(row, rstart, rend, &d_nnz[local], &o_nnz[local]);
+    if (i == 0) {
+      continue;
+    }
+
+    for (PetscInt q = 0; q < 6; ++q) {
+      const PetscInt ii = i + di[q];
+      const PetscInt jj = j + dj[q];
+      const PetscInt kk = k + dk[q];
+      if (ii >= 0 && ii < grid.nx && jj >= 0 && jj < grid.ny && kk >= 0 &&
+          kk < grid.nz && ii != 0) {
+        const PetscInt col = global_dof(ii, jj, kk, c, grid);
+        count_prealloc_column(col, rstart, rend, &d_nnz[local], &o_nnz[local]);
+      }
+    }
+  }
+
+  PetscCall(MatCreateAIJ(PETSC_COMM_WORLD, local_rows, local_rows, ndof, ndof,
+                         0, d_nnz, 0, o_nnz, A));
+  PetscCall(PetscFree2(d_nnz, o_nnz));
+  PetscCall(MatSetOption(*A, MAT_SYMMETRIC, PETSC_TRUE));
+  PetscCall(MatSetOption(*A, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE));
+
+  const PetscReal hx = 1.0 / static_cast<PetscReal>(grid.nx - 1);
+  const PetscReal hy = 1.0 / static_cast<PetscReal>(grid.ny - 1);
+  const PetscReal hz = 1.0 / static_cast<PetscReal>(grid.nz - 1);
+  const PetscReal kx = 1.0 / (hx * hx);
+  const PetscReal ky = 1.0 / (hy * hy);
+  const PetscReal kz = 1.0 / (hz * hz);
+
+  for (PetscInt row = rstart; row < rend; ++row) {
+    const PetscInt c = row % 3;
+    const PetscInt node = row / 3;
+    const PetscInt k = node / nxy;
+    const PetscInt rem = node - k * nxy;
+    const PetscInt j = rem / grid.nx;
+    const PetscInt i = rem - j * grid.nx;
+    PetscInt cols[7];
+    PetscScalar vals[7];
+    PetscInt ncols = 0;
+
+    if (i == 0) {
+      cols[0] = row;
+      vals[0] = 1.0;
+      PetscCall(MatSetValues(*A, 1, &row, 1, cols, vals, INSERT_VALUES));
+    } else {
+      const PetscReal rho0 = node_density(i, j, k, grid, density_options);
+      PetscReal diag = 0.0;
+      const PetscInt di[6] = {-1, 1, 0, 0, 0, 0};
+      const PetscInt dj[6] = {0, 0, -1, 1, 0, 0};
+      const PetscInt dk[6] = {0, 0, 0, 0, -1, 1};
+      const PetscReal weight[6] = {kx, kx, ky, ky, kz, kz};
+
+      for (PetscInt q = 0; q < 6; ++q) {
+        const PetscInt ii = i + di[q];
+        const PetscInt jj = j + dj[q];
+        const PetscInt kk = k + dk[q];
+        if (ii >= 0 && ii < grid.nx && jj >= 0 && jj < grid.ny && kk >= 0 &&
+            kk < grid.nz) {
+          const PetscReal rho1 = node_density(ii, jj, kk, grid, density_options);
+          const PetscReal kij = weight[q] * edge_stiffness(rho0, rho1,
+                                                           density_options);
+          diag += kij;
+          if (ii != 0) {
+            cols[ncols] = global_dof(ii, jj, kk, c, grid);
+            vals[ncols] = -kij;
+            ++ncols;
+          }
+        }
+      }
+
+      cols[ncols] = row;
+      vals[ncols] = diag;
+      ++ncols;
+      PetscCall(MatSetValues(*A, 1, &row, ncols, cols, vals, INSERT_VALUES));
+    }
+  }
+
+  PetscCall(MatAssemblyBegin(*A, MAT_FINAL_ASSEMBLY));
+  PetscCall(MatAssemblyEnd(*A, MAT_FINAL_ASSEMBLY));
+  return 0;
+}
+
+PetscErrorCode fill_low_order_load(const Grid &grid, PetscReal load, Vec b) {
+  PetscInt rstart = 0;
+  PetscInt rend = 0;
+  const PetscInt nxy = grid.nx * grid.ny;
+
+  PetscCall(VecGetOwnershipRange(b, &rstart, &rend));
+  PetscCall(VecSet(b, 0.0));
+  for (PetscInt row = rstart; row < rend; ++row) {
+    const PetscInt c = row % 3;
+    const PetscInt node = row / 3;
+    const PetscInt k = node / nxy;
+    const PetscInt rem = node - k * nxy;
+    const PetscInt j = rem / grid.nx;
+    const PetscInt i = rem - j * grid.nx;
+    if (i == grid.nx - 1 && c == 2) {
+      const PetscScalar value = -load / static_cast<PetscReal>(grid.ny * grid.nz);
+      PetscCall(VecSetValue(b, row, value, INSERT_VALUES));
+    }
+  }
+  PetscCall(VecAssemblyBegin(b));
+  PetscCall(VecAssemblyEnd(b));
+  return 0;
+}
+
+PetscErrorCode run_geometry_mode(const Grid &grid,
+                                 const DensityOptions &density_options,
+                                 const char *output_prefix,
+                                 PetscBool write_structured_vtk,
+                                 PetscBool write_solid_vtk,
+                                 PetscBool write_density_vec,
+                                 const char *structured_vtk_file,
+                                 const char *solid_vtk_file,
+                                 const char *density_vec_file,
+                                 PetscInt max_vtk_cells) {
+  PetscMPIInt ranks = 1;
+  PetscReal vf = 0.0;
+  PetscReal density_average = 0.0;
+  PetscInt solid_cells = 0;
+  PetscInt total_cells = 0;
+  Vec rho = nullptr;
+
+  PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD, &ranks));
+  PetscCall(create_nodal_density_vec(PETSC_COMM_WORLD, grid, density_options, &rho));
+  PetscCall(density_vec_average(rho, &density_average));
+  PetscCall(compute_mask_volume_fraction(PETSC_COMM_WORLD, grid, density_options,
+                                         &vf, &solid_cells, &total_cells));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                        "Geometry mode: nx=%lld ny=%lld nz=%lld, nodal_density_avg=%.6g\n",
+                        static_cast<long long>(grid.nx),
+                        static_cast<long long>(grid.ny),
+                        static_cast<long long>(grid.nz),
+                        static_cast<double>(density_average)));
+
+  if (write_density_vec) {
+    PetscCall(write_density_binary(rho, density_vec_file));
+  }
+  if (write_structured_vtk) {
+    PetscCall(write_structured_density_vtk(PETSC_COMM_WORLD, structured_vtk_file,
+                                           grid, density_options));
+  }
+  if (write_solid_vtk) {
+    PetscCall(write_solid_mask_vtk(PETSC_COMM_WORLD, solid_vtk_file,
+                                   grid, density_options, max_vtk_cells));
+  }
+
+  PetscCall(write_geometry_report(output_prefix, grid, density_options, ranks, vf,
+                                  solid_cells, total_cells));
+  PetscCall(VecDestroy(&rho));
+  return 0;
+}
+
+PetscErrorCode run_solve_mode(const Grid &grid,
+                              const DensityOptions &density_options,
+                              const char *operator_type,
+                              const char *output_prefix,
+                              PetscReal load,
+                              PetscBool write_solution,
+                              PetscBool write_structured_vtk,
+                              PetscBool write_solid_vtk,
+                              const char *solution_file,
+                              const char *structured_vtk_file,
+                              const char *solid_vtk_file,
+                              PetscInt max_vtk_cells) {
+  PetscMPIInt ranks = 1;
+  Mat A = nullptr;
+  Vec b = nullptr;
+  Vec u = nullptr;
+  KSP ksp = nullptr;
+  PC pc = nullptr;
+  PetscLogDouble t0 = 0.0;
+  PetscLogDouble t1 = 0.0;
+  PetscLogDouble t2 = 0.0;
+  PetscInt its = 0;
+  PetscReal rnorm = 0.0;
+  PetscScalar compliance = 0.0;
+
+  PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD, &ranks));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                        "C++ PETSc solve: operator=%s nx=%lld ny=%lld nz=%lld dof=%lld ranks=%d\n",
+                        operator_type,
+                        static_cast<long long>(grid.nx),
+                        static_cast<long long>(grid.ny),
+                        static_cast<long long>(grid.nz),
+                        static_cast<long long>(dof_count(grid)),
+                        static_cast<int>(ranks)));
+  PetscCall(PetscTime(&t0));
+  PetscCall(assemble_low_order_matrix(grid, density_options, &A));
+  PetscCall(PetscTime(&t1));
+
+  PetscCall(MatCreateVecs(A, &u, &b));
+  PetscCall(VecSet(u, 0.0));
+  PetscCall(fill_low_order_load(grid, load, b));
+
+  PetscCall(KSPCreate(PETSC_COMM_WORLD, &ksp));
+  PetscCall(KSPSetOperators(ksp, A, A));
+  PetscCall(KSPSetType(ksp, KSPCG));
+  PetscCall(KSPGetPC(ksp, &pc));
+  PetscCall(PCSetType(pc, PCGAMG));
+  PetscCall(KSPSetTolerances(ksp, 1.0e-6, PETSC_DEFAULT, PETSC_DEFAULT, 500));
+  PetscCall(KSPSetFromOptions(ksp));
+
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Assembly time: %.6e s\n",
+                        static_cast<double>(t1 - t0)));
+  PetscCall(PetscTime(&t1));
+  PetscCall(KSPSolve(ksp, b, u));
+  PetscCall(PetscTime(&t2));
+  PetscCall(KSPGetIterationNumber(ksp, &its));
+  PetscCall(KSPGetResidualNorm(ksp, &rnorm));
+  PetscCall(VecDot(b, u, &compliance));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                        "Solve time: %.6e s, iterations=%lld, residual=%g, compliance=%g\n",
+                        static_cast<double>(t2 - t1),
+                        static_cast<long long>(its),
+                        static_cast<double>(rnorm),
+                        static_cast<double>(PetscRealPart(compliance))));
+  PetscCall(write_solve_report(output_prefix, grid, ranks, operator_type, t1 - t0,
+                               t2 - t1, its, rnorm, PetscRealPart(compliance)));
+
+  if (write_solution) {
+    PetscViewer viewer = nullptr;
+    PetscCall(PetscViewerBinaryOpen(PETSC_COMM_WORLD, solution_file, FILE_MODE_WRITE,
+                                    &viewer));
+    PetscCall(VecView(u, viewer));
+    PetscCall(PetscViewerDestroy(&viewer));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD, "Wrote PETSc solution Vec: %s\n",
+                          solution_file));
+  }
+  if (write_structured_vtk) {
+    PetscCall(write_structured_solution_vtk(u, structured_vtk_file, grid,
+                                            density_options));
+  }
+  if (write_solid_vtk) {
+    PetscCall(write_solid_mask_vtk(PETSC_COMM_WORLD, solid_vtk_file, grid,
+                                   density_options, max_vtk_cells));
+  }
+
+  PetscCall(KSPDestroy(&ksp));
+  PetscCall(VecDestroy(&u));
+  PetscCall(VecDestroy(&b));
+  PetscCall(MatDestroy(&A));
+  return 0;
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  PetscErrorCode ierr = PetscInitialize(&argc, &argv, nullptr, help);
+  if (ierr) {
+    return ierr;
+  }
+  PetscCall(PetscMemorySetGetMaximumUsage());
+
+  Grid grid;
+  DensityOptions density_options;
+  char mode[64] = "geometry";
+  char operator_type[64] = "low_order";
+  char output_prefix[PETSC_MAX_PATH_LEN] = "result/control_arm_cpp";
+  char structured_vtk_file[PETSC_MAX_PATH_LEN] = "";
+  char solid_vtk_file[PETSC_MAX_PATH_LEN] = "";
+  char density_vec_file[PETSC_MAX_PATH_LEN] = "";
+  char solution_file[PETSC_MAX_PATH_LEN] = "";
+  char density_file[PETSC_MAX_PATH_LEN] = "";
+  PetscBool has_structured_vtk_file = PETSC_FALSE;
+  PetscBool has_solid_vtk_file = PETSC_FALSE;
+  PetscBool has_density_vec_file = PETSC_FALSE;
+  PetscBool has_solution_file = PETSC_FALSE;
+  PetscBool has_density_file = PETSC_FALSE;
+  PetscBool write_structured_vtk = PETSC_FALSE;
+  PetscBool write_solid_vtk = PETSC_FALSE;
+  PetscBool write_density_binary_flag = PETSC_FALSE;
+  PetscBool write_solution = PETSC_FALSE;
+  PetscBool is_geometry_mode = PETSC_FALSE;
+  PetscBool is_solve_mode = PETSC_FALSE;
+  PetscBool is_low_order = PETSC_FALSE;
+  PetscBool is_h8_matrix_free = PETSC_FALSE;
+  PetscReal load = 1.0;
+  PetscInt max_vtk_cells = 300000;
+
+  PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-nx", &grid.nx, nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-ny", &grid.ny, nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-nz", &grid.nz, nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-mode", mode, sizeof(mode),
+                                  nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-operator", operator_type,
+                                  sizeof(operator_type), nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-output_prefix", output_prefix,
+                                  sizeof(output_prefix), nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-control_arm_mask",
+                                &density_options.use_control_arm_mask, nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-void_density",
+                                &density_options.void_density, nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-penal", &density_options.penal,
+                                nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-emin", &density_options.emin,
+                                nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-mask_threshold",
+                                &density_options.mask_threshold, nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-load", &load, nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-write_structured_vtk",
+                                &write_structured_vtk, nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-structured_vtk_file",
+                                  structured_vtk_file, sizeof(structured_vtk_file),
+                                  &has_structured_vtk_file));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-write_solid_vtk",
+                                &write_solid_vtk, nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-solid_vtk_file",
+                                  solid_vtk_file, sizeof(solid_vtk_file),
+                                  &has_solid_vtk_file));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-write_density_binary",
+                                &write_density_binary_flag, nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-density_binary_file",
+                                  density_vec_file, sizeof(density_vec_file),
+                                  &has_density_vec_file));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-write_solution",
+                                &write_solution, nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-solution_file", solution_file,
+                                  sizeof(solution_file), &has_solution_file));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-density_file", density_file,
+                                  sizeof(density_file), &has_density_file));
+  PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-max_vtk_cells", &max_vtk_cells,
+                               nullptr));
+
+  PetscCall(PetscStrcmp(mode, "geometry", &is_geometry_mode));
+  PetscCall(PetscStrcmp(mode, "solve", &is_solve_mode));
+  PetscCall(PetscStrcmp(operator_type, "low_order", &is_low_order));
+  PetscCall(PetscStrcmp(operator_type, "h8_matrix_free", &is_h8_matrix_free));
+
+  PetscCheck(is_geometry_mode || is_solve_mode, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "-mode must be geometry or solve");
+  PetscCheck(is_low_order || is_h8_matrix_free, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "-operator must be low_order or h8_matrix_free");
+  PetscCheck(!is_h8_matrix_free, PETSC_COMM_WORLD, PETSC_ERR_SUP,
+             "-operator h8_matrix_free is the next migration stage; this first C++ driver refuses to fake it");
+  PetscCheck(!has_density_file, PETSC_COMM_WORLD, PETSC_ERR_SUP,
+             "-density_file is reserved for distributed HDF5/PETSc Vec input in the optimizer stage");
+  PetscCheck(grid.nx >= 2 && grid.ny >= 2 && grid.nz >= 2, PETSC_COMM_WORLD,
+             PETSC_ERR_ARG_OUTOFRANGE, "nx, ny, and nz must be at least 2");
+  PetscCheck(3.0 * static_cast<double>(grid.nx) * static_cast<double>(grid.ny) *
+                     static_cast<double>(grid.nz) <=
+                 static_cast<double>(PETSC_MAX_INT),
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_OUTOFRANGE,
+             "Requested grid exceeds this PETSc build's PetscInt range");
+
+  if (!has_structured_vtk_file) {
+    PetscCall(PetscSNPrintf(structured_vtk_file, sizeof(structured_vtk_file),
+                            "%s.vtk", output_prefix));
+  }
+  if (!has_solid_vtk_file) {
+    PetscCall(PetscSNPrintf(solid_vtk_file, sizeof(solid_vtk_file),
+                            "%s_solid.vtk", output_prefix));
+  }
+  if (!has_density_vec_file) {
+    PetscCall(PetscSNPrintf(density_vec_file, sizeof(density_vec_file),
+                            "%s_rho.petscbin", output_prefix));
+  }
+  if (!has_solution_file) {
+    PetscCall(PetscSNPrintf(solution_file, sizeof(solution_file),
+                            "%s_u.petscbin", output_prefix));
+  }
+
+  if (is_geometry_mode) {
+    PetscCall(run_geometry_mode(grid, density_options, output_prefix,
+                                write_structured_vtk, write_solid_vtk,
+                                write_density_binary_flag, structured_vtk_file,
+                                solid_vtk_file, density_vec_file, max_vtk_cells));
+  } else {
+    PetscCall(run_solve_mode(grid, density_options, operator_type, output_prefix,
+                             load, write_solution, write_structured_vtk,
+                             write_solid_vtk, solution_file, structured_vtk_file,
+                             solid_vtk_file, max_vtk_cells));
+  }
+
+  PetscCall(PetscFinalize());
+  return 0;
+}
