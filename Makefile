@@ -4,7 +4,7 @@ PETSC_PKG ?= PETSc
 PKG_CONFIG ?= pkg-config
 
 TARGET = bin/control_arm_cpp
-SRC = src/main.cpp src/geometry.cpp src/density.cpp src/vtk.cpp src/petsc_utils.cpp
+SRC = src/main.cpp src/geometry.cpp src/density.cpp src/vtk.cpp src/petsc_utils.cpp src/h8_matrix_free.cpp src/density_pipeline.cpp src/low_order_optimizer.cpp src/h8_optimizer.cpp src/ann_model.cpp src/emsfem_ann.cpp
 OBJ = $(SRC:.cpp=.o)
 PETSC_CONF = ${PETSC_DIR}/lib/petsc/conf
 

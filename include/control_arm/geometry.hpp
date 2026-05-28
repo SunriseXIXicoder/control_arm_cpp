@@ -13,9 +13,11 @@ struct Grid {
 struct DensityOptions {
   PetscBool use_control_arm_mask = PETSC_TRUE;
   PetscReal void_density = 0.02;
+  PetscReal young_modulus = 2.1e11;
   PetscReal penal = 3.0;
   PetscReal emin = 1.0e-6;
   PetscReal mask_threshold = 0.5;
+  PetscReal ab_triangle_retract = 0.22;
 };
 
 PetscReal domain_length(const Grid &grid);

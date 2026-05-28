@@ -38,6 +38,30 @@ PREFIX="${OUTPUT_PREFIX:-result/cpp_${MODE}_${NX}_${NY}_${NZ}_${SLURM_JOB_ID}}"
 WRITE_STRUCTURED_VTK="${WRITE_STRUCTURED_VTK:-false}"
 WRITE_SOLID_VTK="${WRITE_SOLID_VTK:-false}"
 MAX_VTK_CELLS="${MAX_VTK_CELLS:-300000}"
+YOUNG_MODULUS="${YOUNG_MODULUS:-2.1e11}"
+USER_PC_TYPE="${PC_TYPE:-}"
+USER_KSP_MAX_IT="${KSP_MAX_IT:-}"
+MG_ARGS="-pc_gamg_type agg -mg_levels_ksp_type chebyshev -mg_levels_pc_type jacobi"
+if [ "${OPERATOR}" = "h8_matrix_free" ]; then
+  PC_TYPE="${USER_PC_TYPE:-jacobi}"
+  MG_ARGS=""
+else
+  PC_TYPE="${USER_PC_TYPE:-gamg}"
+fi
+OPT_MAX_ITER="${OPT_MAX_ITER:-20}"
+VOLFRAC="${VOLFRAC:-0.35}"
+OPT_FILTER_RADIUS="${OPT_FILTER_RADIUS:-0.0}"
+OPT_WRITE_CHECKPOINT="${OPT_WRITE_CHECKPOINT:-true}"
+OPT_CHECKPOINT_INTERVAL="${OPT_CHECKPOINT_INTERVAL:-0}"
+OPT_CHECKPOINT_PREFIX="${OPT_CHECKPOINT_PREFIX:-${PREFIX}_checkpoint}"
+OPT_ARGS=""
+KSP_MAX_IT="${USER_KSP_MAX_IT:-500}"
+if [ "${MODE}" = "optimize" ]; then
+  PC_TYPE="${USER_PC_TYPE:-jacobi}"
+  MG_ARGS=""
+  KSP_MAX_IT="${USER_KSP_MAX_IT:-3000}"
+  OPT_ARGS="-volfrac ${VOLFRAC} -opt_max_iter ${OPT_MAX_ITER} -opt_move 0.08 -opt_filter_radius ${OPT_FILTER_RADIUS} -opt_rho_min 1e-3 -opt_ksp_max_it ${KSP_MAX_IT} -opt_write_final_vtk false -opt_write_checkpoint ${OPT_WRITE_CHECKPOINT} -opt_checkpoint_interval ${OPT_CHECKPOINT_INTERVAL} -opt_checkpoint_prefix ${OPT_CHECKPOINT_PREFIX}"
+fi
 
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p bin result
@@ -57,6 +81,10 @@ echo "  nodes=${SLURM_JOB_NUM_NODES:-unknown}"
 echo "  tasks=${SLURM_NTASKS:-unknown}"
 echo "  nx=${NX} ny=${NY} nz=${NZ}"
 echo "  operator=${OPERATOR}"
+echo "  pc_type=${PC_TYPE}"
+echo "  opt_max_iter=${OPT_MAX_ITER}"
+echo "  opt_filter_radius=${OPT_FILTER_RADIUS}"
+echo "  opt_write_checkpoint=${OPT_WRITE_CHECKPOINT}"
 echo "  output_prefix=${PREFIX}"
 
 # shellcheck disable=SC2086
@@ -66,15 +94,15 @@ srun -n "$SLURM_NTASKS" ./bin/control_arm_cpp \
   -nx "${NX}" -ny "${NY}" -nz "${NZ}" \
   -control_arm_mask true \
   -void_density 0.02 \
+  -young_modulus "${YOUNG_MODULUS}" \
   -load 1.0 \
   -output_prefix "${PREFIX}" \
+  ${OPT_ARGS} \
   ${VTK_ARGS} \
   -ksp_type cg \
-  -pc_type gamg \
-  -pc_gamg_type agg \
-  -mg_levels_ksp_type chebyshev \
-  -mg_levels_pc_type jacobi \
+  -pc_type "${PC_TYPE}" \
+  ${MG_ARGS} \
   -ksp_rtol 1e-6 \
-  -ksp_max_it 500 \
+  -ksp_max_it "${KSP_MAX_IT}" \
   -ksp_converged_reason \
   -log_view ":${PREFIX}_petsc.log"
