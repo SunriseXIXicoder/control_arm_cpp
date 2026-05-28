@@ -9,5 +9,5 @@ mask_threshold=5.000000000000e-01
 solid_cells=11071
 total_cells=70863
 volume_fraction=1.562310373538e-01
-max_current_memory_bytes=33980416
-max_peak_memory_bytes=33980416
+max_current_memory_bytes=33292288
+max_peak_memory_bytes=33292288

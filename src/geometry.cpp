@@ -43,11 +43,13 @@ bool in_triangle_2d(PetscReal px, PetscReal py,
 } // namespace
 
 PetscReal domain_length(const Grid &grid) {
-  return static_cast<PetscReal>(grid.nx) / static_cast<PetscReal>(grid.nz);
+  return static_cast<PetscReal>(grid.nx - 1) /
+         static_cast<PetscReal>(grid.nz - 1);
 }
 
 PetscReal domain_width(const Grid &grid) {
-  return static_cast<PetscReal>(grid.ny) / static_cast<PetscReal>(grid.nz);
+  return static_cast<PetscReal>(grid.ny - 1) /
+         static_cast<PetscReal>(grid.nz - 1);
 }
 
 PetscReal domain_height(const Grid &) {
@@ -88,8 +90,11 @@ PetscReal density_at_normalized(PetscReal x, PetscReal y, PetscReal z,
 
   const bool middle =
       (Z >= 0.25 * DH && Z <= 0.75 * DH);
+  const PetscReal ab_triangle_retract =
+      PetscMax(0.0, options.ab_triangle_retract) * min_ld;
   const bool triangle =
-      middle && in_triangle_2d(X, Y, A[0], A[1], B[0], B[1], C[0], C[1]);
+      middle && X >= A[0] + ab_triangle_retract &&
+      in_triangle_2d(X, Y, A[0], A[1], B[0], B[1], C[0], C[1]);
 
   const bool axialA = (A[1] - Y <= rA_pad);
   const bool axialB = (Y - B[1] <= rB_pad);
@@ -198,7 +203,9 @@ PetscReal cell_density(PetscInt i, PetscInt j, PetscInt k,
 PetscReal edge_stiffness(PetscReal rho0, PetscReal rho1,
                          const DensityOptions &options) {
   const PetscReal rho = clamp_real(0.5 * (rho0 + rho1), 0.0, 1.0);
-  return options.emin + (1.0 - options.emin) * PetscPowReal(rho, options.penal);
+  return options.young_modulus *
+         (options.emin + (1.0 - options.emin) *
+                             PetscPowReal(rho, options.penal));
 }
 
 PetscInt node_count(const Grid &grid) {

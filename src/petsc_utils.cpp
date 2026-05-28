@@ -45,6 +45,8 @@ PetscErrorCode write_geometry_report(const char *output_prefix,
                                    static_cast<int>(options.use_control_arm_mask)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "void_density=%.12e\n",
                                    static_cast<double>(options.void_density)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "young_modulus=%.12e\n",
+                                   static_cast<double>(options.young_modulus)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "mask_threshold=%.12e\n",
                                    static_cast<double>(options.mask_threshold)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "solid_cells=%lld\n",
