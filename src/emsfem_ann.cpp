@@ -1,5 +1,6 @@
 #include "control_arm/emsfem_ann.hpp"
 
+#include "control_arm/petsc_utils.hpp"
 #include "control_arm/vtk.hpp"
 
 #include <petscdmda.h>
@@ -48,6 +49,9 @@ struct TimingTotals {
   PetscReal density_filter_s = 0.0;
   PetscReal draft_closure_s = 0.0;
   PetscReal ann_cache_s = 0.0;
+  PetscReal ann_shape_predict_s = 0.0;
+  PetscReal ems_matrix_assembly_s = 0.0;
+  PetscReal fine_material_sampling_s = 0.0;
   PetscReal initial_ann_cache_s = 0.0;
   PetscReal preconditioner_setup_s = 0.0;
   PetscReal load_assembly_s = 0.0;
@@ -60,6 +64,13 @@ struct TimingTotals {
   PetscReal final_eval_s = 0.0;
   PetscReal vtk_write_s = 0.0;
   PetscReal total_s = 0.0;
+};
+
+struct EmsCacheTiming {
+  PetscReal total_s = 0.0;
+  PetscReal material_sampling_s = 0.0;
+  PetscReal ann_shape_predict_s = 0.0;
+  PetscReal matrix_assembly_s = 0.0;
 };
 
 PetscErrorCode elapsed_max_since(PetscLogDouble start, PetscReal *elapsed) {
@@ -317,7 +328,8 @@ void overwrite_inside_shape(PetscInt sub_n,
 
 PetscErrorCode build_shape_from_material(EmSfemAnnContext *ctx,
                                          const std::vector<PetscReal> &material,
-                                         std::vector<PetscReal> *shape) {
+                                         std::vector<PetscReal> *shape,
+                                         EmsCacheTiming *timing = nullptr) {
   PetscReal min_value = PETSC_MAX_REAL;
   PetscReal max_value = -PETSC_MAX_REAL;
   for (const PetscReal value : material) {
@@ -331,7 +343,14 @@ PetscErrorCode build_shape_from_material(EmSfemAnnContext *ctx,
   }
 
   std::vector<PetscReal> inside_shape;
+  PetscLogDouble predict_start = 0.0, predict_end = 0.0;
+  if (timing != nullptr) PetscCall(PetscTime(&predict_start));
   PetscCall(ctx->ann.predict_inside_shape(material, &inside_shape));
+  if (timing != nullptr) {
+    PetscCall(PetscTime(&predict_end));
+    timing->ann_shape_predict_s +=
+        static_cast<PetscReal>(predict_end - predict_start);
+  }
   overwrite_inside_shape(ctx->ems_options.sub_n, inside_shape, shape);
   return 0;
 }
@@ -453,7 +472,8 @@ PetscErrorCode compute_fine_cell_energies(EmSfemAnnContext *ctx,
 PetscErrorCode compute_ems_element_matrix_from_material(
     EmSfemAnnContext *ctx,
     const std::vector<PetscReal> &material,
-    PetscReal *ke) {
+    PetscReal *ke,
+    EmsCacheTiming *timing = nullptr) {
   const PetscInt sub_n = ctx->ems_options.sub_n;
   PetscReal sum = 0.0;
   PetscReal min_value = PETSC_MAX_REAL;
@@ -478,7 +498,9 @@ PetscErrorCode compute_ems_element_matrix_from_material(
   }
 
   std::vector<PetscReal> shape;
-  PetscCall(build_shape_from_material(ctx, material, &shape));
+  PetscCall(build_shape_from_material(ctx, material, &shape, timing));
+  PetscLogDouble assembly_start = 0.0, assembly_end = 0.0;
+  if (timing != nullptr) PetscCall(PetscTime(&assembly_start));
   accumulate_shape_stiffness(ctx->fine_ke, shape, material, sub_n, ke);
 
   for (PetscInt a = 0; a < kElementDofs; ++a) {
@@ -488,6 +510,11 @@ PetscErrorCode compute_ems_element_matrix_from_material(
       ke[kElementDofs * a + b] = sym;
       ke[kElementDofs * b + a] = sym;
     }
+  }
+  if (timing != nullptr) {
+    PetscCall(PetscTime(&assembly_end));
+    timing->matrix_assembly_s +=
+        static_cast<PetscReal>(assembly_end - assembly_start);
   }
   return 0;
 }
@@ -1304,12 +1331,16 @@ PetscErrorCode apply_z_draft_closure(DM fda,
 
 PetscErrorCode rebuild_local_k_cache_from_rho(EmSfemAnnContext *ctx,
                                               DM fda,
-                                              Vec rho_phys) {
+                                              Vec rho_phys,
+                                              EmsCacheTiming *timing = nullptr) {
   Vec local_rho = nullptr;
   PetscScalar ***rho = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
   PetscInt ncache = 0;
   const PetscInt sub_n = ctx->ems_options.sub_n;
+  EmsCacheTiming local_timing;
+  PetscLogDouble total_start = 0.0, total_end = 0.0;
+  PetscCall(PetscTime(&total_start));
   PetscCall(DMCreateLocalVector(fda, &local_rho));
   PetscCall(DMGlobalToLocalBegin(fda, rho_phys, INSERT_VALUES, local_rho));
   PetscCall(DMGlobalToLocalEnd(fda, rho_phys, INSERT_VALUES, local_rho));
@@ -1344,6 +1375,8 @@ PetscErrorCode rebuild_local_k_cache_from_rho(EmSfemAnnContext *ctx,
         PetscReal *ke = cached_element_matrix(ctx, ex, ey, ez);
         std::vector<PetscReal> material;
         material.reserve(static_cast<std::size_t>(sub_n * sub_n * sub_n));
+        PetscLogDouble material_start = 0.0, material_end = 0.0;
+        PetscCall(PetscTime(&material_start));
         for (PetscInt fz = 0; fz < sub_n; ++fz) {
           for (PetscInt fy = 0; fy < sub_n; ++fy) {
             for (PetscInt fx = 0; fx < sub_n; ++fx) {
@@ -1354,18 +1387,41 @@ PetscErrorCode rebuild_local_k_cache_from_rho(EmSfemAnnContext *ctx,
             }
           }
         }
-        PetscCall(compute_ems_element_matrix_from_material(ctx, material, ke));
+        PetscCall(PetscTime(&material_end));
+        local_timing.material_sampling_s +=
+            static_cast<PetscReal>(material_end - material_start);
+        PetscCall(compute_ems_element_matrix_from_material(ctx, material, ke,
+                                                           &local_timing));
         ++ncache;
       }
     }
   }
   PetscCall(DMDAVecRestoreArrayRead(fda, local_rho, &rho));
   PetscCall(VecDestroy(&local_rho));
+  PetscCall(PetscTime(&total_end));
+  local_timing.total_s = static_cast<PetscReal>(total_end - total_start);
+  if (timing != nullptr) {
+    PetscReal local_values[4] = {local_timing.total_s,
+                                 local_timing.material_sampling_s,
+                                 local_timing.ann_shape_predict_s,
+                                 local_timing.matrix_assembly_s};
+    PetscReal global_values[4] = {};
+    PetscCallMPI(MPI_Allreduce(local_values, global_values, 4, MPIU_REAL,
+                               MPI_MAX, PETSC_COMM_WORLD));
+    timing->total_s = global_values[0];
+    timing->material_sampling_s = global_values[1];
+    timing->ann_shape_predict_s = global_values[2];
+    timing->matrix_assembly_s = global_values[3];
+  }
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "EMsFEM ANN fine-density K cache rebuilt: local coarse elements=%lld fine subcells/element=%lld max %.3f GiB/rank\n",
+                        "EMsFEM ANN fine-density K cache rebuilt: local coarse elements=%lld fine subcells/element=%lld max %.3f GiB/rank time[s]: total=%.3g material=%.3g ann_shape=%.3g ems_ke=%.3g\n",
                         static_cast<long long>(ncache),
                         static_cast<long long>(sub_n * sub_n * sub_n),
-                        gib));
+                        gib,
+                        static_cast<double>(timing != nullptr ? timing->total_s : local_timing.total_s),
+                        static_cast<double>(timing != nullptr ? timing->material_sampling_s : local_timing.material_sampling_s),
+                        static_cast<double>(timing != nullptr ? timing->ann_shape_predict_s : local_timing.ann_shape_predict_s),
+                        static_cast<double>(timing != nullptr ? timing->matrix_assembly_s : local_timing.matrix_assembly_s)));
   return 0;
 }
 
@@ -2230,6 +2286,11 @@ PetscErrorCode write_ems_summary(const char *output_prefix,
   PetscCall(PetscViewerASCIIPrintf(viewer, "nx=%lld\n", static_cast<long long>(grid.nx)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "ny=%lld\n", static_cast<long long>(grid.ny)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "nz=%lld\n", static_cast<long long>(grid.nz)));
+  PetscCall(PetscViewerASCIIPrintf(viewer,
+                                   "domain_length_m=%.12e\ndomain_width_m=%.12e\ndomain_height_m=%.12e\n",
+                                   static_cast<double>(domain_length(grid)),
+                                   static_cast<double>(domain_width(grid)),
+                                   static_cast<double>(domain_height(grid))));
   PetscCall(PetscViewerASCIIPrintf(viewer, "dof=%lld\n", static_cast<long long>(dof_count(grid))));
   PetscCall(PetscViewerASCIIPrintf(viewer, "sub_n=%lld\n", static_cast<long long>(ems.sub_n)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "fine_density_cells=%lld\n",
@@ -2272,6 +2333,9 @@ PetscErrorCode write_ems_summary(const char *output_prefix,
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_density_filter_s=%.12e\n", static_cast<double>(timing.density_filter_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_draft_closure_s=%.12e\n", static_cast<double>(timing.draft_closure_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_ann_cache_s=%.12e\n", static_cast<double>(timing.ann_cache_s)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "timing_fine_material_sampling_s=%.12e\n", static_cast<double>(timing.fine_material_sampling_s)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "timing_ann_shape_predict_s=%.12e\n", static_cast<double>(timing.ann_shape_predict_s)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "timing_ems_matrix_assembly_s=%.12e\n", static_cast<double>(timing.ems_matrix_assembly_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_initial_ann_cache_s=%.12e\n", static_cast<double>(timing.initial_ann_cache_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_preconditioner_setup_s=%.12e\n", static_cast<double>(timing.preconditioner_setup_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_load_assembly_s=%.12e\n", static_cast<double>(timing.load_assembly_s)));
@@ -2585,6 +2649,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   EmsBlockJacobiContext *pc_ctx = nullptr;
   PetscViewer hist = nullptr;
   char hist_path[PETSC_MAX_PATH_LEN];
+  std::vector<ObjectiveVolumePoint> objective_history;
   PetscReal compliance = 0.0, volume = 0.0, change = 0.0;
   PetscReal accepted_compliance = PETSC_MAX_REAL;
   PetscReal current_move = optimizer_options.move;
@@ -2706,11 +2771,16 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   {
     PetscLogDouble stage_start = 0.0;
     PetscReal elapsed = 0.0;
+    EmsCacheTiming cache_timing;
     PetscCall(PetscTime(&stage_start));
-    PetscCall(rebuild_local_k_cache_from_rho(ctx, fda, rho_phys));
+    PetscCall(rebuild_local_k_cache_from_rho(ctx, fda, rho_phys,
+                                             &cache_timing));
     PetscCall(elapsed_max_since(stage_start, &elapsed));
     timings.ann_cache_s += elapsed;
     timings.initial_ann_cache_s += elapsed;
+    timings.fine_material_sampling_s += cache_timing.material_sampling_s;
+    timings.ann_shape_predict_s += cache_timing.ann_shape_predict_s;
+    timings.ems_matrix_assembly_s += cache_timing.matrix_assembly_s;
   }
   PetscCall(MatCreateShell(PETSC_COMM_WORLD, local_size, local_size,
                            dof_count(grid), dof_count(grid), ctx, &A));
@@ -2760,7 +2830,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                           output_prefix));
   PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, hist_path, &hist));
   PetscCall(PetscViewerASCIIPrintf(hist,
-                                   "iter,compliance,volume,raw_design_volume,effective_raw_volfrac,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_residual,effective_move,converged_cases,diverged_cases,accepted,iteration_total_time_s,density_filter_time_s,draft_closure_time_s,ann_cache_time_s,preconditioner_setup_time_s,load_assembly_time_s,ksp_solve_time_s,sensitivity_time_s,sensitivity_filter_time_s,mma_oc_update_time_s,checkpoint_write_time_s,fem_total_time_s\n"));
+                                   "iter,compliance,volume,raw_design_volume,effective_raw_volfrac,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_residual,effective_move,converged_cases,diverged_cases,accepted,iteration_total_time_s,density_filter_time_s,draft_closure_time_s,ann_cache_time_s,fine_material_sampling_time_s,ann_shape_predict_time_s,ems_matrix_assembly_time_s,preconditioner_setup_time_s,load_assembly_time_s,ksp_solve_time_s,sensitivity_time_s,sensitivity_filter_time_s,mma_oc_update_time_s,checkpoint_write_time_s,fem_total_time_s\n"));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                         "Optimize mode: emsfem_ann nx=%lld ny=%lld nz=%lld sub_n=%lld fine_density_cells=%lld max_iter=%lld volfrac=%g coarse_filter_radius=%g fine_filter_radius=%g heaviside=%d beta0=%g beta_max=%g beta_interval=%lld fixed_nodes=%lld\n",
                         static_cast<long long>(grid.nx),
@@ -2785,6 +2855,9 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     PetscReal iter_density_filter_s = 0.0;
     PetscReal iter_draft_closure_s = 0.0;
     PetscReal iter_ann_cache_s = 0.0;
+    PetscReal iter_fine_material_sampling_s = 0.0;
+    PetscReal iter_ann_shape_predict_s = 0.0;
+    PetscReal iter_ems_matrix_assembly_s = 0.0;
     PetscReal iter_pc_setup_s = 0.0;
     PetscReal iter_load_assembly_s = 0.0;
     PetscReal iter_ksp_solve_s = 0.0;
@@ -2822,10 +2895,18 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     }
     {
       PetscLogDouble stage_start = 0.0;
+      EmsCacheTiming cache_timing;
       PetscCall(PetscTime(&stage_start));
-      PetscCall(rebuild_local_k_cache_from_rho(ctx, fda, rho_phys));
+      PetscCall(rebuild_local_k_cache_from_rho(ctx, fda, rho_phys,
+                                               &cache_timing));
       PetscCall(elapsed_max_since(stage_start, &iter_ann_cache_s));
       timings.ann_cache_s += iter_ann_cache_s;
+      iter_fine_material_sampling_s = cache_timing.material_sampling_s;
+      iter_ann_shape_predict_s = cache_timing.ann_shape_predict_s;
+      iter_ems_matrix_assembly_s = cache_timing.matrix_assembly_s;
+      timings.fine_material_sampling_s += iter_fine_material_sampling_s;
+      timings.ann_shape_predict_s += iter_ann_shape_predict_s;
+      timings.ems_matrix_assembly_s += iter_ems_matrix_assembly_s;
     }
     {
       PetscLogDouble stage_start = 0.0;
@@ -2990,7 +3071,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
         iter_load_assembly_s + iter_ksp_solve_s + iter_sensitivity_s;
     final_iter = iter;
     PetscCall(PetscViewerASCIIPrintf(hist,
-                                     "%lld,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%lld,%.12e,%.12e,%lld,%lld,%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
+                                     "%lld,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%lld,%.12e,%.12e,%lld,%lld,%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
                                      static_cast<long long>(iter),
                                      static_cast<double>(compliance),
                                      static_cast<double>(volume),
@@ -3009,6 +3090,9 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                      static_cast<double>(iter_density_filter_s),
                                      static_cast<double>(iter_draft_closure_s),
                                      static_cast<double>(iter_ann_cache_s),
+                                     static_cast<double>(iter_fine_material_sampling_s),
+                                     static_cast<double>(iter_ann_shape_predict_s),
+                                     static_cast<double>(iter_ems_matrix_assembly_s),
                                      static_cast<double>(iter_pc_setup_s),
                                      static_cast<double>(iter_load_assembly_s),
                                      static_cast<double>(iter_ksp_solve_s),
@@ -3017,8 +3101,12 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                      static_cast<double>(iter_optimizer_update_s),
                                      static_cast<double>(iter_checkpoint_s),
                                      static_cast<double>(iter_fem_total_s)));
+    PetscCall(PetscViewerFlush(hist));
+    objective_history.push_back({iter, compliance, volume});
+    PetscCall(write_objective_volume_history(output_prefix, objective_history,
+                                             optimizer_options.volfrac));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                          "it=%lld compliance=%.6e volume=%.6f raw=%.6f raw_target=%.6f beta=%.3g change=%.3e ksp_it=%lld move=%.3e accepted=%d time=%.3fs ann=%.3fs fem=%.3fs mma/oc=%.3fs\n",
+                          "it=%lld compliance=%.6e volume=%.6f raw=%.6f raw_target=%.6f beta=%.3g change=%.3e ksp_it=%lld move=%.3e accepted=%d time=%.3fs ann_cache=%.3fs ann_shape=%.3fs ems_ke=%.3fs linear_solve=%.3fs fem=%.3fs mma/oc=%.3fs\n",
                           static_cast<long long>(iter),
                           static_cast<double>(compliance),
                           static_cast<double>(volume),
@@ -3031,6 +3119,9 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                           static_cast<int>(accepted),
                           static_cast<double>(iter_total_s),
                           static_cast<double>(iter_ann_cache_s),
+                          static_cast<double>(iter_ann_shape_predict_s),
+                          static_cast<double>(iter_ems_matrix_assembly_s),
+                          static_cast<double>(iter_ksp_solve_s),
                           static_cast<double>(iter_fem_total_s),
                           static_cast<double>(iter_optimizer_update_s)));
     last_iteration_accepted = accepted;
@@ -3087,10 +3178,15 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     {
       PetscLogDouble stage_start = 0.0;
       PetscReal elapsed = 0.0;
+      EmsCacheTiming cache_timing;
       PetscCall(PetscTime(&stage_start));
-      PetscCall(rebuild_local_k_cache_from_rho(ctx, fda, rho_phys));
+      PetscCall(rebuild_local_k_cache_from_rho(ctx, fda, rho_phys,
+                                               &cache_timing));
       PetscCall(elapsed_max_since(stage_start, &elapsed));
       timings.ann_cache_s += elapsed;
+      timings.fine_material_sampling_s += cache_timing.material_sampling_s;
+      timings.ann_shape_predict_s += cache_timing.ann_shape_predict_s;
+      timings.ems_matrix_assembly_s += cache_timing.matrix_assembly_s;
     }
     {
       PetscLogDouble stage_start = 0.0;

@@ -9,11 +9,13 @@ NELZ="${NELZ:-8}"
 NX=$((NELX + 1))
 NY=$((NELY + 1))
 NZ=$((NELZ + 1))
+DOMAIN_HEIGHT="${DOMAIN_HEIGHT:-0.08}"
 
 ITERS="${ITERS:-50}"
 VOLFRAC="${VOLFRAC:-0.30}"
 PREFIX="${PREFIX:-result/ems_ann_opt_${NELX}_${NELY}_${NELZ}_np${NP}}"
-ANN_DIR="${ANN_DIR:-../input_5}"
+EMS_SUB_N="${EMS_SUB_N:-5}"
+ANN_DIR="${ANN_DIR:-../input_${EMS_SUB_N}}"
 # 0 means the previous three control-arm load cases with AHP weights.
 LOAD_CASE="${LOAD_CASE:-0}"
 FILTER_RADIUS="${FILTER_RADIUS:-1.5}"
@@ -55,6 +57,7 @@ mpirun -np "${NP}" ./bin/control_arm_cpp \
   -mode optimize \
   -operator emsfem_ann \
   -nx "${NX}" -ny "${NY}" -nz "${NZ}" \
+  -domain_height "${DOMAIN_HEIGHT}" \
   -control_arm_mask true \
   -void_density 0.02 \
   -young_modulus "${YOUNG_MODULUS}" \
@@ -85,6 +88,7 @@ mpirun -np "${NP}" ./bin/control_arm_cpp \
   -opt_vtk_file "${PREFIX}_final.vtk" \
   -output_prefix "${PREFIX}" \
   -ems_ann_dir "${ANN_DIR}" \
+  -ems_sub_n "${EMS_SUB_N}" \
   -ems_cache_element_matrices true \
   -ems_cache_gib_limit 2 \
   -control_arm_bc true \

@@ -1,8 +1,11 @@
 #include "control_arm/low_order_optimizer.hpp"
 
+#include "control_arm/petsc_utils.hpp"
+
 #include <petscdmda.h>
 
 #include <cstdio>
+#include <vector>
 
 namespace control_arm {
 namespace {
@@ -588,6 +591,7 @@ PetscErrorCode run_low_order_optimizer(const Grid &grid,
   KSP ksp = nullptr;
   PetscViewer hist = nullptr;
   char hist_path[PETSC_MAX_PATH_LEN];
+  std::vector<ObjectiveVolumePoint> objective_history;
   PetscReal compliance = 0.0;
   PetscReal volume = 0.0;
   PetscReal change = 0.0;
@@ -653,6 +657,10 @@ PetscErrorCode run_low_order_optimizer(const Grid &grid,
                                      static_cast<double>(change),
                                      static_cast<long long>(its),
                                      static_cast<double>(rnorm)));
+    PetscCall(PetscViewerFlush(hist));
+    objective_history.push_back({iter, compliance, volume});
+    PetscCall(write_objective_volume_history(output_prefix, objective_history,
+                                             optimizer_options.volfrac));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "it=%lld compliance=%.6e volume=%.6f change=%.3e ksp_it=%lld\n",
                           static_cast<long long>(iter),

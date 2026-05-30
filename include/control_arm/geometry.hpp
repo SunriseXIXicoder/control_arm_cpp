@@ -8,6 +8,7 @@ struct Grid {
   PetscInt nx = 80;
   PetscInt ny = 40;
   PetscInt nz = 24;
+  PetscReal physical_height = 0.08;
 };
 
 struct DensityOptions {

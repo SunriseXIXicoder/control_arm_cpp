@@ -15,8 +15,10 @@ export PETSC_ARCH="${PETSC_ARCH:-}"
 NX="${NX:-700}"
 NY="${NY:-400}"
 NZ="${NZ:-120}"
+DOMAIN_HEIGHT="${DOMAIN_HEIGHT:-0.08}"
 
-ANN_DIR="${ANN_DIR:-input_5}"
+EMS_SUB_N="${EMS_SUB_N:-5}"
+ANN_DIR="${ANN_DIR:-input_${EMS_SUB_N}}"
 PREFIX="${PREFIX:-result/ems_ann_${NX}_${NY}_${NZ}_${SLURM_JOB_ID}}"
 LOAD_CASE="${LOAD_CASE:-2}"
 CONTROL_ARM_BC="${CONTROL_ARM_BC:-true}"
@@ -42,11 +44,13 @@ srun -n "${TOTAL_TASKS}" ./bin/control_arm_cpp \
   -mode solve \
   -operator emsfem_ann \
   -nx "${NX}" -ny "${NY}" -nz "${NZ}" \
+  -domain_height "${DOMAIN_HEIGHT}" \
   -control_arm_mask true \
   -void_density 0.0 \
   -young_modulus "${YOUNG_MODULUS}" \
   -emin "${EMIN}" \
   -ems_ann_dir "${ANN_DIR}" \
+  -ems_sub_n "${EMS_SUB_N}" \
   -ems_cache_element_matrices "${CACHE_K}" \
   -ems_cache_gib_limit "${CACHE_GIB_LIMIT}" \
   -control_arm_bc "${CONTROL_ARM_BC}" \

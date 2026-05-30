@@ -21,7 +21,7 @@ static char help[] =
     "stage interfaces and are not silently approximated here.\n"
     "\n"
     "Main options:\n"
-    "  -mode geometry|solve\n"
+    "  -mode geometry|density|solve|optimize|h8_initial_vtk|h8_postprocess|h8_full_vtk\n"
     "  -nx -ny -nz\n"
     "  -operator low_order|h8_matrix_free|emsfem_ann\n"
     "  -output_prefix <path>\n"
@@ -401,11 +401,15 @@ int main(int argc, char **argv) {
   char density_vec_file[PETSC_MAX_PATH_LEN] = "";
   char solution_file[PETSC_MAX_PATH_LEN] = "";
   char density_file[PETSC_MAX_PATH_LEN] = "";
+  char mask_file[PETSC_MAX_PATH_LEN] = "";
+  char post_vtk_file[PETSC_MAX_PATH_LEN] = "";
   PetscBool has_structured_vtk_file = PETSC_FALSE;
   PetscBool has_solid_vtk_file = PETSC_FALSE;
   PetscBool has_density_vec_file = PETSC_FALSE;
   PetscBool has_solution_file = PETSC_FALSE;
   PetscBool has_density_file = PETSC_FALSE;
+  PetscBool has_mask_file = PETSC_FALSE;
+  PetscBool has_post_vtk_file = PETSC_FALSE;
   PetscBool write_structured_vtk = PETSC_FALSE;
   PetscBool write_solid_vtk = PETSC_FALSE;
   PetscBool write_density_binary_flag = PETSC_FALSE;
@@ -414,11 +418,16 @@ int main(int argc, char **argv) {
   PetscBool is_solve_mode = PETSC_FALSE;
   PetscBool is_density_mode = PETSC_FALSE;
   PetscBool is_optimize_mode = PETSC_FALSE;
+  PetscBool is_h8_initial_vtk_mode = PETSC_FALSE;
+  PetscBool is_h8_postprocess_mode = PETSC_FALSE;
+  PetscBool is_h8_full_vtk_mode = PETSC_FALSE;
   PetscBool is_low_order = PETSC_FALSE;
   PetscBool is_h8_matrix_free = PETSC_FALSE;
   PetscBool is_emsfem_ann = PETSC_FALSE;
   PetscReal load = 1.0;
   PetscInt max_vtk_cells = 300000;
+  PetscInt post_stride = 5;
+  PetscInt post_max_samples = 2000000;
   DensityPipelineOptions pipeline_options;
   PetscBool write_density_vtk = PETSC_FALSE;
   char density_vtk_file[PETSC_MAX_PATH_LEN] = "";
@@ -431,6 +440,8 @@ int main(int argc, char **argv) {
   PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-nx", &grid.nx, nullptr));
   PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-ny", &grid.ny, nullptr));
   PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-nz", &grid.nz, nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-domain_height",
+                                &grid.physical_height, nullptr));
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-mode", mode, sizeof(mode),
                                   nullptr));
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-operator", operator_type,
@@ -474,6 +485,14 @@ int main(int argc, char **argv) {
                                   sizeof(solution_file), &has_solution_file));
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-density_file", density_file,
                                   sizeof(density_file), &has_density_file));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-mask_file", mask_file,
+                                  sizeof(mask_file), &has_mask_file));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-post_vtk_file", post_vtk_file,
+                                  sizeof(post_vtk_file), &has_post_vtk_file));
+  PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-post_stride", &post_stride,
+                               nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-post_max_samples",
+                               &post_max_samples, nullptr));
   PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-max_vtk_cells", &max_vtk_cells,
                                nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-filter_radius",
@@ -579,22 +598,32 @@ int main(int argc, char **argv) {
   PetscCall(PetscStrcmp(mode, "solve", &is_solve_mode));
   PetscCall(PetscStrcmp(mode, "density", &is_density_mode));
   PetscCall(PetscStrcmp(mode, "optimize", &is_optimize_mode));
+  PetscCall(PetscStrcmp(mode, "h8_initial_vtk", &is_h8_initial_vtk_mode));
+  PetscCall(PetscStrcmp(mode, "h8_postprocess", &is_h8_postprocess_mode));
+  PetscCall(PetscStrcmp(mode, "h8_full_vtk", &is_h8_full_vtk_mode));
   PetscCall(PetscStrcmp(operator_type, "low_order", &is_low_order));
   PetscCall(PetscStrcmp(operator_type, "h8_matrix_free", &is_h8_matrix_free));
   PetscCall(PetscStrcmp(operator_type, "emsfem_ann", &is_emsfem_ann));
 
-  PetscCheck(is_geometry_mode || is_solve_mode || is_density_mode || is_optimize_mode,
+  PetscCheck(is_geometry_mode || is_solve_mode || is_density_mode ||
+                 is_optimize_mode || is_h8_initial_vtk_mode ||
+                 is_h8_postprocess_mode ||
+                 is_h8_full_vtk_mode,
              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-             "-mode must be geometry, density, optimize, or solve");
+             "-mode must be geometry, density, optimize, solve, h8_initial_vtk, h8_postprocess, or h8_full_vtk");
   PetscCheck(is_low_order || is_h8_matrix_free || is_emsfem_ann,
              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
              "-operator must be low_order, h8_matrix_free, or emsfem_ann");
-  PetscCheck(ems_options.sub_n == 5, PETSC_COMM_WORLD, PETSC_ERR_SUP,
-             "The bundled ANN weights are trained for -ems_sub_n 5");
-  PetscCheck(!has_density_file, PETSC_COMM_WORLD, PETSC_ERR_SUP,
-             "-density_file is reserved for distributed HDF5/PETSc Vec input in the optimizer stage");
+  PetscCheck(ems_options.sub_n >= 2, PETSC_COMM_WORLD, PETSC_ERR_ARG_OUTOFRANGE,
+             "-ems_sub_n must be at least 2");
+  PetscCheck(!has_density_file || is_h8_postprocess_mode || is_h8_full_vtk_mode,
+             PETSC_COMM_WORLD,
+             PETSC_ERR_SUP,
+             "-density_file is currently accepted only by -mode h8_postprocess or h8_full_vtk");
   PetscCheck(grid.nx >= 2 && grid.ny >= 2 && grid.nz >= 2, PETSC_COMM_WORLD,
              PETSC_ERR_ARG_OUTOFRANGE, "nx, ny, and nz must be at least 2");
+  PetscCheck(grid.physical_height > 0.0, PETSC_COMM_WORLD,
+             PETSC_ERR_ARG_OUTOFRANGE, "-domain_height must be positive");
   PetscCheck(3.0 * static_cast<double>(grid.nx) * static_cast<double>(grid.ny) *
                      static_cast<double>(grid.nz) <=
                  static_cast<double>(PETSC_MAX_INT),
@@ -621,6 +650,10 @@ int main(int argc, char **argv) {
     PetscCall(PetscSNPrintf(density_vtk_file, sizeof(density_vtk_file),
                             "%s_density.vtk", output_prefix));
   }
+  if (!has_post_vtk_file) {
+    PetscCall(PetscSNPrintf(post_vtk_file, sizeof(post_vtk_file),
+                            "%s_downsample.vtk", output_prefix));
+  }
   if (!has_opt_vtk_file) {
     PetscCall(PetscSNPrintf(opt_vtk_file, sizeof(opt_vtk_file),
                             "%s_final.vtk", output_prefix));
@@ -645,6 +678,20 @@ int main(int argc, char **argv) {
     PetscCall(run_optimize_mode(grid, density_options, optimizer_options,
                                 ems_options,
                                 operator_type, output_prefix, opt_vtk_file));
+  } else if (is_h8_initial_vtk_mode) {
+    PetscCall(run_h8_initial_vtk(grid, density_options, optimizer_options,
+                                 post_vtk_file, post_stride,
+                                 post_max_samples));
+  } else if (is_h8_postprocess_mode) {
+    PetscCall(run_h8_density_postprocess(grid, optimizer_options, density_file,
+                                         has_mask_file ? mask_file : "",
+                                         post_vtk_file, post_stride,
+                                         post_max_samples));
+  } else if (is_h8_full_vtk_mode) {
+    PetscCall(run_h8_full_vtk_postprocess(grid, density_options,
+                                          optimizer_options, density_file,
+                                          has_mask_file ? mask_file : "",
+                                          post_vtk_file));
   } else {
     PetscCall(run_solve_mode(grid, density_options, ems_options, operator_type,
                              output_prefix, load, write_solution, write_structured_vtk,

@@ -44,16 +44,16 @@ bool in_triangle_2d(PetscReal px, PetscReal py,
 
 PetscReal domain_length(const Grid &grid) {
   return static_cast<PetscReal>(grid.nx - 1) /
-         static_cast<PetscReal>(grid.nz - 1);
+         static_cast<PetscReal>(grid.nz - 1) * domain_height(grid);
 }
 
 PetscReal domain_width(const Grid &grid) {
   return static_cast<PetscReal>(grid.ny - 1) /
-         static_cast<PetscReal>(grid.nz - 1);
+         static_cast<PetscReal>(grid.nz - 1) * domain_height(grid);
 }
 
-PetscReal domain_height(const Grid &) {
-  return 1.0;
+PetscReal domain_height(const Grid &grid) {
+  return grid.physical_height;
 }
 
 PetscReal density_at_normalized(PetscReal x, PetscReal y, PetscReal z,

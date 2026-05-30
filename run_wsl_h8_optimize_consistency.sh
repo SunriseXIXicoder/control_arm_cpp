@@ -6,7 +6,8 @@ NY="${NY:-7}"
 NZ="${NZ:-8}"
 ITERS="${ITERS:-2}"
 VOLFRAC="${VOLFRAC:-0.35}"
-export NX NY NZ ITERS VOLFRAC
+H8_PC_TYPE="${H8_PC_TYPE:-block_jacobi}"
+export NX NY NZ ITERS VOLFRAC H8_PC_TYPE
 
 mkdir -p result
 make wsl
@@ -31,7 +32,7 @@ for NP in 1 2; do
     -opt_write_final_vtk false \
     -output_prefix "${PREFIX}" \
     -ksp_type cg \
-    -pc_type jacobi \
+    -h8_pc_type "${H8_PC_TYPE}" \
     -log_view ":${PREFIX}_petsc.log" < /dev/null
 done
 

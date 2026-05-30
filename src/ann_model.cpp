@@ -22,6 +22,47 @@ PetscErrorCode read_text_file(const std::string &path, std::string *text) {
   return 0;
 }
 
+bool file_exists(const std::string &path) {
+  std::ifstream in(path, std::ios::in | std::ios::binary);
+  return in.good();
+}
+
+std::string first_existing_or_first(const std::vector<std::string> &paths) {
+  for (const std::string &path : paths) {
+    if (file_exists(path)) return path;
+  }
+  return paths.empty() ? std::string() : paths.front();
+}
+
+std::string legacy_ann_prefix(PetscInt sub_n) {
+  if (sub_n == 5) return "3DEMs_FEMBLC_20220821_input_5";
+  if (sub_n == 10) return "3DEMs_FEMBLC_20220824_input_10";
+  return "";
+}
+
+std::string choose_function_path(const std::string &base, PetscInt sub_n) {
+  std::vector<std::string> paths;
+  paths.push_back(base + "/model_function.json");
+  const std::string prefix = legacy_ann_prefix(sub_n);
+  if (!prefix.empty()) {
+    paths.push_back(base + "/model_function_" + prefix + "_layer1.json");
+  }
+  return first_existing_or_first(paths);
+}
+
+std::string choose_weight_path(const std::string &base, PetscInt sub_n,
+                               PetscInt layer) {
+  std::vector<std::string> paths;
+  paths.push_back(base + "/model_weight_layer" +
+                  std::to_string(static_cast<long long>(layer)) + ".json");
+  const std::string prefix = legacy_ann_prefix(sub_n);
+  if (!prefix.empty()) {
+    paths.push_back(base + "/model_weight_" + prefix + "_layer" +
+                    std::to_string(static_cast<long long>(layer)) + ".json");
+  }
+  return first_existing_or_first(paths);
+}
+
 std::vector<PetscReal> scan_numbers(const std::string &text) {
   std::vector<PetscReal> values;
   const char *ptr = text.c_str();
@@ -81,11 +122,12 @@ PetscReal activate(PetscReal x, const std::string &kind) {
 PetscErrorCode load_network(const std::string &weight_path,
                             const std::vector<std::string> &activations,
                             const std::vector<PetscInt> &dims,
+                            PetscInt network_input_dim,
                             AnnNetwork *network) {
   std::string text;
   PetscCall(read_text_file(weight_path, &text));
   const std::vector<PetscReal> numbers = scan_numbers(text);
-  PetscInt input_dim = 125;
+  PetscInt input_dim = network_input_dim;
   std::size_t offset = 0;
 
   network->layers.clear();
@@ -154,11 +196,16 @@ PetscErrorCode AnnNetwork::forward(const std::vector<PetscReal> &input,
 PetscErrorCode AnnShapeModel::load(const char *directory, PetscInt subcell_count) {
   sub_n = subcell_count;
   inside_dofs = 3 * (sub_n - 1) * (sub_n - 1) * (sub_n - 1);
+  const PetscInt network_count = sub_n - 1;
+  const PetscInt input_dim = sub_n * sub_n * sub_n;
+  const PetscInt slice_output =
+      (sub_n - 1) * (sub_n - 1) * 3 * 21;
+  PetscCheck(sub_n >= 2, PETSC_COMM_SELF, PETSC_ERR_ARG_OUTOFRANGE,
+             "-ems_sub_n must be at least 2");
 
   std::string func_text;
   const std::string base(directory);
-  const std::string func_path =
-      base + "/model_function_3DEMs_FEMBLC_20220821_input_5_layer1.json";
+  const std::string func_path = choose_function_path(base, sub_n);
   PetscCall(read_text_file(func_path, &func_text));
 
   std::vector<std::string> activations = scan_json_strings(func_text);
@@ -170,15 +217,17 @@ PetscErrorCode AnnShapeModel::load(const char *directory, PetscInt subcell_count
   }
   PetscCheck(!dims.empty(), PETSC_COMM_SELF, PETSC_ERR_FILE_UNEXPECTED,
              "ANN function file has no layer dimensions: %s", func_path.c_str());
-  PetscCheck(dims.back() == 1008, PETSC_COMM_SELF, PETSC_ERR_ARG_INCOMP,
-             "This ANN/EMsFEM path expects each shape network to output 1008 values");
+  PetscCheck(dims.back() == slice_output, PETSC_COMM_SELF, PETSC_ERR_ARG_INCOMP,
+             "ANN shape network output mismatch for -ems_sub_n %lld: expected %lld values per slice, got %lld",
+             static_cast<long long>(sub_n),
+             static_cast<long long>(slice_output),
+             static_cast<long long>(dims.back()));
 
-  networks.assign(4, AnnNetwork{});
-  for (PetscInt i = 0; i < 4; ++i) {
-    const std::string weight_path =
-        base + "/model_weight_3DEMs_FEMBLC_20220821_input_5_layer" +
-        std::to_string(static_cast<long long>(i + 1)) + ".json";
+  networks.assign(static_cast<std::size_t>(network_count), AnnNetwork{});
+  for (PetscInt i = 0; i < network_count; ++i) {
+    const std::string weight_path = choose_weight_path(base, sub_n, i + 1);
     PetscCall(load_network(weight_path, activations, dims,
+                           input_dim,
                            &networks[static_cast<std::size_t>(i)]));
   }
   return 0;
@@ -192,7 +241,7 @@ PetscErrorCode AnnShapeModel::predict_inside_shape(
              "ANN material input must contain sub_n^3 entries");
 
   std::vector<PetscReal> concatenated;
-  concatenated.reserve(4032);
+  concatenated.reserve(static_cast<std::size_t>(inside_dofs) * 21u);
   for (const AnnNetwork &network : networks) {
     std::vector<PetscReal> out;
     PetscCall(network.forward(material, &out));
