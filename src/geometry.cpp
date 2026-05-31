@@ -83,9 +83,9 @@ PetscReal density_at_normalized(PetscReal x, PetscReal y, PetscReal z,
   const PetscReal rA_keep = 0.30 * min_ld;
   const PetscReal rB_keep = 0.30 * min_ld;
   const PetscReal rC_keep = 0.13 * min_lw;
-  const PetscReal rA_pad = 0.35 * min_ld;
-  const PetscReal rB_pad = 0.35 * min_ld;
-  const PetscReal rC_pad = 0.15 * min_lw;
+  const PetscReal rA_pad = 0.45 * min_ld;
+  const PetscReal rB_pad = 0.45 * min_ld;
+  const PetscReal rC_pad = 0.18 * min_lw;
   const PetscReal rAB_void = 0.070 * PetscMin(DL, DW);
 
   const bool middle =
@@ -135,12 +135,42 @@ PetscReal density_at_normalized(PetscReal x, PetscReal y, PetscReal z,
       ((X - C[0]) * (X - C[0]) + (Y - C[1]) * (Y - C[1]) <=
        rC_pad * rC_pad) &&
       middle;
+  const PetscReal G[3] = {(A[0] + B[0] + C[0]) / 3.0,
+                          (A[1] + B[1] + C[1]) / 3.0,
+                          0.50 * DH};
+  const PetscReal neck_radius_ab = 0.14 * min_ld;
+  const PetscReal neck_radius_c = 0.10 * min_lw;
+  const PetscReal Aneck[3] = {A[0] + 0.55 * (G[0] - A[0]),
+                              A[1] + 0.55 * (G[1] - A[1]),
+                              A[2] + 0.55 * (G[2] - A[2])};
+  const PetscReal Bneck[3] = {B[0] + 0.55 * (G[0] - B[0]),
+                              B[1] + 0.55 * (G[1] - B[1]),
+                              B[2] + 0.55 * (G[2] - B[2])};
+  const PetscReal Cneck[3] = {C[0] + 0.45 * (G[0] - C[0]),
+                              C[1] + 0.45 * (G[1] - C[1]),
+                              C[2] + 0.45 * (G[2] - C[2])};
+  const bool neckA =
+      middle &&
+      segment_distance_squared(X, Y, Z, A[0], A[1], A[2], Aneck[0],
+                               Aneck[1], Aneck[2]) <=
+          neck_radius_ab * neck_radius_ab;
+  const bool neckB =
+      middle &&
+      segment_distance_squared(X, Y, Z, B[0], B[1], B[2], Bneck[0],
+                               Bneck[1], Bneck[2]) <=
+          neck_radius_ab * neck_radius_ab;
+  const bool neckC =
+      middle &&
+      segment_distance_squared(X, Y, Z, C[0], C[1], C[2], Cneck[0],
+                               Cneck[1], Cneck[2]) <=
+          neck_radius_c * neck_radius_c;
   const bool spring_mount =
       middle &&
       (PetscAbsReal(X - spring_center[0]) <= 0.105 * DL / 2.0) &&
       (PetscAbsReal(Y - spring_center[1]) <= 0.105 * DW / 2.0);
 
-  const bool outer_mask = triangle || padA || padB || padC;
+  const bool outer_mask = triangle || padA || padB || padC || neckA ||
+                          neckB || neckC;
   bool ab_void = false;
 
   const PetscReal ABx = B[0] - A[0];
