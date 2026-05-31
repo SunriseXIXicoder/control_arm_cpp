@@ -6,7 +6,7 @@ NX="${NX:-6}"
 NY="${NY:-4}"
 NZ="${NZ:-3}"
 PREFIX="${PREFIX:-result/ems_ann_smoke_${NX}_${NY}_${NZ}_np${NP}}"
-EMS_SUB_N="${EMS_SUB_N:-5}"
+EMS_SUB_N="${EMS_SUB_N:-20}"
 ANN_DIR="${ANN_DIR:-../input_${EMS_SUB_N}}"
 
 mkdir -p result

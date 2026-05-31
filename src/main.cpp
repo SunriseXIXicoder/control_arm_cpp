@@ -554,8 +554,12 @@ int main(int argc, char **argv) {
   PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-opt_heaviside_beta_interval",
                                &optimizer_options.heaviside_beta_interval,
                                nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_z_draft_closure",
+                                &optimizer_options.z_draft_closure, nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_z_draft_eta",
+                                &optimizer_options.z_draft_eta, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_load",
-                                &optimizer_options.load, nullptr));
+                                 &optimizer_options.load, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_ksp_rtol",
                                 &optimizer_options.ksp_rtol, nullptr));
   PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-opt_ksp_max_it",

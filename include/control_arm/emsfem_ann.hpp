@@ -9,8 +9,8 @@
 namespace control_arm {
 
 struct EmSfemAnnOptions {
-  char ann_dir[PETSC_MAX_PATH_LEN] = "../input_5";
-  PetscInt sub_n = 5;
+  char ann_dir[PETSC_MAX_PATH_LEN] = "../input_20";
+  PetscInt sub_n = 20;
   PetscBool cache_element_matrices = PETSC_TRUE;
   PetscReal cache_gib_limit = 0.0;
   PetscBool control_arm_bc = PETSC_FALSE;

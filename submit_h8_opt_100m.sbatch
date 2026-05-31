@@ -60,20 +60,25 @@ DOMAIN_HEIGHT="${DOMAIN_HEIGHT:-0.08}"
 OPT_MAX_ITER="${OPT_MAX_ITER:-5}"
 VOLFRAC="${VOLFRAC:-0.35}"
 OPT_FILTER_RADIUS="${OPT_FILTER_RADIUS:-1.5}"
-OPT_MOVE="${OPT_MOVE:-0.08}"
+OPT_Z_DRAFT_CLOSURE="${OPT_Z_DRAFT_CLOSURE:-true}"
+OPT_Z_DRAFT_ETA="${OPT_Z_DRAFT_ETA:-0.5}"
+OPT_MOVE="${OPT_MOVE:-0.04}"
 YOUNG_MODULUS="${YOUNG_MODULUS:-2.1e11}"
-PENAL="${PENAL:-3.0}"
-EMIN="${EMIN:-1e-6}"
-VOID_DENSITY="${VOID_DENSITY:-0.02}"
+PENAL="${PENAL:-1.5}"
+EMIN="${EMIN:-1e-4}"
+VOID_DENSITY="${VOID_DENSITY:-0.05}"
 OPT_RHO_MIN="${OPT_RHO_MIN:-1e-3}"
-KSP_RTOL="${KSP_RTOL:-1e-6}"
-KSP_MAX_IT="${KSP_MAX_IT:-4000}"
+KSP_RTOL="${KSP_RTOL:-1e-2}"
+KSP_MAX_IT="${KSP_MAX_IT:-1500}"
 KSP_TYPE="${KSP_TYPE:-fgmres}"
 OPT_CHECKPOINT_INTERVAL="${OPT_CHECKPOINT_INTERVAL:-1}"
-H8_PC_TYPE="${H8_PC_TYPE:-block_jacobi}"
+H8_PC_TYPE="${H8_PC_TYPE:-aux_elastic_hypre}"
+H8_AUX_REBUILD_INTERVAL="${H8_AUX_REBUILD_INTERVAL:-1}"
 H8_REUSE_INITIAL_GUESS="${H8_REUSE_INITIAL_GUESS:-true}"
 OPT_STOP_ON_KSP_DIVERGENCE="${OPT_STOP_ON_KSP_DIVERGENCE:-true}"
-PETSC_EXTRA_OPTIONS="${PETSC_EXTRA_OPTIONS:--ksp_gmres_restart 80 -ksp_norm_type unpreconditioned -ksp_monitor_true_residual}"
+H8_LOAD_CASE="${H8_LOAD_CASE:-0}"
+H8_INCLUDE_SPRING_LOAD="${H8_INCLUDE_SPRING_LOAD:-true}"
+PETSC_EXTRA_OPTIONS="${PETSC_EXTRA_OPTIONS:--ksp_gmres_restart 80 -ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg}"
 CXXSTD="${CXXSTD:-c++11}"
 JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-manual}}"
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
@@ -130,6 +135,8 @@ echo "  ksp_type=${KSP_TYPE}"
 echo "  h8_pc_type=${H8_PC_TYPE}"
 echo "  h8_reuse_initial_guess=${H8_REUSE_INITIAL_GUESS}"
 echo "  opt_stop_on_ksp_divergence=${OPT_STOP_ON_KSP_DIVERGENCE}"
+echo "  h8_load_case=${H8_LOAD_CASE}"
+echo "  h8_include_spring_load=${H8_INCLUDE_SPRING_LOAD}"
 echo "  checkpoint_interval=${OPT_CHECKPOINT_INTERVAL}"
 echo "  output_prefix=${PREFIX}"
 echo "  mpi_launcher=${MPI_LAUNCHER}"
@@ -156,8 +163,12 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -opt_max_iter "${OPT_MAX_ITER}" \
   -opt_move "${OPT_MOVE}" \
   -opt_filter_radius "${OPT_FILTER_RADIUS}" \
+  -opt_z_draft_closure "${OPT_Z_DRAFT_CLOSURE}" \
+  -opt_z_draft_eta "${OPT_Z_DRAFT_ETA}" \
   -opt_rho_min "${OPT_RHO_MIN}" \
   -opt_load 1.0 \
+  -h8_load_case "${H8_LOAD_CASE}" \
+  -h8_include_spring_load "${H8_INCLUDE_SPRING_LOAD}" \
   -opt_ksp_rtol "${KSP_RTOL}" \
   -opt_ksp_max_it "${KSP_MAX_IT}" \
   -opt_write_final_vtk false \
@@ -167,6 +178,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -output_prefix "${PREFIX}" \
   -ksp_type "${KSP_TYPE}" \
   -h8_pc_type "${H8_PC_TYPE}" \
+  -h8_aux_rebuild_interval "${H8_AUX_REBUILD_INTERVAL}" \
   -h8_reuse_initial_guess "${H8_REUSE_INITIAL_GUESS}" \
   -opt_stop_on_ksp_divergence "${OPT_STOP_ON_KSP_DIVERGENCE}" \
   -ksp_converged_reason \
