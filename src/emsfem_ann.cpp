@@ -1619,7 +1619,9 @@ PetscErrorCode fill_control_arm_load(DM da,
                                      const EmSfemAnnOptions &options,
                                      PetscReal load_scale,
                                      Vec b) {
-  static const PetscReal weights[3] = {0.06579, 0.78539, 0.14882};
+  // Keep the dominant vertical/spring case, but avoid letting one load case
+  // completely drive the topology into a single force path.
+  static const PetscReal weights[3] = {0.25, 0.50, 0.25};
   static const PetscReal p1_f[3][3] = {
       {91.0, 3597.0, 10230.0},
       {-814.0, 2716.0, 22726.0},
@@ -1632,6 +1634,14 @@ PetscErrorCode fill_control_arm_load(DM da,
       {2534.0, 10162.0, -8288.0},
       {-1790.0, 3503.0, -16398.0},
       {-3488.0, -4632.0, -7851.0}};
+  // Bushing/load-introduction moment at the B ring.  The previous pure-force
+  // B load allowed the optimizer to keep only a very narrow resultant-force
+  // path.  These moderate moments represent braking/cornering torsion and
+  // force the B ring to introduce load over a broader local region.
+  static const PetscReal p2_t[3][3] = {
+      {4200.0, -6200.0, 3600.0},
+      {-7600.0, 9200.0, -5200.0},
+      {5400.0, 6800.0, 6400.0}};
   static const PetscReal spring_mag[3] = {8000.0, 16000.0, 10000.0};
 
   PetscScalar ****bg = nullptr;
@@ -1653,7 +1663,7 @@ PetscErrorCode fill_control_arm_load(DM da,
     PetscReal wrench1[6] = {p1_f[cidx][0], p1_f[cidx][1], p1_f[cidx][2],
                             p1_t[cidx][0], p1_t[cidx][1], p1_t[cidx][2]};
     PetscReal wrench2[6] = {p2_f[cidx][0], p2_f[cidx][1], p2_f[cidx][2],
-                            0.0, 0.0, 0.0};
+                            p2_t[cidx][0], p2_t[cidx][1], p2_t[cidx][2]};
     PetscReal q1[6] = {};
     PetscReal q2[6] = {};
     PetscInt n1 = 0, n2 = 0;
@@ -2495,7 +2505,7 @@ PetscErrorCode write_ems_opt_vtk(DM uda, DM fda, const char *path,
 }
 
 PetscReal control_arm_case_weight(PetscInt load_case) {
-  static const PetscReal weights[3] = {0.06579, 0.78539, 0.14882};
+  static const PetscReal weights[3] = {0.25, 0.50, 0.25};
   if (load_case >= 1 && load_case <= 3) return weights[load_case - 1];
   return 1.0;
 }
