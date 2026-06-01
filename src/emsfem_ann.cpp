@@ -1471,6 +1471,94 @@ PetscBool is_fixed_node(PetscInt i, PetscInt j, PetscInt k,
              : simple_fixed_node(i);
 }
 
+PetscErrorCode attach_ems_elasticity_near_nullspace(DM uda,
+                                                    const EmSfemAnnContext &ctx,
+                                                    Mat P) {
+  PetscBool attach = PETSC_TRUE;
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr,
+                                "-ems_attach_elasticity_near_nullspace",
+                                &attach, nullptr));
+  if (!attach) return 0;
+
+  Vec basis[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  const Grid &grid = ctx.grid;
+  const PetscReal cx = 0.5 * domain_length(grid);
+  const PetscReal cy = 0.5 * domain_width(grid);
+  const PetscReal cz = 0.5 * domain_height(grid);
+
+  for (PetscInt m = 0; m < 6; ++m) {
+    PetscCall(DMCreateGlobalVector(uda, &basis[m]));
+    PetscCall(VecSet(basis[m], 0.0));
+  }
+
+  PetscCall(DMDAGetCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt m = 0; m < 6; ++m) {
+    PetscScalar ****v = nullptr;
+    PetscCall(DMDAVecGetArrayDOF(uda, basis[m], &v));
+    for (PetscInt k = zs; k < zs + zm; ++k) {
+      for (PetscInt j = ys; j < ys + ym; ++j) {
+        for (PetscInt i = xs; i < xs + xm; ++i) {
+          if (is_fixed_node(i, j, k, ctx)) continue;
+          PetscReal x = 0.0, y = 0.0, z = 0.0;
+          node_xyz(i, j, k, grid, &x, &y, &z);
+          x -= cx;
+          y -= cy;
+          z -= cz;
+          switch (m) {
+          case 0:
+            v[k][j][i][0] = 1.0;
+            break;
+          case 1:
+            v[k][j][i][1] = 1.0;
+            break;
+          case 2:
+            v[k][j][i][2] = 1.0;
+            break;
+          case 3:
+            v[k][j][i][1] = -z;
+            v[k][j][i][2] = y;
+            break;
+          case 4:
+            v[k][j][i][0] = z;
+            v[k][j][i][2] = -x;
+            break;
+          case 5:
+            v[k][j][i][0] = -y;
+            v[k][j][i][1] = x;
+            break;
+          }
+        }
+      }
+    }
+    PetscCall(DMDAVecRestoreArrayDOF(uda, basis[m], &v));
+  }
+
+  for (PetscInt i = 0; i < 6; ++i) {
+    for (PetscInt j = 0; j < i; ++j) {
+      PetscScalar dot = 0.0;
+      PetscCall(VecDot(basis[i], basis[j], &dot));
+      PetscCall(VecAXPY(basis[i], -dot, basis[j]));
+    }
+    PetscReal norm = 0.0;
+    PetscCall(VecNorm(basis[i], NORM_2, &norm));
+    PetscCheck(norm > PETSC_SMALL, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+               "Elasticity near-nullspace mode %lld is numerically zero",
+               static_cast<long long>(i));
+    PetscCall(VecScale(basis[i], 1.0 / norm));
+  }
+
+  MatNullSpace near_nullspace = nullptr;
+  PetscCall(MatNullSpaceCreate(PETSC_COMM_WORLD, PETSC_FALSE, 6, basis,
+                               &near_nullspace));
+  PetscCall(MatSetNearNullSpace(P, near_nullspace));
+  PetscCall(MatNullSpaceDestroy(&near_nullspace));
+  for (PetscInt m = 0; m < 6; ++m) PetscCall(VecDestroy(&basis[m]));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                        "EMsFEM ANN auxiliary matrix: attached 3D elasticity near-nullspace for GAMG\n"));
+  return 0;
+}
+
 PetscBool select_hole_node(PetscInt i, PetscInt j, PetscInt k,
                            const Grid &grid,
                            PetscInt which) {
@@ -2272,9 +2360,11 @@ PetscErrorCode create_ems_aux_elasticity_matrix(DM uda, DM cda,
                                                 const EmSfemAnnContext &ctx,
                                                 Mat *P) {
   PetscCall(DMCreateMatrix(uda, P));
+  PetscCall(MatSetBlockSize(*P, 3));
   PetscCall(MatSetOption(*P, MAT_SYMMETRIC, PETSC_TRUE));
   PetscCall(MatSetOption(*P, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE));
   PetscCall(assemble_ems_aux_elasticity_matrix(uda, cda, coarse_rho, ctx, *P));
+  PetscCall(attach_ems_elasticity_near_nullspace(uda, ctx, *P));
   return 0;
 }
 
@@ -2357,9 +2447,11 @@ PetscErrorCode assemble_ems_aux_ann_matrix(DM uda, EmSfemAnnContext *ctx,
 PetscErrorCode create_ems_aux_ann_matrix(DM uda, EmSfemAnnContext *ctx,
                                          Mat *P) {
   PetscCall(DMCreateMatrix(uda, P));
+  PetscCall(MatSetBlockSize(*P, 3));
   PetscCall(MatSetOption(*P, MAT_SYMMETRIC, PETSC_TRUE));
   PetscCall(MatSetOption(*P, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE));
   PetscCall(assemble_ems_aux_ann_matrix(uda, ctx, *P));
+  PetscCall(attach_ems_elasticity_near_nullspace(uda, *ctx, *P));
   return 0;
 }
 
