@@ -130,6 +130,23 @@ PetscInt fine_cell_count(const Grid &grid, PetscInt sub_n) {
          fine_nelz(grid, sub_n);
 }
 
+PetscErrorCode check_ems_fine_grid_size(const Grid &grid, PetscInt sub_n) {
+  const long double fnx = static_cast<long double>(grid.nx - 1) *
+                          static_cast<long double>(sub_n);
+  const long double fny = static_cast<long double>(grid.ny - 1) *
+                          static_cast<long double>(sub_n);
+  const long double fnz = static_cast<long double>(grid.nz - 1) *
+                          static_cast<long double>(sub_n);
+  const long double cells = fnx * fny * fnz;
+  PetscCheck(fnx <= static_cast<long double>(PETSC_MAX_INT) &&
+                 fny <= static_cast<long double>(PETSC_MAX_INT) &&
+                 fnz <= static_cast<long double>(PETSC_MAX_INT) &&
+                 cells <= static_cast<long double>(PETSC_MAX_INT),
+             PETSC_COMM_WORLD, PETSC_ERR_SUP,
+             "EMsFEM fine-density grid exceeds PetscInt capacity; rebuild PETSc with --with-64-bit-indices=1 or reduce nx/ny/nz/sub_n");
+  return 0;
+}
+
 PetscReal fine_cell_density(PetscInt i, PetscInt j, PetscInt k,
                             const Grid &grid,
                             const DensityOptions &options,
@@ -727,6 +744,116 @@ PetscErrorCode choose_ems_process_grid(const Grid &grid,
   return 0;
 }
 
+void ems_ownership_from_nodal_range(const PetscInt *node_lens,
+                                    PetscInt p,
+                                    PetscInt n_nodes,
+                                    PetscInt sub_n,
+                                    std::vector<PetscInt> *elem_lens,
+                                    std::vector<PetscInt> *fine_lens) {
+  elem_lens->assign(static_cast<std::size_t>(p), 0);
+  fine_lens->assign(static_cast<std::size_t>(p), 0);
+  PetscInt node_start = 0;
+  for (PetscInt r = 0; r < p; ++r) {
+    const PetscInt node_end = node_start + node_lens[r];
+    const PetscInt elem_start = PetscMin(node_start, n_nodes - 1);
+    const PetscInt elem_end = PetscMin(node_end, n_nodes - 1);
+    const PetscInt nelem = PetscMax(0, elem_end - elem_start);
+    (*elem_lens)[static_cast<std::size_t>(r)] = nelem;
+    (*fine_lens)[static_cast<std::size_t>(r)] = nelem * sub_n;
+    node_start = node_end;
+  }
+}
+
+PetscErrorCode ems_get_aligned_ownership(DM uda,
+                                         const Grid &grid,
+                                         PetscInt sub_n,
+                                         PetscInt *px,
+                                         PetscInt *py,
+                                         PetscInt *pz,
+                                         std::vector<PetscInt> *ex_lens,
+                                         std::vector<PetscInt> *ey_lens,
+                                         std::vector<PetscInt> *ez_lens,
+                                         std::vector<PetscInt> *fx_lens,
+                                         std::vector<PetscInt> *fy_lens,
+                                         std::vector<PetscInt> *fz_lens) {
+  const PetscInt *ux = nullptr;
+  const PetscInt *uy = nullptr;
+  const PetscInt *uz = nullptr;
+  PetscCall(DMDAGetInfo(uda, nullptr, nullptr, nullptr, nullptr,
+                        px, py, pz, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr));
+  PetscCall(DMDAGetOwnershipRanges(uda, &ux, &uy, &uz));
+  ems_ownership_from_nodal_range(ux, *px, grid.nx, sub_n, ex_lens, fx_lens);
+  ems_ownership_from_nodal_range(uy, *py, grid.ny, sub_n, ey_lens, fy_lens);
+  ems_ownership_from_nodal_range(uz, *pz, grid.nz, sub_n, ez_lens, fz_lens);
+  return 0;
+}
+
+PetscErrorCode check_ems_fda_ghost_covers_element_box(DM fda,
+                                                      const ElementCacheBox &box,
+                                                      PetscInt sub_n,
+                                                      const char *stage) {
+  PetscInt fxs = 0, fys = 0, fzs = 0, fxm = 0, fym = 0, fzm = 0;
+  PetscCall(DMDAGetGhostCorners(fda, &fxs, &fys, &fzs, &fxm, &fym, &fzm));
+  const PetscInt need_x0 = box.xs * sub_n;
+  const PetscInt need_y0 = box.ys * sub_n;
+  const PetscInt need_z0 = box.zs * sub_n;
+  const PetscInt need_x1 = (box.xs + box.xm) * sub_n;
+  const PetscInt need_y1 = (box.ys + box.ym) * sub_n;
+  const PetscInt need_z1 = (box.zs + box.zm) * sub_n;
+  PetscCheck(need_x0 >= fxs && need_x1 <= fxs + fxm &&
+                 need_y0 >= fys && need_y1 <= fys + fym &&
+                 need_z0 >= fzs && need_z1 <= fzs + fzm,
+             PETSC_COMM_SELF, PETSC_ERR_ARG_INCOMP,
+             "%s: fda ghost does not cover EMsFEM fine cells: need x=[%lld,%lld) y=[%lld,%lld) z=[%lld,%lld), ghost x=[%lld,%lld) y=[%lld,%lld) z=[%lld,%lld)",
+             stage,
+             static_cast<long long>(need_x0),
+             static_cast<long long>(need_x1),
+             static_cast<long long>(need_y0),
+             static_cast<long long>(need_y1),
+             static_cast<long long>(need_z0),
+             static_cast<long long>(need_z1),
+             static_cast<long long>(fxs),
+             static_cast<long long>(fxs + fxm),
+             static_cast<long long>(fys),
+             static_cast<long long>(fys + fym),
+             static_cast<long long>(fzs),
+             static_cast<long long>(fzs + fzm));
+  return 0;
+}
+
+PetscErrorCode check_ems_uda_ghost_covers_element_box(DM uda,
+                                                      const ElementCacheBox &box,
+                                                      const char *stage) {
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscCall(DMDAGetGhostCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
+  const PetscInt need_x0 = box.xs;
+  const PetscInt need_y0 = box.ys;
+  const PetscInt need_z0 = box.zs;
+  const PetscInt need_x1 = box.xs + box.xm + 1;
+  const PetscInt need_y1 = box.ys + box.ym + 1;
+  const PetscInt need_z1 = box.zs + box.zm + 1;
+  PetscCheck(need_x0 >= xs && need_x1 <= xs + xm &&
+                 need_y0 >= ys && need_y1 <= ys + ym &&
+                 need_z0 >= zs && need_z1 <= zs + zm,
+             PETSC_COMM_SELF, PETSC_ERR_ARG_INCOMP,
+             "%s: uda ghost does not cover EMsFEM coarse element nodes: need x=[%lld,%lld) y=[%lld,%lld) z=[%lld,%lld), ghost x=[%lld,%lld) y=[%lld,%lld) z=[%lld,%lld)",
+             stage,
+             static_cast<long long>(need_x0),
+             static_cast<long long>(need_x1),
+             static_cast<long long>(need_y0),
+             static_cast<long long>(need_y1),
+             static_cast<long long>(need_z0),
+             static_cast<long long>(need_z1),
+             static_cast<long long>(xs),
+             static_cast<long long>(xs + xm),
+             static_cast<long long>(ys),
+             static_cast<long long>(ys + ym),
+             static_cast<long long>(zs),
+             static_cast<long long>(zs + zm));
+  return 0;
+}
+
 PetscErrorCode create_ems_opt_dms(const Grid &grid,
                                   PetscInt sub_n,
                                   PetscInt fine_stencil_width,
@@ -736,6 +863,7 @@ PetscErrorCode create_ems_opt_dms(const Grid &grid,
   const PetscInt fstencil = PetscMax(1, fine_stencil_width);
   PetscInt px = 1, py = 1, pz = 1;
   PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD, &ranks));
+  PetscCall(check_ems_fine_grid_size(grid, sub_n));
   PetscCall(choose_ems_process_grid(grid, sub_n, fstencil, ranks,
                                     &px, &py, &pz));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
@@ -752,12 +880,16 @@ PetscErrorCode create_ems_opt_dms(const Grid &grid,
   PetscCall(DMSetFromOptions(*uda));
   PetscCall(DMSetUp(*uda));
 
+  std::vector<PetscInt> ex_lens, ey_lens, ez_lens;
+  std::vector<PetscInt> fx_lens, fy_lens, fz_lens;
+  PetscCall(ems_get_aligned_ownership(*uda, grid, sub_n, &px, &py, &pz,
+                                      &ex_lens, &ey_lens, &ez_lens,
+                                      &fx_lens, &fy_lens, &fz_lens));
   PetscCall(DMDACreate3d(PETSC_COMM_WORLD, DM_BOUNDARY_NONE, DM_BOUNDARY_NONE,
                          DM_BOUNDARY_NONE, DMDA_STENCIL_BOX,
                          fine_nelx(grid, sub_n), fine_nely(grid, sub_n),
                          fine_nelz(grid, sub_n), px, py, pz, 1, fstencil,
-                         nullptr, nullptr, nullptr, fda));
-  PetscCall(DMSetFromOptions(*fda));
+                         fx_lens.data(), fy_lens.data(), fz_lens.data(), fda));
   PetscCall(DMSetUp(*fda));
   return 0;
 }
@@ -1357,6 +1489,8 @@ PetscErrorCode rebuild_local_k_cache_from_rho(EmSfemAnnContext *ctx,
   box.ym = PetscMax(0, ye - box.ys);
   box.zm = PetscMax(0, ze - box.zs);
   ctx->cache_box = box;
+  PetscCall(check_ems_fda_ghost_covers_element_box(
+      fda, box, sub_n, "EMsFEM K-cache rebuild"));
   const std::size_t elems =
       static_cast<std::size_t>(box.xm) * static_cast<std::size_t>(box.ym) *
       static_cast<std::size_t>(box.zm);
@@ -2081,14 +2215,16 @@ PetscErrorCode ems_block_jacobi_apply(PC pc, Vec x, Vec y) {
 
 PetscErrorCode create_ems_coarse_density_dm(DM uda, const Grid &grid, DM *cda) {
   PetscInt px = 1, py = 1, pz = 1;
-  PetscCall(DMDAGetInfo(uda, nullptr, nullptr, nullptr, nullptr,
-                        &px, &py, &pz, nullptr, nullptr, nullptr,
-                        nullptr, nullptr, nullptr));
+  std::vector<PetscInt> ex_lens, ey_lens, ez_lens;
+  std::vector<PetscInt> fx_lens, fy_lens, fz_lens;
+  PetscCall(ems_get_aligned_ownership(uda, grid, 1, &px, &py, &pz,
+                                      &ex_lens, &ey_lens, &ez_lens,
+                                      &fx_lens, &fy_lens, &fz_lens));
   PetscCall(DMDACreate3d(PETSC_COMM_WORLD, DM_BOUNDARY_NONE,
                          DM_BOUNDARY_NONE, DM_BOUNDARY_NONE,
                          DMDA_STENCIL_BOX, grid.nx - 1, grid.ny - 1,
                          grid.nz - 1, px, py, pz, 1, 2,
-                         nullptr, nullptr, nullptr, cda));
+                         ex_lens.data(), ey_lens.data(), ez_lens.data(), cda));
   PetscCall(DMSetUp(*cda));
   return 0;
 }
@@ -2109,6 +2245,15 @@ PetscErrorCode build_ems_coarse_density(DM cda, DM fda, Vec fine_rho,
   PetscCall(DMDAVecGetArrayRead(fda, local_rho, &rho));
   PetscCall(DMDAVecGetArray(cda, coarse_rho, &coarse));
   PetscCall(DMDAGetCorners(cda, &xs, &ys, &zs, &xm, &ym, &zm));
+  ElementCacheBox box;
+  box.xs = xs;
+  box.ys = ys;
+  box.zs = zs;
+  box.xm = xm;
+  box.ym = ym;
+  box.zm = zm;
+  PetscCall(check_ems_fda_ghost_covers_element_box(
+      fda, box, sub_n, "EMsFEM coarse-density build"));
 
   for (PetscInt ez = zs; ez < zs + zm; ++ez) {
     for (PetscInt ey = ys; ey < ys + ym; ++ey) {
@@ -2716,12 +2861,26 @@ PetscErrorCode compute_ems_fine_sensitivity(EmSfemAnnContext *ctx,
       PetscMin(ctx->grid.ny - 2, (ys + ym - 1) / sub_n);
   const PetscInt ez_end =
       PetscMin(ctx->grid.nz - 2, (zs + zm - 1) / sub_n);
+  if (ex_start <= ex_end && ey_start <= ey_end && ez_start <= ez_end) {
+    ElementCacheBox box;
+    box.xs = ex_start;
+    box.ys = ey_start;
+    box.zs = ez_start;
+    box.xm = ex_end - ex_start + 1;
+    box.ym = ey_end - ey_start + 1;
+    box.zm = ez_end - ez_start + 1;
+    PetscCall(check_ems_fda_ghost_covers_element_box(
+        fda, box, sub_n, "EMsFEM sensitivity"));
+    PetscCall(check_ems_uda_ghost_covers_element_box(
+        uda, box, "EMsFEM sensitivity"));
+  }
 
   for (PetscInt ez = ez_start; ez <= ez_end; ++ez) {
     for (PetscInt ey = ey_start; ey <= ey_end; ++ey) {
       for (PetscInt ex = ex_start; ex <= ex_end; ++ex) {
         PetscReal ue[kElementDofs] = {};
-        PetscReal energies[125] = {};
+        std::vector<PetscReal> energies(
+            static_cast<std::size_t>(sub_n * sub_n * sub_n), 0.0);
         std::vector<PetscReal> material;
         material.reserve(static_cast<std::size_t>(sub_n * sub_n * sub_n));
 
@@ -2747,7 +2906,7 @@ PetscErrorCode compute_ems_fine_sensitivity(EmSfemAnnContext *ctx,
           }
         }
 
-        PetscCall(compute_fine_cell_energies(ctx, material, ue, energies));
+        PetscCall(compute_fine_cell_energies(ctx, material, ue, energies.data()));
         for (PetscInt fz = 0; fz < sub_n; ++fz) {
           for (PetscInt fy = 0; fy < sub_n; ++fy) {
             for (PetscInt fx = 0; fx < sub_n; ++fx) {
@@ -3650,8 +3809,21 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       PetscCall(KSPGetResidualNorm(ksp, &case_rnorm));
       KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
       PetscCall(KSPGetConvergedReason(ksp, &reason));
-      if (reason > 0) ++converged_cases;
-      else ++diverged_cases;
+      its += case_its;
+      rnorm_max = PetscMax(rnorm_max, case_rnorm);
+      if (reason > 0) {
+        ++converged_cases;
+      } else {
+        ++diverged_cases;
+        PetscCall(PetscPrintf(
+            PETSC_COMM_WORLD,
+            "EMsFEM ANN load_case=%lld linear solve did not converge; skipping invalid sensitivity for this case\n",
+            static_cast<long long>(load_case)));
+        PetscCheck(have_last_good, PETSC_COMM_WORLD, PETSC_ERR_CONV_FAILED,
+                   "First EMsFEM ANN linear solve did not converge (%lld diverged load case(s)); refusing to update the design with an invalid displacement field",
+                   static_cast<long long>(diverged_cases));
+        continue;
+      }
       PetscCall(VecDot(b, u, &dot));
       {
         PetscLogDouble stage_start = 0.0;
@@ -3666,8 +3838,6 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       PetscCall(VecAXPY(dc_phys, weight, dc_case));
       compliance += weight * PetscRealPart(dot);
       volume = case_volume;
-      its += case_its;
-      rnorm_max = PetscMax(rnorm_max, case_rnorm);
     }
     rnorm = rnorm_max;
     PetscCheck(!optimizer_options.stability_guard || diverged_cases == 0 ||
@@ -3690,7 +3860,8 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     PetscBool accepted = PETSC_TRUE;
     PetscReal raw_design_volume = 0.0;
     PetscCall(compute_design_mean(fda, rho_design, mask, &raw_design_volume));
-    const PetscReal projected_volume_gap = volume - raw_design_volume;
+    const PetscReal projected_volume_gap =
+        diverged_cases > 0 ? 0.0 : volume - raw_design_volume;
     PetscReal effective_raw_volfrac = optimizer_options.volfrac;
     if (optimizer_options.projected_volume_correction) {
       effective_raw_volfrac = optimizer_options.volfrac - projected_volume_gap;
@@ -3935,6 +4106,11 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       }
       PetscCall(KSPGetIterationNumber(ksp, &case_its));
       PetscCall(KSPGetResidualNorm(ksp, &case_rnorm));
+      KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
+      PetscCall(KSPGetConvergedReason(ksp, &reason));
+      PetscCheck(reason > 0, PETSC_COMM_WORLD, PETSC_ERR_CONV_FAILED,
+                 "Final EMsFEM ANN linear solve did not converge for load_case=%lld",
+                 static_cast<long long>(load_case));
       PetscCall(VecDot(b, u, &dot));
       {
         PetscLogDouble stage_start = 0.0;
