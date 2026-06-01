@@ -88,14 +88,21 @@ OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
 OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-0}"
 CACHE_K="${CACHE_K:-true}"
 CACHE_GIB_LIMIT="${CACHE_GIB_LIMIT:-8}"
-KSP_TYPE="${KSP_TYPE:-cg}"
-PC_TYPE="${PC_TYPE:-shell}"
+EMS_PC_TYPE="${EMS_PC_TYPE:-aux_hypre}"
+if [ "${EMS_PC_TYPE}" = "block_jacobi" ]; then
+  KSP_TYPE="${KSP_TYPE:-cg}"
+  PC_TYPE="${PC_TYPE:-shell}"
+  KSP_EXTRA="${KSP_EXTRA:-}"
+else
+  KSP_TYPE="${KSP_TYPE:-fgmres}"
+  PC_TYPE="${PC_TYPE:-hypre}"
+  KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
+fi
 KSP_MAX_IT="${KSP_MAX_IT:-5000}"
 KSP_RTOL="${KSP_RTOL:-1e-4}"
 KSP_ATOL="${KSP_ATOL:-1e-12}"
 WRITE_FINAL_VTK="${WRITE_FINAL_VTK:-false}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
-KSP_EXTRA="${KSP_EXTRA:-}"
 CXXSTD="${CXXSTD:-c++11}"
 JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-manual}}"
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
@@ -147,6 +154,7 @@ echo "  include_spring_load=${INCLUDE_SPRING_LOAD}"
 echo "  volfrac=${VOLFRAC}"
 echo "  ab_triangle_retract=${AB_TRIANGLE_RETRACT}"
 echo "  heaviside=${OPT_HEAVISIDE} beta0=${OPT_HEAVISIDE_BETA_INITIAL} beta_max=${OPT_HEAVISIDE_BETA_MAX} beta_interval=${OPT_HEAVISIDE_BETA_INTERVAL}"
+echo "  ems_pc_type=${EMS_PC_TYPE}"
 echo "  ksp_type=${KSP_TYPE} pc_type=${PC_TYPE} ksp_rtol=${KSP_RTOL} ksp_max_it=${KSP_MAX_IT}"
 echo "  output_prefix=${PREFIX}"
 echo "  mpi_launcher=${MPI_LAUNCHER}"
@@ -198,6 +206,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -ems_sub_n "${EMS_SUB_N}" \
   -ems_cache_element_matrices "${CACHE_K}" \
   -ems_cache_gib_limit "${CACHE_GIB_LIMIT}" \
+  -ems_pc_type "${EMS_PC_TYPE}" \
   -control_arm_bc "${CONTROL_ARM_BC}" \
   -load_case "${LOAD_CASE}" \
   -include_spring_load "${INCLUDE_SPRING_LOAD}" \
