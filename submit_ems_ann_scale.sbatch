@@ -107,7 +107,7 @@ case "${EMS_PC_TYPE}" in
   aux_ann_gamg|aux_elastic_gamg|aux_gamg)
     KSP_TYPE="${KSP_TYPE:-fgmres}"
     PC_TYPE="${PC_TYPE:-gamg}"
-    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_gamg_type agg -pc_gamg_threshold 0.02 -pc_gamg_square_graph 1 -pc_gamg_agg_nsmooths 2 -mg_levels_ksp_type chebyshev -mg_levels_ksp_max_it 2 -mg_levels_pc_type jacobi}"
+    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_gamg_type agg}"
     ;;
   *)
     KSP_TYPE="${KSP_TYPE:-fgmres}"
