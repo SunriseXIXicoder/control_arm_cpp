@@ -2406,7 +2406,7 @@ PetscErrorCode get_ems_pc_type_option(char *ems_pc_type,
                                       size_t ems_pc_type_size,
                                       PetscBool *uses_aux_matrix) {
   PetscBool has_ems_pc_type = PETSC_FALSE;
-  PetscCall(PetscStrncpy(ems_pc_type, "aux_elastic_hypre", ems_pc_type_size));
+  PetscCall(PetscStrncpy(ems_pc_type, "aux_ann_gamg", ems_pc_type_size));
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-ems_pc_type",
                                   ems_pc_type, ems_pc_type_size,
                                   &has_ems_pc_type));
@@ -3244,7 +3244,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   TimingTotals timings;
   PetscLogDouble topopt_start = 0.0;
   PetscLogDouble setup_start = 0.0;
-  char ems_pc_type[64] = "aux_elastic_hypre";
+  char ems_pc_type[64] = "aux_ann_gamg";
   PetscBool ems_uses_aux_matrix = PETSC_FALSE;
   PetscCall(PetscTime(&topopt_start));
   PetscCall(PetscTime(&setup_start));

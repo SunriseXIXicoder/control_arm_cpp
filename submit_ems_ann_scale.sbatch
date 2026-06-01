@@ -96,21 +96,29 @@ OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
 OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-0}"
 CACHE_K="${CACHE_K:-true}"
 CACHE_GIB_LIMIT="${CACHE_GIB_LIMIT:-8}"
-EMS_PC_TYPE="${EMS_PC_TYPE:-aux_elastic_hypre}"
+EMS_PC_TYPE="${EMS_PC_TYPE:-aux_ann_gamg}"
 KSP_GMRES_RESTART="${KSP_GMRES_RESTART:-100}"
-if [ "${EMS_PC_TYPE}" = "block_jacobi" ]; then
-  KSP_TYPE="${KSP_TYPE:-cg}"
-  PC_TYPE="${PC_TYPE:-shell}"
-  KSP_EXTRA="${KSP_EXTRA:-}"
-else
-  KSP_TYPE="${KSP_TYPE:-fgmres}"
-  PC_TYPE="${PC_TYPE:-hypre}"
-  if [ "${EMS_PC_TYPE}" = "aux_ann_hypre" ] || [ "${EMS_PC_TYPE}" = "aux_elastic_hypre" ]; then
-    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3}"
-  else
-    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
-  fi
-fi
+case "${EMS_PC_TYPE}" in
+  block_jacobi)
+    KSP_TYPE="${KSP_TYPE:-cg}"
+    PC_TYPE="${PC_TYPE:-shell}"
+    KSP_EXTRA="${KSP_EXTRA:-}"
+    ;;
+  aux_ann_gamg|aux_elastic_gamg|aux_gamg)
+    KSP_TYPE="${KSP_TYPE:-fgmres}"
+    PC_TYPE="${PC_TYPE:-gamg}"
+    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_gamg_type agg}"
+    ;;
+  *)
+    KSP_TYPE="${KSP_TYPE:-fgmres}"
+    PC_TYPE="${PC_TYPE:-hypre}"
+    if [ "${EMS_PC_TYPE}" = "aux_ann_hypre" ] || [ "${EMS_PC_TYPE}" = "aux_elastic_hypre" ]; then
+      KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3}"
+    else
+      KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
+    fi
+    ;;
+esac
 case "${EMS_PC_TYPE}" in
   *hypre*)
     if ! grep -q 'PETSC_HAVE_HYPRE' "${PETSC_DIR}/${PETSC_ARCH}/include/petscconf.h" 2>/dev/null; then
@@ -132,7 +140,7 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
 CXXSTD="${CXXSTD:-c++11}"
 JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-manual}}"
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
-RUN_LABEL="${RUN_LABEL:-ems_ann_10m_sub5_auxelastic}"
+RUN_LABEL="${RUN_LABEL:-ems_ann_10m_sub5_auxanngamg}"
 PREFIX="${OUTPUT_PREFIX:-result/${RUN_LABEL}_${NX}_${NY}_${NZ}_${JOB_ID}}"
 NODES_ALLOC="${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}"
 TASKS_PER_NODE_ALLOC="${SLURM_NTASKS_PER_NODE:-${SLURM_CPUS_ON_NODE:-28}}"
