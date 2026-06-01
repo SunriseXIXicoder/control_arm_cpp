@@ -74,7 +74,7 @@ h8_guard_required_hypre_pc() {
   esac
 
   echo "ERROR: production H8 run requires a hypre-backed preconditioner." >&2
-  echo "Current H8_PC_TYPE=${H8_PC_TYPE:-unset}; expected aux_elastic_hypre for 10M/100M runs." >&2
-  echo "Set H8_PC_TYPE=aux_elastic_hypre, or set REQUIRE_H8_HYPRE_PC=false only for explicit diagnostics." >&2
+  echo "Current H8_PC_TYPE=${H8_PC_TYPE:-unset}; expected aux_hypre or aux_elastic_hypre for 10M/100M runs." >&2
+  echo "Set H8_PC_TYPE=aux_hypre, or set REQUIRE_H8_HYPRE_PC=false only for explicit diagnostics." >&2
   exit 2
 }

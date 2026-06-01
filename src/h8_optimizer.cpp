@@ -524,15 +524,17 @@ PetscErrorCode create_h8_dms(const Grid &grid, PetscInt element_stencil_width,
                              DM *uda, DM *eda) {
   PetscMPIInt ranks = 1;
   const PetscInt estencil = PetscMax(1, element_stencil_width);
+  const PetscInt density_stencil = PetscMax(estencil, 2);
   PetscInt px = 1, py = 1, pz = 1;
   PetscCallMPI(MPI_Comm_size(PETSC_COMM_WORLD, &ranks));
   PetscCall(choose_h8_process_grid(grid, estencil, ranks, &px, &py, &pz));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "H8 optimizer DMDA process grid: px=%lld py=%lld pz=%lld, element_stencil=%lld\n",
+                        "H8 optimizer DMDA process grid: px=%lld py=%lld pz=%lld, filter_stencil=%lld density_stencil=%lld\n",
                         static_cast<long long>(px),
                         static_cast<long long>(py),
                         static_cast<long long>(pz),
-                        static_cast<long long>(estencil)));
+                        static_cast<long long>(estencil),
+                        static_cast<long long>(density_stencil)));
 
   PetscCall(DMDACreate3d(PETSC_COMM_WORLD, DM_BOUNDARY_NONE, DM_BOUNDARY_NONE,
                          DM_BOUNDARY_NONE, DMDA_STENCIL_BOX,
@@ -545,7 +547,7 @@ PetscErrorCode create_h8_dms(const Grid &grid, PetscInt element_stencil_width,
   PetscCall(DMDACreate3d(PETSC_COMM_WORLD, DM_BOUNDARY_NONE, DM_BOUNDARY_NONE,
                          DM_BOUNDARY_NONE, DMDA_STENCIL_BOX,
                          grid.nx - 1, grid.ny - 1, grid.nz - 1,
-                         px, py, pz, 1, estencil,
+                         px, py, pz, 1, density_stencil,
                          nullptr, nullptr, nullptr, eda));
   PetscCall(DMSetFromOptions(*eda));
   PetscCall(DMSetUp(*eda));
@@ -1317,7 +1319,7 @@ PetscErrorCode assemble_h8_aux_laplacian_matrix(DM uda, DM eda, Vec rho,
           vals[ncols] = PetscMax(diag, PETSC_SMALL);
           ++ncols;
           PetscCall(MatSetValuesStencil(P, 1, &row, ncols, cols, vals,
-                                         INSERT_VALUES));
+                                         ADD_VALUES));
         }
       }
     }
@@ -1515,7 +1517,7 @@ PetscErrorCode configure_h8_ksp(KSP ksp, Mat A, Mat P, DM uda, DM eda, Vec rho,
     PetscCheck(allow_large_block_jacobi ||
                    ndof < large_block_jacobi_dof_limit,
                PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-               "Refusing H8 block_jacobi on %lld DOF. It is intended for small diagnostics and stalled in production; use -h8_pc_type aux_elastic_hypre or set -h8_allow_large_block_jacobi true.",
+               "Refusing H8 block_jacobi on %lld DOF. It is intended for small diagnostics and stalled in production; use -h8_pc_type aux_hypre or set -h8_allow_large_block_jacobi true.",
                static_cast<long long>(ndof));
   }
   PetscCall(KSPSetOperators(ksp, A, P ? P : A));
