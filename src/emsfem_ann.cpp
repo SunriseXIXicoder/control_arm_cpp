@@ -2175,9 +2175,110 @@ PetscErrorCode create_ems_aux_laplacian_matrix(DM uda, DM cda,
   return 0;
 }
 
+PetscErrorCode assemble_ems_aux_ann_matrix(DM uda, EmSfemAnnContext *ctx,
+                                           Mat P) {
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscReal temp_ke[kElementDofs * kElementDofs] = {};
+  const Grid &grid = ctx->grid;
+
+  PetscCall(MatZeroEntries(P));
+  PetscCall(DMDAGetCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        for (PetscInt c = 0; c < 3; ++c) {
+          MatStencil row;
+          MatStencil cols[8 * 8 * 3];
+          PetscScalar vals[8 * 8 * 3];
+          PetscInt ncols = 0;
+          row.i = i;
+          row.j = j;
+          row.k = k;
+          row.c = c;
+
+          if (is_fixed_node(i, j, k, *ctx)) {
+            cols[0] = row;
+            vals[0] = 1.0;
+            PetscCall(MatSetValuesStencil(P, 1, &row, 1, cols, vals,
+                                           ADD_VALUES));
+            continue;
+          }
+
+          const PetscInt ex0 = PetscMax(0, i - 1);
+          const PetscInt ex1 = PetscMin(i, grid.nx - 2);
+          const PetscInt ey0 = PetscMax(0, j - 1);
+          const PetscInt ey1 = PetscMin(j, grid.ny - 2);
+          const PetscInt ez0 = PetscMax(0, k - 1);
+          const PetscInt ez1 = PetscMin(k, grid.nz - 2);
+          for (PetscInt ez = ez0; ez <= ez1; ++ez) {
+            for (PetscInt ey = ey0; ey <= ey1; ++ey) {
+              for (PetscInt ex = ex0; ex <= ex1; ++ex) {
+                PetscReal *ke = cached_element_matrix(ctx, ex, ey, ez);
+                if (!ke) {
+                  PetscCall(compute_ems_element_matrix(ctx, ex, ey, ez,
+                                                       temp_ke));
+                  ke = temp_ke;
+                }
+                const PetscInt row_node = h8_local_node(i - ex, j - ey, k - ez);
+                const PetscInt erow = 3 * row_node + c;
+                for (PetscInt col_node = 0; col_node < 8; ++col_node) {
+                  PetscInt ni = 0, nj = 0, nk = 0;
+                  h8_node_coords(ex, ey, ez, col_node, &ni, &nj, &nk);
+                  if (is_fixed_node(ni, nj, nk, *ctx)) continue;
+                  for (PetscInt d = 0; d < 3; ++d) {
+                    const PetscInt ecol = 3 * col_node + d;
+                    cols[ncols].i = ni;
+                    cols[ncols].j = nj;
+                    cols[ncols].k = nk;
+                    cols[ncols].c = d;
+                    vals[ncols] = ke[kElementDofs * erow + ecol];
+                    ++ncols;
+                  }
+                }
+              }
+            }
+          }
+
+          PetscCall(MatSetValuesStencil(P, 1, &row, ncols, cols, vals,
+                                         ADD_VALUES));
+        }
+      }
+    }
+  }
+
+  PetscCall(MatAssemblyBegin(P, MAT_FINAL_ASSEMBLY));
+  PetscCall(MatAssemblyEnd(P, MAT_FINAL_ASSEMBLY));
+  return 0;
+}
+
+PetscErrorCode create_ems_aux_ann_matrix(DM uda, EmSfemAnnContext *ctx,
+                                         Mat *P) {
+  PetscCall(DMCreateMatrix(uda, P));
+  PetscCall(MatSetOption(*P, MAT_SYMMETRIC, PETSC_TRUE));
+  PetscCall(MatSetOption(*P, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_TRUE));
+  PetscCall(assemble_ems_aux_ann_matrix(uda, ctx, *P));
+  return 0;
+}
+
 PetscBool ems_pc_type_uses_aux_matrix(const char *ems_pc_type) {
   return (std::strcmp(ems_pc_type, "aux_gamg") == 0 ||
+          std::strcmp(ems_pc_type, "aux_hypre") == 0 ||
+          std::strcmp(ems_pc_type, "aux_ann_gamg") == 0 ||
+          std::strcmp(ems_pc_type, "aux_ann_hypre") == 0)
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscBool ems_pc_type_uses_low_order_aux_matrix(const char *ems_pc_type) {
+  return (std::strcmp(ems_pc_type, "aux_gamg") == 0 ||
           std::strcmp(ems_pc_type, "aux_hypre") == 0)
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscBool ems_pc_type_uses_ann_aux_matrix(const char *ems_pc_type) {
+  return (std::strcmp(ems_pc_type, "aux_ann_gamg") == 0 ||
+          std::strcmp(ems_pc_type, "aux_ann_hypre") == 0)
              ? PETSC_TRUE
              : PETSC_FALSE;
 }
@@ -2186,7 +2287,7 @@ PetscErrorCode get_ems_pc_type_option(char *ems_pc_type,
                                       size_t ems_pc_type_size,
                                       PetscBool *uses_aux_matrix) {
   PetscBool has_ems_pc_type = PETSC_FALSE;
-  PetscCall(PetscStrncpy(ems_pc_type, "aux_hypre", ems_pc_type_size));
+  PetscCall(PetscStrncpy(ems_pc_type, "aux_ann_hypre", ems_pc_type_size));
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-ems_pc_type",
                                   ems_pc_type, ems_pc_type_size,
                                   &has_ems_pc_type));
@@ -2202,11 +2303,15 @@ PetscErrorCode setup_ems_preconditioner(KSP ksp, Mat A, Mat P, DM uda, DM cda,
                                         const char *ems_pc_type) {
   PetscCheck(ctx != nullptr, PETSC_COMM_WORLD, PETSC_ERR_ARG_NULL,
              "Missing EMsFEM ANN context");
-  if (P != nullptr) {
+  if (ems_pc_type_uses_low_order_aux_matrix(ems_pc_type)) {
     PetscCheck(cda != nullptr && coarse_rho != nullptr, PETSC_COMM_WORLD,
                PETSC_ERR_ARG_NULL,
                "Auxiliary EMsFEM preconditioner needs coarse density state");
     PetscCall(assemble_ems_aux_laplacian_matrix(uda, cda, coarse_rho, *ctx, P));
+  } else if (ems_pc_type_uses_ann_aux_matrix(ems_pc_type)) {
+    PetscCheck(P != nullptr, PETSC_COMM_WORLD, PETSC_ERR_ARG_NULL,
+               "ANN auxiliary EMsFEM preconditioner needs an assembled matrix");
+    PetscCall(assemble_ems_aux_ann_matrix(uda, ctx, P));
   } else if (std::strcmp(ems_pc_type, "block_jacobi") == 0) {
     PetscCall(setup_ems_block_jacobi(pc_ctx));
   }
@@ -2281,9 +2386,27 @@ PetscErrorCode configure_ems_ksp(KSP ksp, Mat A, Mat P,
     PetscCall(PCSetFromOptions(pc));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "EMsFEM ANN preconditioner: auxiliary low-order matrix with PETSc/HYPRE\n"));
+  } else if (std::strcmp(ems_pc_type, "aux_ann_gamg") == 0) {
+    PC pc = nullptr;
+    PetscCheck(P != nullptr, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+               "aux_ann_gamg needs an assembled ANN auxiliary matrix");
+    PetscCall(KSPGetPC(ksp, &pc));
+    PetscCall(PCSetType(pc, PCGAMG));
+    PetscCall(PCSetFromOptions(pc));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                          "EMsFEM ANN preconditioner: assembled ANN matrix with PETSc GAMG\n"));
+  } else if (std::strcmp(ems_pc_type, "aux_ann_hypre") == 0) {
+    PC pc = nullptr;
+    PetscCheck(P != nullptr, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+               "aux_ann_hypre needs an assembled ANN auxiliary matrix");
+    PetscCall(KSPGetPC(ksp, &pc));
+    PetscCall(PCSetType(pc, PCHYPRE));
+    PetscCall(PCSetFromOptions(pc));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                          "EMsFEM ANN preconditioner: assembled ANN matrix with PETSc/HYPRE\n"));
   } else {
     PetscCheck(PETSC_FALSE, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-               "-ems_pc_type must be block_jacobi, jacobi, petsc, aux_gamg, or aux_hypre");
+               "-ems_pc_type must be block_jacobi, jacobi, petsc, aux_gamg, aux_hypre, aux_ann_gamg, or aux_ann_hypre");
   }
   return 0;
 }
@@ -2973,7 +3096,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   TimingTotals timings;
   PetscLogDouble topopt_start = 0.0;
   PetscLogDouble setup_start = 0.0;
-  char ems_pc_type[64] = "aux_hypre";
+  char ems_pc_type[64] = "aux_ann_hypre";
   PetscBool ems_uses_aux_matrix = PETSC_FALSE;
   PetscCall(PetscTime(&topopt_start));
   PetscCall(PetscTime(&setup_start));
@@ -3106,7 +3229,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                  reinterpret_cast<void (*)(void)>(emsfem_destroy)));
   PetscCall(MatSetOption(A, MAT_SYMMETRIC, PETSC_TRUE));
 
-  if (ems_uses_aux_matrix) {
+  if (ems_pc_type_uses_low_order_aux_matrix(ems_pc_type)) {
     PetscLogDouble stage_start = 0.0;
     PetscReal elapsed = 0.0;
     PetscCall(PetscTime(&stage_start));
@@ -3116,6 +3239,13 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                        ems_options.sub_n, coarse_rho));
     PetscCall(create_ems_aux_laplacian_matrix(uda, cda, coarse_rho,
                                               *ctx, &P));
+    PetscCall(elapsed_max_since(stage_start, &elapsed));
+    timings.preconditioner_setup_s += elapsed;
+  } else if (ems_pc_type_uses_ann_aux_matrix(ems_pc_type)) {
+    PetscLogDouble stage_start = 0.0;
+    PetscReal elapsed = 0.0;
+    PetscCall(PetscTime(&stage_start));
+    PetscCall(create_ems_aux_ann_matrix(uda, ctx, &P));
     PetscCall(elapsed_max_since(stage_start, &elapsed));
     timings.preconditioner_setup_s += elapsed;
   } else if (std::strcmp(ems_pc_type, "block_jacobi") == 0) {
@@ -3227,7 +3357,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     {
       PetscLogDouble stage_start = 0.0;
       PetscCall(PetscTime(&stage_start));
-      if (ems_uses_aux_matrix) {
+      if (ems_pc_type_uses_low_order_aux_matrix(ems_pc_type)) {
         PetscCall(build_ems_coarse_density(cda, fda, rho_phys, grid,
                                            ems_options.sub_n, coarse_rho));
       }
@@ -3512,7 +3642,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       PetscLogDouble stage_start = 0.0;
       PetscReal elapsed = 0.0;
       PetscCall(PetscTime(&stage_start));
-      if (ems_uses_aux_matrix) {
+      if (ems_pc_type_uses_low_order_aux_matrix(ems_pc_type)) {
         PetscCall(build_ems_coarse_density(cda, fda, rho_phys, grid,
                                            ems_options.sub_n, coarse_rho));
       }
