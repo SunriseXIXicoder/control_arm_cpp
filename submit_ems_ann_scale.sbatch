@@ -25,13 +25,20 @@ else
 fi
 
 PETSC_DIR="${PETSC_DIR:-/data/home/dlutmxy/petsc/petsc-v3.19.3}"
-PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-debug}"
+PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-opt-hypre}"
 export PETSC_DIR PETSC_ARCH
 if [ ! -f "${PETSC_DIR}/lib/petsc/conf/variables" ]; then
   echo "PETSc configuration not found:" >&2
   echo "  PETSC_DIR=${PETSC_DIR}" >&2
   echo "  PETSC_ARCH=${PETSC_ARCH}" >&2
   echo "Expected file: ${PETSC_DIR}/lib/petsc/conf/variables" >&2
+  exit 2
+fi
+if [ ! -d "${PETSC_DIR}/${PETSC_ARCH}" ]; then
+  echo "PETSc arch directory not found:" >&2
+  echo "  PETSC_DIR=${PETSC_DIR}" >&2
+  echo "  PETSC_ARCH=${PETSC_ARCH}" >&2
+  echo "Expected directory: ${PETSC_DIR}/${PETSC_ARCH}" >&2
   exit 2
 fi
 export PATH="${PETSC_DIR}/bin:${PATH}"
@@ -98,6 +105,17 @@ else
   PC_TYPE="${PC_TYPE:-hypre}"
   KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
 fi
+case "${EMS_PC_TYPE}" in
+  *hypre*)
+    if ! grep -q 'PETSC_HAVE_HYPRE' "${PETSC_DIR}/${PETSC_ARCH}/include/petscconf.h" 2>/dev/null; then
+      echo "EMS_PC_TYPE=${EMS_PC_TYPE} requires a PETSc arch built with HYPRE." >&2
+      echo "Current PETSC_DIR=${PETSC_DIR}" >&2
+      echo "Current PETSC_ARCH=${PETSC_ARCH}" >&2
+      echo "Use PETSC_ARCH=arch-linux-c-opt-hypre or rebuild PETSc with --download-hypre." >&2
+      exit 2
+    fi
+    ;;
+esac
 KSP_MAX_IT="${KSP_MAX_IT:-5000}"
 KSP_RTOL="${KSP_RTOL:-1e-4}"
 KSP_ATOL="${KSP_ATOL:-1e-12}"
