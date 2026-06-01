@@ -3,7 +3,6 @@
 #SBATCH -N 4
 #SBATCH --ntasks-per-node=28
 #SBATCH --partition=normal,normal1,normal2,normal3,normal4
-#SBATCH --mem=0
 #SBATCH --output=result/%j.%x.out
 #SBATCH --error=result/%j.%x.err
 
@@ -26,7 +25,7 @@ else
 fi
 
 PETSC_DIR="${PETSC_DIR:-/data/home/dlutmxy/petsc/petsc-v3.19.3}"
-PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-debug}"
+PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-opt-hypre}"
 export PETSC_DIR PETSC_ARCH
 if [ ! -f "${PETSC_DIR}/lib/petsc/conf/variables" ]; then
   echo "PETSc configuration not found:" >&2
@@ -110,6 +109,15 @@ echo "Run host: $(hostname)"
 echo "Job id: ${JOB_ID}"
 echo "Slurm nodes: ${SLURM_JOB_NODELIST:-unknown}"
 echo "SLURM_NTASKS=${SLURM_NTASKS:-unset}"
+echo "SLURM_MEM_PER_NODE=${SLURM_MEM_PER_NODE:-unset}"
+echo "SLURM_MEM_PER_CPU=${SLURM_MEM_PER_CPU:-unset}"
+if command -v scontrol >/dev/null 2>&1 && [ -n "${SLURM_JOB_ID:-}" ]; then
+  scontrol show job "${SLURM_JOB_ID}" | egrep 'TRES|MinMemory|NumNodes|NumCPUs|Reason|ExitCode' || true
+  first_node="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" 2>/dev/null | head -n 1 || true)"
+  if [ -n "${first_node}" ]; then
+    scontrol show node "${first_node}" | egrep 'RealMemory|AllocMem|FreeMem|CPUTot|CPUAlloc' || true
+  fi
+fi
 echo "PETSC_DIR=${PETSC_DIR}"
 echo "PETSC_ARCH=${PETSC_ARCH}"
 echo "Compiler wrapper:"
