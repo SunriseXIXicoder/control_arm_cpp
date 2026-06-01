@@ -97,6 +97,7 @@ OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-0}"
 CACHE_K="${CACHE_K:-true}"
 CACHE_GIB_LIMIT="${CACHE_GIB_LIMIT:-8}"
 EMS_PC_TYPE="${EMS_PC_TYPE:-aux_ann_gamg}"
+GAMG_PROFILE="${GAMG_PROFILE:-lowmem}"
 KSP_GMRES_RESTART="${KSP_GMRES_RESTART:-100}"
 case "${EMS_PC_TYPE}" in
   block_jacobi)
@@ -107,7 +108,20 @@ case "${EMS_PC_TYPE}" in
   aux_ann_gamg|aux_elastic_gamg|aux_gamg)
     KSP_TYPE="${KSP_TYPE:-fgmres}"
     PC_TYPE="${PC_TYPE:-gamg}"
-    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_gamg_type agg}"
+    if [ -z "${KSP_EXTRA+x}" ]; then
+      case "${GAMG_PROFILE}" in
+        lowmem)
+          KSP_EXTRA="-ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_gamg_type agg"
+          ;;
+        strong)
+          KSP_EXTRA="-ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_gamg_type agg -pc_gamg_threshold 0.02 -pc_gamg_square_graph 1 -pc_gamg_agg_nsmooths 2 -mg_levels_ksp_type chebyshev -mg_levels_ksp_max_it 2 -mg_levels_pc_type jacobi"
+          ;;
+        *)
+          echo "Unknown GAMG_PROFILE=${GAMG_PROFILE}; use lowmem or strong." >&2
+          exit 2
+          ;;
+      esac
+    fi
     ;;
   *)
     KSP_TYPE="${KSP_TYPE:-fgmres}"
@@ -201,6 +215,7 @@ echo "  volfrac=${VOLFRAC}"
 echo "  ab_triangle_retract=${AB_TRIANGLE_RETRACT}"
 echo "  heaviside=${OPT_HEAVISIDE} beta0=${OPT_HEAVISIDE_BETA_INITIAL} beta_max=${OPT_HEAVISIDE_BETA_MAX} beta_interval=${OPT_HEAVISIDE_BETA_INTERVAL}"
 echo "  ems_pc_type=${EMS_PC_TYPE}"
+echo "  gamg_profile=${GAMG_PROFILE}"
 echo "  ksp_type=${KSP_TYPE} pc_type=${PC_TYPE} ksp_rtol=${KSP_RTOL} ksp_max_it=${KSP_MAX_IT}"
 echo "  output_prefix=${PREFIX}"
 echo "  mpi_launcher=${MPI_LAUNCHER}"
