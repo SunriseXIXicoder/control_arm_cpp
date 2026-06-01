@@ -3,7 +3,7 @@
 #SBATCH -N 8
 #SBATCH --ntasks-per-node=28
 #SBATCH --partition=normal,normal1,normal2,normal3,normal4
-#SBATCH --mem=0
+#SBATCH --exclusive
 #SBATCH --output=result/%j.%x.out
 #SBATCH --error=result/%j.%x.err
 
@@ -33,7 +33,7 @@ fi
 echo "Compiler/MPI environment checked"
 
 PETSC_DIR="${PETSC_DIR:-/data/home/dlutmxy/petsc/petsc-v3.19.3}"
-PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-debug}"
+PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-opt-hypre}"
 export PETSC_DIR
 export PETSC_ARCH
 if [ ! -f "${PETSC_DIR}/lib/petsc/conf/variables" ]; then
@@ -116,7 +116,14 @@ echo "Submit dir: ${SUBMIT_DIR}"
 echo "Run host: $(hostname)"
 echo "Job id: ${JOB_ID}"
 echo "Slurm nodes: ${SLURM_JOB_NODELIST:-unknown}"
-echo "SLURM_NTASKS=${SLURM_NTASKS:-unset}"
+if [ -f scripts/h8_slurm_guard.sh ]; then
+  . scripts/h8_slurm_guard.sh
+  h8_print_slurm_diagnostics
+  h8_guard_slurm_memory_accounting
+  h8_guard_petsc_hypre
+else
+  echo "Warning: scripts/h8_slurm_guard.sh not found; Slurm memory guard skipped" >&2
+fi
 echo "PETSC_DIR=${PETSC_DIR}"
 echo "PETSC_ARCH=${PETSC_ARCH:-<empty>}"
 echo "CXXSTD=${CXXSTD}"

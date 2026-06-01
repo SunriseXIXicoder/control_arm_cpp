@@ -3,7 +3,6 @@
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=2
 #SBATCH --partition=normal,normal1,normal2,normal3,normal4
-#SBATCH --mem=0
 #SBATCH --output=result/%j.%x.out
 #SBATCH --error=result/%j.%x.err
 
@@ -27,11 +26,18 @@ if command -v module >/dev/null 2>&1; then
 fi
 
 PETSC_DIR="${PETSC_DIR:-/data/home/dlutmxy/petsc/petsc-v3.19.3}"
-PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-debug}"
+PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-opt-hypre}"
 export PETSC_DIR PETSC_ARCH
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 mkdir -p bin result logs
+if [ -f scripts/h8_slurm_guard.sh ]; then
+  . scripts/h8_slurm_guard.sh
+  h8_print_slurm_diagnostics
+  h8_guard_slurm_memory_accounting
+else
+  echo "Warning: scripts/h8_slurm_guard.sh not found; Slurm memory guard skipped" >&2
+fi
 
 echo "Checking script bytes"
 file submit_h8_opt_100m.sbatch || true

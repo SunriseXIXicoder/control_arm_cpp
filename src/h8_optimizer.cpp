@@ -44,6 +44,28 @@ struct ElementGrid {
   PetscInt ez = 0;
 };
 
+PetscErrorCode log_h8_memory_stage(const char *stage) {
+  PetscLogDouble current_bytes = 0.0;
+  PetscLogDouble peak_bytes = 0.0;
+  PetscLogDouble max_current_bytes = 0.0;
+  PetscLogDouble max_peak_bytes = 0.0;
+
+  PetscCall(PetscMemoryGetCurrentUsage(&current_bytes));
+  PetscCall(PetscMemoryGetMaximumUsage(&peak_bytes));
+  PetscCallMPI(MPI_Allreduce(&current_bytes, &max_current_bytes, 1, MPI_DOUBLE,
+                             MPI_MAX, PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&peak_bytes, &max_peak_bytes, 1, MPI_DOUBLE,
+                             MPI_MAX, PETSC_COMM_WORLD));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                        "H8 memory [%s]: current_max_rank=%.3f MiB peak_max_rank=%.3f MiB\n",
+                        stage,
+                        static_cast<double>(max_current_bytes /
+                                            (1024.0 * 1024.0)),
+                        static_cast<double>(max_peak_bytes /
+                                            (1024.0 * 1024.0))));
+  return 0;
+}
+
 PetscInt h8_local_node(PetscInt lx, PetscInt ly, PetscInt lz) {
   if (lz == 0) {
     if (ly == 0) return lx == 0 ? 0 : 1;
@@ -3010,6 +3032,7 @@ PetscErrorCode run_h8_full_vtk_postprocess(const Grid &grid,
                                   &use_aux_matrix));
   use_elastic_aux_matrix = h8_pc_type_uses_elastic_aux_matrix(h8_pc_type);
   if (use_aux_matrix) {
+    PetscCall(log_h8_memory_stage("full_vtk before auxiliary matrix"));
     if (use_elastic_aux_matrix) {
       PetscCall(create_h8_aux_elasticity_matrix(uda, eda, rho, grid,
                                                 density_options, &P));
@@ -3017,17 +3040,21 @@ PetscErrorCode run_h8_full_vtk_postprocess(const Grid &grid,
       PetscCall(create_h8_aux_laplacian_matrix(uda, eda, rho, grid,
                                                density_options, &P));
     }
+    PetscCall(log_h8_memory_stage("full_vtk after auxiliary matrix"));
   }
   PetscCall(KSPCreate(PETSC_COMM_WORLD, &ksp));
   PetscCall(configure_h8_ksp(ksp, A, P, uda, eda, rho, grid, density_options,
                              optimizer_options));
+  PetscCall(log_h8_memory_stage("full_vtk after KSP configure"));
 
   PetscCall(PetscTime(&solve_start));
   PetscCall(VecSet(u, 0.0));
   PetscCall(set_h8_ksp_operators(ksp, A, P, uda, eda, rho, grid,
                                  density_options, PETSC_FALSE,
                                  use_elastic_aux_matrix));
+  PetscCall(log_h8_memory_stage("full_vtk before KSPSolve"));
   PetscCall(KSPSolve(ksp, b, u));
+  PetscCall(log_h8_memory_stage("full_vtk after KSPSolve"));
   PetscCall(KSPGetIterationNumber(ksp, &its));
   KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
   PetscCall(KSPGetConvergedReason(ksp, &reason));
@@ -3134,6 +3161,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                   &use_aux_matrix));
   use_elastic_aux_matrix = h8_pc_type_uses_elastic_aux_matrix(h8_pc_type);
   if (use_aux_matrix) {
+    PetscCall(log_h8_memory_stage("optimizer before auxiliary matrix"));
     if (use_elastic_aux_matrix) {
       PetscCall(create_h8_aux_elasticity_matrix(uda, eda, rho_phys, grid,
                                                 density_options, &P));
@@ -3141,6 +3169,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
       PetscCall(create_h8_aux_laplacian_matrix(uda, eda, rho_phys, grid,
                                                density_options, &P));
     }
+    PetscCall(log_h8_memory_stage("optimizer after auxiliary matrix"));
   }
   PetscCall(write_h8_checkpoint(optimizer_options, 0, PETSC_FALSE,
                                 rho_design, rho_phys, mask));
@@ -3148,6 +3177,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(KSPCreate(PETSC_COMM_WORLD, &ksp));
   PetscCall(configure_h8_ksp(ksp, A, P, uda, eda, rho_phys, grid, density_options,
                              optimizer_options));
+  PetscCall(log_h8_memory_stage("optimizer after KSP configure"));
 
   PetscCall(PetscSNPrintf(hist_path, sizeof(hist_path), "%s_history.csv",
                           output_prefix));
@@ -3205,6 +3235,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscScalar dot = 0.0;
     PetscLogDouble iter_start = 0.0;
     PetscLogDouble stage_start = 0.0;
+    char memory_stage[128];
 
     PetscCall(PetscTime(&iter_start));
     PetscCall(PetscTime(&stage_start));
@@ -3233,7 +3264,15 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                      density_options, rebuild_aux,
                                      use_elastic_aux_matrix));
     }
+    PetscCall(PetscSNPrintf(memory_stage, sizeof(memory_stage),
+                            "optimizer iter %lld before KSPSolve",
+                            static_cast<long long>(iter)));
+    PetscCall(log_h8_memory_stage(memory_stage));
     PetscCall(KSPSolve(ksp, b, u));
+    PetscCall(PetscSNPrintf(memory_stage, sizeof(memory_stage),
+                            "optimizer iter %lld after KSPSolve",
+                            static_cast<long long>(iter)));
+    PetscCall(log_h8_memory_stage(memory_stage));
     PetscCall(KSPGetIterationNumber(ksp, &its));
     PetscCall(KSPGetConvergedReason(ksp, &reason));
     PetscCall(KSPGetResidualNorm(ksp, &rnorm));
