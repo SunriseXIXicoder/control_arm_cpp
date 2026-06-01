@@ -1,9 +1,10 @@
 #!/bin/bash
 #SBATCH -J ca_ems_ann
-#SBATCH -N 2
+#SBATCH -N 16
 #SBATCH --ntasks-per-node=28
 #SBATCH --partition=normal,normal1,normal2,normal3,normal4
 #SBATCH --mem=0
+#SBATCH --exclusive
 #SBATCH --output=result/%j.%x.out
 #SBATCH --error=result/%j.%x.err
 
@@ -62,9 +63,9 @@ if [ -n "${NELX:-}" ] || [ -n "${NELY:-}" ] || [ -n "${NELZ:-}" ]; then
   NY=$((NELY + 1))
   NZ=$((NELZ + 1))
 else
-  NX="${NX:-700}"
-  NY="${NY:-400}"
-  NZ="${NZ:-120}"
+  NX="${NX:-325}"
+  NY="${NY:-186}"
+  NZ="${NZ:-56}"
 fi
 
 MODE="${MODE:-optimize}"
@@ -105,9 +106,9 @@ else
   KSP_TYPE="${KSP_TYPE:-fgmres}"
   PC_TYPE="${PC_TYPE:-hypre}"
   if [ "${EMS_PC_TYPE}" = "aux_ann_hypre" ] || [ "${EMS_PC_TYPE}" = "aux_elastic_hypre" ]; then
-    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -ksp_gmres_restart ${KSP_GMRES_RESTART} -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3}"
+    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3}"
   else
-    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -ksp_gmres_restart ${KSP_GMRES_RESTART} -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
+    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
   fi
 fi
 case "${EMS_PC_TYPE}" in
@@ -124,18 +125,31 @@ esac
 KSP_MAX_IT="${KSP_MAX_IT:-5000}"
 KSP_RTOL="${KSP_RTOL:-1e-4}"
 KSP_ATOL="${KSP_ATOL:-1e-12}"
+ALLOW_HUGE_EMS="${ALLOW_HUGE_EMS:-false}"
+MAX_DEFAULT_EMS_DOF="${MAX_DEFAULT_EMS_DOF:-20000000}"
 WRITE_FINAL_VTK="${WRITE_FINAL_VTK:-false}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
 CXXSTD="${CXXSTD:-c++11}"
 JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-manual}}"
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
-RUN_LABEL="${RUN_LABEL:-ems_ann_5x5x5_loadtuned}"
+RUN_LABEL="${RUN_LABEL:-ems_ann_10m_sub5_auxelastic}"
 PREFIX="${OUTPUT_PREFIX:-result/${RUN_LABEL}_${NX}_${NY}_${NZ}_${JOB_ID}}"
 NODES_ALLOC="${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}"
 TASKS_PER_NODE_ALLOC="${SLURM_NTASKS_PER_NODE:-${SLURM_CPUS_ON_NODE:-28}}"
 TOTAL_TASKS="${SLURM_NPROCS:-${SLURM_NTASKS:-$((NODES_ALLOC * TASKS_PER_NODE_ALLOC))}}"
 MPI_LAUNCHER="${MPI_LAUNCHER:-mpirun}"
 MPI_LAUNCHER_ARGS="${MPI_LAUNCHER_ARGS:-}"
+
+DOF=$((NX * NY * NZ * 3))
+COARSE_ELEMS=$(((NX - 1) * (NY - 1) * (NZ - 1)))
+FINE_DENSITY_CELLS=$((COARSE_ELEMS * EMS_SUB_N * EMS_SUB_N * EMS_SUB_N))
+if [ "${DOF}" -gt "${MAX_DEFAULT_EMS_DOF}" ] && [ "${ALLOW_HUGE_EMS}" != "true" ]; then
+  echo "Refusing huge EMsFEM ANN run without ALLOW_HUGE_EMS=true." >&2
+  echo "  nx=${NX} ny=${NY} nz=${NZ} dof=${DOF}" >&2
+  echo "  ems_sub_n=${EMS_SUB_N} fine_density_cells=${FINE_DENSITY_CELLS}" >&2
+  echo "This script defaults to the 10M-DOF case. Set NX/NY/NZ intentionally and ALLOW_HUGE_EMS=true for larger scaling runs." >&2
+  exit 2
+fi
 
 EMS_DM_ARGS=""
 if [ -n "${EMS_DM_PX:-}" ] || [ -n "${EMS_DM_PY:-}" ] || [ -n "${EMS_DM_PZ:-}" ]; then
@@ -146,7 +160,7 @@ if [ -n "${EMS_DM_PX:-}" ] || [ -n "${EMS_DM_PY:-}" ] || [ -n "${EMS_DM_PZ:-}" ]
   EMS_DM_ARGS="-ems_dm_px ${EMS_DM_PX} -ems_dm_py ${EMS_DM_PY} -ems_dm_pz ${EMS_DM_PZ}"
 fi
 if [ "${KSP_TYPE}" = "gmres" ] || [ "${KSP_TYPE}" = "fgmres" ]; then
-  KSP_EXTRA="${KSP_EXTRA} -ksp_gmres_restart ${KSP_GMRES_RESTART:-200}"
+  KSP_EXTRA="${KSP_EXTRA} -ksp_gmres_restart ${KSP_GMRES_RESTART}"
 fi
 
 cd "$SUBMIT_DIR"
@@ -168,8 +182,9 @@ echo "Running EMsFEM ANN control-arm ${MODE}"
 echo "  nodes=${SLURM_JOB_NUM_NODES:-unknown}"
 echo "  tasks=${TOTAL_TASKS}"
 echo "  nx=${NX} ny=${NY} nz=${NZ}"
-echo "  dof=$((NX * NY * NZ * 3))"
+echo "  dof=${DOF}"
 echo "  ems_sub_n=${EMS_SUB_N}"
+echo "  fine_density_cells=${FINE_DENSITY_CELLS}"
 echo "  ann_dir=${ANN_DIR}"
 echo "  load_case=${LOAD_CASE} (0 means weighted 3-case load set)"
 echo "  control_arm_bc=${CONTROL_ARM_BC}"
