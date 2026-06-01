@@ -58,15 +58,25 @@ NY="${NY:-400}"
 NZ="${NZ:-120}"
 DOMAIN_HEIGHT="${DOMAIN_HEIGHT:-0.08}"
 OPT_MAX_ITER="${OPT_MAX_ITER:-5}"
-VOLFRAC="${VOLFRAC:-0.35}"
+VOLFRAC="${VOLFRAC:-0.30}"
 OPT_FILTER_RADIUS="${OPT_FILTER_RADIUS:-1.5}"
 OPT_Z_DRAFT_CLOSURE="${OPT_Z_DRAFT_CLOSURE:-true}"
 OPT_Z_DRAFT_ETA="${OPT_Z_DRAFT_ETA:-0.5}"
-OPT_MOVE="${OPT_MOVE:-0.04}"
+AB_TRIANGLE_RETRACT="${AB_TRIANGLE_RETRACT:-0.22}"
+OPT_MOVE="${OPT_MOVE:-0.025}"
+OPT_MOVE_MIN="${OPT_MOVE_MIN:-0.004}"
+OPT_MOVE_SHRINK="${OPT_MOVE_SHRINK:-0.5}"
+OPT_MOVE_GROWTH="${OPT_MOVE_GROWTH:-1.05}"
+OPT_MAX_COMPLIANCE_INCREASE="${OPT_MAX_COMPLIANCE_INCREASE:-0.08}"
+OPT_HEAVISIDE="${OPT_HEAVISIDE:-true}"
+OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
+OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"
+OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
+OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-0}"
 YOUNG_MODULUS="${YOUNG_MODULUS:-2.1e11}"
-PENAL="${PENAL:-1.5}"
-EMIN="${EMIN:-1e-4}"
-VOID_DENSITY="${VOID_DENSITY:-0.05}"
+PENAL="${PENAL:-3.0}"
+EMIN="${EMIN:-1e-6}"
+VOID_DENSITY="${VOID_DENSITY:-0.02}"
 OPT_RHO_MIN="${OPT_RHO_MIN:-1e-3}"
 KSP_RTOL="${KSP_RTOL:-1e-2}"
 KSP_MAX_IT="${KSP_MAX_IT:-1500}"
@@ -125,6 +135,8 @@ echo "  dof=$((NX * NY * NZ * 3))"
 echo "  opt_max_iter=${OPT_MAX_ITER}"
 echo "  opt_move=${OPT_MOVE}"
 echo "  opt_filter_radius=${OPT_FILTER_RADIUS}"
+echo "  ab_triangle_retract=${AB_TRIANGLE_RETRACT}"
+echo "  heaviside=${OPT_HEAVISIDE} beta0=${OPT_HEAVISIDE_BETA_INITIAL} beta_max=${OPT_HEAVISIDE_BETA_MAX} beta_interval=${OPT_HEAVISIDE_BETA_INTERVAL}"
 echo "  penal=${PENAL}"
 echo "  emin=${EMIN}"
 echo "  void_density=${VOID_DENSITY}"
@@ -159,13 +171,24 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -penal "${PENAL}" \
   -emin "${EMIN}" \
   -mask_threshold 0.5 \
+  -ab_triangle_retract "${AB_TRIANGLE_RETRACT}" \
   -volfrac "${VOLFRAC}" \
   -opt_max_iter "${OPT_MAX_ITER}" \
   -opt_move "${OPT_MOVE}" \
+  -opt_move_min "${OPT_MOVE_MIN}" \
+  -opt_move_shrink "${OPT_MOVE_SHRINK}" \
+  -opt_move_growth "${OPT_MOVE_GROWTH}" \
+  -opt_max_compliance_increase "${OPT_MAX_COMPLIANCE_INCREASE}" \
+  -opt_stability_guard true \
   -opt_filter_radius "${OPT_FILTER_RADIUS}" \
   -opt_z_draft_closure "${OPT_Z_DRAFT_CLOSURE}" \
   -opt_z_draft_eta "${OPT_Z_DRAFT_ETA}" \
   -opt_rho_min "${OPT_RHO_MIN}" \
+  -opt_heaviside_projection "${OPT_HEAVISIDE}" \
+  -opt_heaviside_eta "${OPT_HEAVISIDE_ETA}" \
+  -opt_heaviside_beta_initial "${OPT_HEAVISIDE_BETA_INITIAL}" \
+  -opt_heaviside_beta_max "${OPT_HEAVISIDE_BETA_MAX}" \
+  -opt_heaviside_beta_interval "${OPT_HEAVISIDE_BETA_INTERVAL}" \
   -opt_load 1.0 \
   -h8_load_case "${H8_LOAD_CASE}" \
   -h8_include_spring_load "${H8_INCLUDE_SPRING_LOAD}" \

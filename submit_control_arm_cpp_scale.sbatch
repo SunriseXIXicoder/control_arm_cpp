@@ -49,8 +49,24 @@ else
   PC_TYPE="${USER_PC_TYPE:-gamg}"
 fi
 OPT_MAX_ITER="${OPT_MAX_ITER:-20}"
-VOLFRAC="${VOLFRAC:-0.35}"
-OPT_FILTER_RADIUS="${OPT_FILTER_RADIUS:-0.0}"
+VOLFRAC="${VOLFRAC:-0.30}"
+AB_TRIANGLE_RETRACT="${AB_TRIANGLE_RETRACT:-0.22}"
+OPT_FILTER_RADIUS="${OPT_FILTER_RADIUS:-1.5}"
+OPT_MOVE="${OPT_MOVE:-0.025}"
+OPT_MOVE_MIN="${OPT_MOVE_MIN:-0.004}"
+OPT_MOVE_SHRINK="${OPT_MOVE_SHRINK:-0.5}"
+OPT_MOVE_GROWTH="${OPT_MOVE_GROWTH:-1.05}"
+OPT_MAX_COMPLIANCE_INCREASE="${OPT_MAX_COMPLIANCE_INCREASE:-0.08}"
+OPT_HEAVISIDE="${OPT_HEAVISIDE:-true}"
+OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
+OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"
+OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
+OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-0}"
+OPT_Z_DRAFT_CLOSURE="${OPT_Z_DRAFT_CLOSURE:-true}"
+OPT_Z_DRAFT_ETA="${OPT_Z_DRAFT_ETA:-0.5}"
+PENAL="${PENAL:-3.0}"
+EMIN="${EMIN:-1e-6}"
+VOID_DENSITY="${VOID_DENSITY:-0.02}"
 OPT_WRITE_CHECKPOINT="${OPT_WRITE_CHECKPOINT:-true}"
 OPT_CHECKPOINT_INTERVAL="${OPT_CHECKPOINT_INTERVAL:-0}"
 OPT_CHECKPOINT_PREFIX="${OPT_CHECKPOINT_PREFIX:-${PREFIX}_checkpoint}"
@@ -60,7 +76,7 @@ if [ "${MODE}" = "optimize" ]; then
   PC_TYPE="${USER_PC_TYPE:-jacobi}"
   MG_ARGS=""
   KSP_MAX_IT="${USER_KSP_MAX_IT:-3000}"
-  OPT_ARGS="-volfrac ${VOLFRAC} -opt_max_iter ${OPT_MAX_ITER} -opt_move 0.08 -opt_filter_radius ${OPT_FILTER_RADIUS} -opt_rho_min 1e-3 -opt_ksp_max_it ${KSP_MAX_IT} -opt_write_final_vtk false -opt_write_checkpoint ${OPT_WRITE_CHECKPOINT} -opt_checkpoint_interval ${OPT_CHECKPOINT_INTERVAL} -opt_checkpoint_prefix ${OPT_CHECKPOINT_PREFIX}"
+  OPT_ARGS="-volfrac ${VOLFRAC} -opt_max_iter ${OPT_MAX_ITER} -opt_move ${OPT_MOVE} -opt_move_min ${OPT_MOVE_MIN} -opt_move_shrink ${OPT_MOVE_SHRINK} -opt_move_growth ${OPT_MOVE_GROWTH} -opt_max_compliance_increase ${OPT_MAX_COMPLIANCE_INCREASE} -opt_stability_guard true -opt_filter_radius ${OPT_FILTER_RADIUS} -opt_z_draft_closure ${OPT_Z_DRAFT_CLOSURE} -opt_z_draft_eta ${OPT_Z_DRAFT_ETA} -opt_rho_min 1e-3 -opt_heaviside_projection ${OPT_HEAVISIDE} -opt_heaviside_eta ${OPT_HEAVISIDE_ETA} -opt_heaviside_beta_initial ${OPT_HEAVISIDE_BETA_INITIAL} -opt_heaviside_beta_max ${OPT_HEAVISIDE_BETA_MAX} -opt_heaviside_beta_interval ${OPT_HEAVISIDE_BETA_INTERVAL} -opt_ksp_max_it ${KSP_MAX_IT} -opt_write_final_vtk false -opt_write_checkpoint ${OPT_WRITE_CHECKPOINT} -opt_checkpoint_interval ${OPT_CHECKPOINT_INTERVAL} -opt_checkpoint_prefix ${OPT_CHECKPOINT_PREFIX}"
 fi
 
 cd "$SLURM_SUBMIT_DIR"
@@ -84,6 +100,8 @@ echo "  operator=${OPERATOR}"
 echo "  pc_type=${PC_TYPE}"
 echo "  opt_max_iter=${OPT_MAX_ITER}"
 echo "  opt_filter_radius=${OPT_FILTER_RADIUS}"
+echo "  ab_triangle_retract=${AB_TRIANGLE_RETRACT}"
+echo "  heaviside=${OPT_HEAVISIDE} beta0=${OPT_HEAVISIDE_BETA_INITIAL} beta_max=${OPT_HEAVISIDE_BETA_MAX} beta_interval=${OPT_HEAVISIDE_BETA_INTERVAL}"
 echo "  opt_write_checkpoint=${OPT_WRITE_CHECKPOINT}"
 echo "  output_prefix=${PREFIX}"
 
@@ -93,8 +111,12 @@ srun -n "$SLURM_NTASKS" ./bin/control_arm_cpp \
   -operator "${OPERATOR}" \
   -nx "${NX}" -ny "${NY}" -nz "${NZ}" \
   -control_arm_mask true \
-  -void_density 0.02 \
+  -void_density "${VOID_DENSITY}" \
   -young_modulus "${YOUNG_MODULUS}" \
+  -penal "${PENAL}" \
+  -emin "${EMIN}" \
+  -mask_threshold 0.5 \
+  -ab_triangle_retract "${AB_TRIANGLE_RETRACT}" \
   -load 1.0 \
   -output_prefix "${PREFIX}" \
   ${OPT_ARGS} \
