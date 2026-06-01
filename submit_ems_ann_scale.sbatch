@@ -103,7 +103,11 @@ if [ "${EMS_PC_TYPE}" = "block_jacobi" ]; then
 else
   KSP_TYPE="${KSP_TYPE:-fgmres}"
   PC_TYPE="${PC_TYPE:-hypre}"
-  KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
+  if [ "${EMS_PC_TYPE}" = "aux_ann_hypre" ]; then
+    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3}"
+  else
+    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
+  fi
 fi
 case "${EMS_PC_TYPE}" in
   *hypre*)
