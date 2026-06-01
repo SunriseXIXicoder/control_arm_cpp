@@ -63,3 +63,18 @@ h8_guard_petsc_hypre() {
     exit 2
   fi
 }
+
+h8_guard_required_hypre_pc() {
+  if [ "${REQUIRE_H8_HYPRE_PC:-true}" = "false" ]; then
+    return 0
+  fi
+
+  case "${H8_PC_TYPE:-}" in
+    *hypre*) return 0 ;;
+  esac
+
+  echo "ERROR: production H8 run requires a hypre-backed preconditioner." >&2
+  echo "Current H8_PC_TYPE=${H8_PC_TYPE:-unset}; expected aux_elastic_hypre for 10M/100M runs." >&2
+  echo "Set H8_PC_TYPE=aux_elastic_hypre, or set REQUIRE_H8_HYPRE_PC=false only for explicit diagnostics." >&2
+  exit 2
+}

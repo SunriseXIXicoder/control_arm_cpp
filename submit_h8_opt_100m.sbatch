@@ -120,6 +120,7 @@ if [ -f scripts/h8_slurm_guard.sh ]; then
   . scripts/h8_slurm_guard.sh
   h8_print_slurm_diagnostics
   h8_guard_slurm_memory_accounting
+  h8_guard_required_hypre_pc
   h8_guard_petsc_hypre
 else
   echo "Warning: scripts/h8_slurm_guard.sh not found; Slurm memory guard skipped" >&2

@@ -1499,9 +1499,25 @@ PetscErrorCode configure_h8_ksp(KSP ksp, Mat A, Mat P, DM uda, DM eda, Vec rho,
                                 const OptimizerOptions &optimizer_options) {
   char h8_pc_type[64] = "aux_gamg";
   PetscBool has_h8_pc_type = PETSC_FALSE;
+  PetscBool allow_large_block_jacobi = PETSC_FALSE;
+  PetscInt large_block_jacobi_dof_limit = 2000000;
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-h8_pc_type",
                                   h8_pc_type, sizeof(h8_pc_type),
                                   &has_h8_pc_type));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr,
+                                "-h8_allow_large_block_jacobi",
+                                &allow_large_block_jacobi, nullptr));
+  PetscCall(PetscOptionsGetInt(nullptr, nullptr,
+                               "-h8_large_block_jacobi_dof_limit",
+                               &large_block_jacobi_dof_limit, nullptr));
+  if (std::strcmp(h8_pc_type, "block_jacobi") == 0) {
+    const PetscInt ndof = dof_count(grid);
+    PetscCheck(allow_large_block_jacobi ||
+                   ndof < large_block_jacobi_dof_limit,
+               PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+               "Refusing H8 block_jacobi on %lld DOF. It is intended for small diagnostics and stalled in production; use -h8_pc_type aux_elastic_hypre or set -h8_allow_large_block_jacobi true.",
+               static_cast<long long>(ndof));
+  }
   PetscCall(KSPSetOperators(ksp, A, P ? P : A));
   PetscCall(KSPSetType(ksp, h8_pc_type_uses_aux_matrix(h8_pc_type)
                                 ? KSPFGMRES

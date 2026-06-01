@@ -113,6 +113,7 @@ if [ -f scripts/h8_slurm_guard.sh ]; then
   . scripts/h8_slurm_guard.sh
   h8_print_slurm_diagnostics
   h8_guard_slurm_memory_accounting
+  h8_guard_required_hypre_pc
   h8_guard_petsc_hypre
 else
   echo "Warning: scripts/h8_slurm_guard.sh not found; Slurm memory guard skipped" >&2
@@ -134,6 +135,8 @@ echo "  volfrac=${VOLFRAC}"
 echo "  ab_triangle_retract=${AB_TRIANGLE_RETRACT}"
 echo "  ksp_rtol=${KSP_RTOL}"
 echo "  ksp_max_it=${KSP_MAX_IT}"
+echo "  ksp_type=${KSP_TYPE}"
+echo "  h8_pc_type=${H8_PC_TYPE}"
 echo "  h8_load_case=${H8_LOAD_CASE}"
 echo "  h8_include_spring_load=${H8_INCLUDE_SPRING_LOAD}"
 echo "  output_prefix=${PREFIX}"
