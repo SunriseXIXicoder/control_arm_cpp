@@ -95,7 +95,8 @@ OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
 OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-0}"
 CACHE_K="${CACHE_K:-true}"
 CACHE_GIB_LIMIT="${CACHE_GIB_LIMIT:-8}"
-EMS_PC_TYPE="${EMS_PC_TYPE:-aux_ann_hypre}"
+EMS_PC_TYPE="${EMS_PC_TYPE:-aux_elastic_hypre}"
+KSP_GMRES_RESTART="${KSP_GMRES_RESTART:-100}"
 if [ "${EMS_PC_TYPE}" = "block_jacobi" ]; then
   KSP_TYPE="${KSP_TYPE:-cg}"
   PC_TYPE="${PC_TYPE:-shell}"
@@ -103,10 +104,10 @@ if [ "${EMS_PC_TYPE}" = "block_jacobi" ]; then
 else
   KSP_TYPE="${KSP_TYPE:-fgmres}"
   PC_TYPE="${PC_TYPE:-hypre}"
-  if [ "${EMS_PC_TYPE}" = "aux_ann_hypre" ]; then
-    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3}"
+  if [ "${EMS_PC_TYPE}" = "aux_ann_hypre" ] || [ "${EMS_PC_TYPE}" = "aux_elastic_hypre" ]; then
+    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -ksp_gmres_restart ${KSP_GMRES_RESTART} -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3}"
   else
-    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
+    KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -ksp_gmres_restart ${KSP_GMRES_RESTART} -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
   fi
 fi
 case "${EMS_PC_TYPE}" in
