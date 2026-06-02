@@ -96,8 +96,13 @@ OPT_MAX_COMPLIANCE_INCREASE="${OPT_MAX_COMPLIANCE_INCREASE:-0.08}"
 OPT_HEAVISIDE="${OPT_HEAVISIDE:-true}"
 OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
 OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"
-OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
-OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-0}"
+# Production ANN runs need an explicit black-white continuation.  Leaving the
+# interval at 0 spreads beta updates across the whole run; for a 500-step job
+# beta stays at 1 for about the first 100 steps, which leaves a very gray
+# density field if the job stops early.  The defaults below reach beta=32 at
+# step 251 while still starting gently enough for the linear solver.
+OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-32.0}"
+OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-50}"
 CACHE_K="${CACHE_K:-true}"
 CACHE_GIB_LIMIT="${CACHE_GIB_LIMIT:-8}"
 EMS_PC_TYPE="${EMS_PC_TYPE:-aux_ann_gamg}"
