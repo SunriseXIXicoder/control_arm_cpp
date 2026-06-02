@@ -96,18 +96,17 @@ OPT_MAX_COMPLIANCE_INCREASE="${OPT_MAX_COMPLIANCE_INCREASE:-0.08}"
 OPT_HEAVISIDE="${OPT_HEAVISIDE:-true}"
 OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
 OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"
-# Production ANN runs need an explicit black-white continuation.  Leaving the
-# interval at 0 spreads beta updates across the whole run; for a 500-step job
-# beta stays at 1 for about the first 100 steps, which leaves a very gray
-# density field if the job stops early.  The defaults below reach beta=32 at
-# step 251 while still starting gently enough for the linear solver.
-OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-32.0}"
-OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-50}"
+# Keep the black-white continuation explicit but gentle.  The 8525166
+# production run was stable through beta=4 and became fragile when beta jumped
+# to 8 at step 301, so do not advance beta faster than 100-step stages unless
+# the preconditioner has been revalidated.
+OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
+OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-100}"
 CACHE_K="${CACHE_K:-true}"
 CACHE_GIB_LIMIT="${CACHE_GIB_LIMIT:-8}"
 EMS_PC_TYPE="${EMS_PC_TYPE:-aux_ann_gamg}"
-GAMG_PROFILE="${GAMG_PROFILE:-lowmem}"
-KSP_GMRES_RESTART="${KSP_GMRES_RESTART:-100}"
+GAMG_PROFILE="${GAMG_PROFILE:-strong}"
+KSP_GMRES_RESTART="${KSP_GMRES_RESTART:-200}"
 case "${EMS_PC_TYPE}" in
   block_jacobi)
     KSP_TYPE="${KSP_TYPE:-cg}"
@@ -153,8 +152,8 @@ case "${EMS_PC_TYPE}" in
     fi
     ;;
 esac
-KSP_MAX_IT="${KSP_MAX_IT:-5000}"
-KSP_RTOL="${KSP_RTOL:-1e-4}"
+KSP_MAX_IT="${KSP_MAX_IT:-1200}"
+KSP_RTOL="${KSP_RTOL:-1e-3}"
 KSP_ATOL="${KSP_ATOL:-1e-12}"
 ALLOW_HUGE_EMS="${ALLOW_HUGE_EMS:-false}"
 MAX_DEFAULT_EMS_DOF="${MAX_DEFAULT_EMS_DOF:-20000000}"

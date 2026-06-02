@@ -3485,6 +3485,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   PetscReal compliance = 0.0, volume = 0.0, change = 0.0;
   PetscReal accepted_compliance = PETSC_MAX_REAL;
   PetscReal current_move = optimizer_options.move;
+  PetscReal last_good_effective_raw_volfrac = optimizer_options.volfrac;
   PetscBool have_last_good = PETSC_FALSE;
   PetscBool last_iteration_accepted = PETSC_TRUE;
   PetscInt reject_streak = 0;
@@ -3881,6 +3882,10 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
          (diverged_cases > 0 || compliance_spike))
             ? PETSC_TRUE
             : PETSC_FALSE;
+    if (unstable && have_last_good && diverged_cases > 0 &&
+        optimizer_options.projected_volume_correction) {
+      effective_raw_volfrac = last_good_effective_raw_volfrac;
+    }
     OptimizerOptions step_options = optimizer_options;
     step_options.volfrac = effective_raw_volfrac;
     PetscLogDouble optimizer_update_start = 0.0;
@@ -3906,6 +3911,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       PetscCall(VecCopy(rho_design, rho_last_good));
       PetscCall(VecCopy(dc_design, dc_last_good));
       accepted_compliance = compliance;
+      last_good_effective_raw_volfrac = effective_raw_volfrac;
       have_last_good = PETSC_TRUE;
       reject_streak = 0;
       PetscCall(oc_update(fda, rho_design, mask, dc_design, dv_design,
