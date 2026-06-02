@@ -154,6 +154,7 @@ KSP_ATOL="${KSP_ATOL:-1e-12}"
 ALLOW_HUGE_EMS="${ALLOW_HUGE_EMS:-false}"
 MAX_DEFAULT_EMS_DOF="${MAX_DEFAULT_EMS_DOF:-20000000}"
 WRITE_FINAL_VTK="${WRITE_FINAL_VTK:-false}"
+OPT_VTK_MAX_POINTS="${OPT_VTK_MAX_POINTS:-5000000}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
 CXXSTD="${CXXSTD:-c++11}"
 JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-manual}}"
@@ -265,6 +266,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -opt_checkpoint_interval "${CHECKPOINT_INTERVAL}" \
   -opt_checkpoint_prefix "${PREFIX}_checkpoint" \
   -opt_write_final_vtk "${WRITE_FINAL_VTK}" \
+  -opt_vtk_max_points "${OPT_VTK_MAX_POINTS}" \
   -opt_vtk_file "${PREFIX}_final.vtk" \
   -output_prefix "${PREFIX}" \
   -ems_ann_dir "${ANN_DIR}" \
