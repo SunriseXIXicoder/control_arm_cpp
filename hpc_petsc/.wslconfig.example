@@ -1,0 +1,13 @@
+[wsl2]
+memory=24GB
+processors=24
+swap=64GB
+localhostForwarding=true
+
+# Usage:
+# 1. Copy this file to C:\Users\<your-user>\.wslconfig
+# 2. From PowerShell, run: wsl --shutdown
+# 3. Start Ubuntu again and check: free -h
+#
+# This is for local validation only. 100M+ DOF production runs should use
+# multi-node PETSc/MPI on the cluster.
