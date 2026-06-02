@@ -1,0 +1,13 @@
+operator=low_order
+nx=80
+ny=40
+nz=24
+dof=230400
+ranks=4
+assembly_time_sec=1.152940300000e-02
+solve_time_sec=2.764837700000e-01
+ksp_iterations=11
+ksp_residual=8.662018066689e-10
+compliance=1.318565400647e-05
+max_current_memory_bytes=101916672
+max_peak_memory_bytes=101916672
