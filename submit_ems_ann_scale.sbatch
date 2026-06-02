@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -J ca_ems_ann
-# For the 10M-DOF, sub_n=5 ANN optimizer, 32 nodes is the recommended
-# default: it roughly halves the per-rank ANN/K-cache work from the
-# converged 16-node baseline while keeping enough local DOFs for GAMG.
+# For the 10M-DOF, sub_n=5 ANN optimizer, 48 nodes is the recommended
+# strong-preconditioner default.  It gives a balanced 24x14x4-style process
+# grid on 28-core nodes while leaving enough local DOFs for AMG coarsening.
 # Override at submission time with: sbatch -N <nodes> ...
-#SBATCH -N 32
+#SBATCH -N 48
 #SBATCH --ntasks-per-node=28
 #SBATCH --partition=normal,normal1,normal2,normal3,normal4
 #SBATCH --mem=0
@@ -106,6 +106,7 @@ CACHE_K="${CACHE_K:-true}"
 CACHE_GIB_LIMIT="${CACHE_GIB_LIMIT:-8}"
 EMS_PC_TYPE="${EMS_PC_TYPE:-aux_ann_gamg}"
 GAMG_PROFILE="${GAMG_PROFILE:-strong}"
+HYPRE_PROFILE="${HYPRE_PROFILE:-strong}"
 KSP_GMRES_RESTART="${KSP_GMRES_RESTART:-200}"
 case "${EMS_PC_TYPE}" in
   block_jacobi)
@@ -124,8 +125,11 @@ case "${EMS_PC_TYPE}" in
         strong)
           KSP_EXTRA="-ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_gamg_type agg -pc_gamg_threshold 0.02 -pc_gamg_square_graph 1 -pc_gamg_agg_nsmooths 2 -mg_levels_ksp_type chebyshev -mg_levels_ksp_max_it 2 -mg_levels_pc_type jacobi"
           ;;
+        xstrong)
+          KSP_EXTRA="-ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_gamg_type agg -pc_gamg_threshold 0.05 -pc_gamg_threshold_scale 0.0 -pc_gamg_square_graph 1 -pc_gamg_aggressive_coarsening 1 -pc_gamg_agg_nsmooths 3 -pc_gamg_esteig_ksp_max_it 10 -mg_levels_ksp_type chebyshev -mg_levels_ksp_max_it 4 -mg_levels_ksp_chebyshev_esteig 0,0.05,0,1.1 -mg_levels_pc_type jacobi"
+          ;;
         *)
-          echo "Unknown GAMG_PROFILE=${GAMG_PROFILE}; use lowmem or strong." >&2
+          echo "Unknown GAMG_PROFILE=${GAMG_PROFILE}; use lowmem, strong, or xstrong." >&2
           exit 2
           ;;
       esac
@@ -134,10 +138,26 @@ case "${EMS_PC_TYPE}" in
   *)
     KSP_TYPE="${KSP_TYPE:-fgmres}"
     PC_TYPE="${PC_TYPE:-hypre}"
-    if [ "${EMS_PC_TYPE}" = "aux_ann_hypre" ] || [ "${EMS_PC_TYPE}" = "aux_elastic_hypre" ]; then
-      KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3}"
-    else
-      KSP_EXTRA="${KSP_EXTRA:--ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
+    if [ -z "${KSP_EXTRA+x}" ]; then
+      if [ "${EMS_PC_TYPE}" = "aux_ann_hypre" ] || [ "${EMS_PC_TYPE}" = "aux_elastic_hypre" ]; then
+        case "${HYPRE_PROFILE}" in
+          lowmem)
+            KSP_EXTRA="-ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3"
+            ;;
+          strong)
+            KSP_EXTRA="-ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.6 -pc_hypre_boomeramg_nodal_coarsen 6 -pc_hypre_boomeramg_vec_interp_variant 3 -pc_hypre_boomeramg_interp_type ext+i -pc_hypre_boomeramg_relax_type_all l1scaled-Jacobi"
+            ;;
+          xstrong)
+            KSP_EXTRA="-ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.7 -pc_hypre_boomeramg_nodal_coarsen 6 -pc_hypre_boomeramg_vec_interp_variant 3 -pc_hypre_boomeramg_interp_type ext+i -pc_hypre_boomeramg_coarsen_type PMIS -pc_hypre_boomeramg_relax_type_all l1scaled-Jacobi -pc_hypre_boomeramg_max_iter 2"
+            ;;
+          *)
+            echo "Unknown HYPRE_PROFILE=${HYPRE_PROFILE}; use lowmem, strong, or xstrong." >&2
+            exit 2
+            ;;
+        esac
+      else
+        KSP_EXTRA="-ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.6"
+      fi
     fi
     ;;
 esac
@@ -225,6 +245,7 @@ echo "  ab_triangle_retract=${AB_TRIANGLE_RETRACT}"
 echo "  heaviside=${OPT_HEAVISIDE} beta0=${OPT_HEAVISIDE_BETA_INITIAL} beta_max=${OPT_HEAVISIDE_BETA_MAX} beta_interval=${OPT_HEAVISIDE_BETA_INTERVAL}"
 echo "  ems_pc_type=${EMS_PC_TYPE}"
 echo "  gamg_profile=${GAMG_PROFILE}"
+echo "  hypre_profile=${HYPRE_PROFILE}"
 echo "  ksp_type=${KSP_TYPE} pc_type=${PC_TYPE} ksp_rtol=${KSP_RTOL} ksp_max_it=${KSP_MAX_IT}"
 echo "  output_prefix=${PREFIX}"
 echo "  mpi_launcher=${MPI_LAUNCHER}"
