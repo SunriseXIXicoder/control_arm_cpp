@@ -1,6 +1,10 @@
 #!/bin/bash
 #SBATCH -J ca_ems_ann
-#SBATCH -N 16
+# For the 10M-DOF, sub_n=5 ANN optimizer, 32 nodes is the recommended
+# default: it roughly halves the per-rank ANN/K-cache work from the
+# converged 16-node baseline while keeping enough local DOFs for GAMG.
+# Override at submission time with: sbatch -N <nodes> ...
+#SBATCH -N 32
 #SBATCH --ntasks-per-node=28
 #SBATCH --partition=normal,normal1,normal2,normal3,normal4
 #SBATCH --mem=0
