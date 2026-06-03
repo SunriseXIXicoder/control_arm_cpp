@@ -39,4 +39,12 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                         const char *output_prefix,
                                         const char *final_vtk_file);
 
+PetscErrorCode run_emsfem_ann_postsolve(const Grid &grid,
+                                        const DensityOptions &density_options,
+                                        const OptimizerOptions &optimizer_options,
+                                        const EmSfemAnnOptions &ems_options,
+                                        const char *density_file,
+                                        const char *mask_file,
+                                        const char *output_prefix);
+
 } // namespace control_arm

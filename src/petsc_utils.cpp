@@ -1,5 +1,11 @@
 #include "control_arm/petsc_utils.hpp"
 
+#include <petscdmda.h>
+
+#include <cstdint>
+#include <cstring>
+#include <limits>
+
 namespace control_arm {
 namespace {
 
@@ -15,6 +21,28 @@ PetscReal map_linear(PetscReal value, PetscReal min_value, PetscReal max_value,
                      PetscReal out_min, PetscReal out_max) {
   return out_min + (value - min_value) * (out_max - out_min) /
                        (max_value - min_value);
+}
+
+std::uint32_t read_be32(const unsigned char *b) {
+  return (static_cast<std::uint32_t>(b[0]) << 24) |
+         (static_cast<std::uint32_t>(b[1]) << 16) |
+         (static_cast<std::uint32_t>(b[2]) << 8) |
+         static_cast<std::uint32_t>(b[3]);
+}
+
+std::uint64_t read_be64(const unsigned char *b) {
+  std::uint64_t value = 0;
+  for (PetscInt i = 0; i < 8; ++i) {
+    value = (value << 8) | static_cast<std::uint64_t>(b[i]);
+  }
+  return value;
+}
+
+PetscReal read_be_double(const unsigned char *b) {
+  const std::uint64_t bits = read_be64(b);
+  double value = 0.0;
+  std::memcpy(&value, &bits, sizeof(value));
+  return static_cast<PetscReal>(value);
 }
 
 } // namespace
@@ -340,6 +368,94 @@ PetscErrorCode write_objective_volume_history(
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                         "Objective-volume history: %s, plot: %s\n",
                         csv_path, svg_path));
+  return 0;
+}
+
+PetscErrorCode load_vec_binary_checkpoint(Vec v, const char *path) {
+  static const std::uint64_t kPetscVecFileClassId = 1211214ULL;
+  MPI_Comm comm = PetscObjectComm(reinterpret_cast<PetscObject>(v));
+  MPI_File fh;
+  MPI_Status status;
+  unsigned char header[16] = {};
+  PetscInt vec_size = 0;
+  PetscInt lo = 0, hi = 0;
+  PetscMPIInt byte_count = 0;
+  PetscMPIInt rank = 0;
+  std::uint64_t file_class = 0;
+  std::uint64_t file_size = 0;
+  MPI_Offset header_bytes = 0;
+
+  PetscCallMPI(MPI_Comm_rank(comm, &rank));
+  PetscCallMPI(MPI_File_open(comm, const_cast<char *>(path), MPI_MODE_RDONLY,
+                             MPI_INFO_NULL, &fh));
+  PetscCallMPI(MPI_File_read_at_all(fh, 0, header, 16, MPI_BYTE, &status));
+
+  if (read_be32(header) == kPetscVecFileClassId) {
+    file_class = read_be32(header);
+    file_size = read_be32(header + 4);
+    header_bytes = 8;
+  } else if (read_be64(header) == kPetscVecFileClassId) {
+    file_class = read_be64(header);
+    file_size = read_be64(header + 8);
+    header_bytes = 16;
+  }
+
+  PetscCheck(file_class == kPetscVecFileClassId, comm, PETSC_ERR_FILE_UNEXPECTED,
+             "PETSc binary checkpoint is not a Vec file or has an unsupported header: %s",
+             path);
+  PetscCall(VecGetSize(v, &vec_size));
+  PetscCheck(file_size == static_cast<std::uint64_t>(vec_size), comm,
+             PETSC_ERR_FILE_UNEXPECTED,
+             "PETSc binary Vec length mismatch for %s: file has %llu entries, expected %lld",
+             path, static_cast<unsigned long long>(file_size),
+             static_cast<long long>(vec_size));
+  PetscCall(VecGetOwnershipRange(v, &lo, &hi));
+
+  const PetscInt local_n = hi - lo;
+  const std::size_t raw_bytes =
+      static_cast<std::size_t>(local_n) * sizeof(double);
+  PetscCheck(raw_bytes <=
+                 static_cast<std::size_t>(
+                     std::numeric_limits<PetscMPIInt>::max()),
+             comm, PETSC_ERR_SUP,
+             "Local PETSc checkpoint read is too large for one MPI-IO call");
+  std::vector<unsigned char> raw(raw_bytes);
+  byte_count = static_cast<PetscMPIInt>(raw_bytes);
+  if (byte_count > 0) {
+    const MPI_Offset offset =
+        header_bytes +
+        static_cast<MPI_Offset>(lo) * static_cast<MPI_Offset>(sizeof(double));
+    PetscCallMPI(MPI_File_read_at_all(fh, offset, raw.data(), byte_count,
+                                      MPI_BYTE, &status));
+  }
+  PetscCallMPI(MPI_File_close(&fh));
+
+  PetscScalar *arr = nullptr;
+  PetscCall(VecGetArray(v, &arr));
+  for (PetscInt i = 0; i < local_n; ++i) {
+    arr[i] =
+        read_be_double(raw.data() + static_cast<std::size_t>(i) * sizeof(double));
+  }
+  PetscCall(VecRestoreArray(v, &arr));
+
+  if (rank == 0) {
+    PetscCall(PetscPrintf(comm,
+                          "Loaded PETSc binary Vec checkpoint: %s entries=%llu header_bytes=%lld\n",
+                          path,
+                          static_cast<unsigned long long>(file_size),
+                          static_cast<long long>(header_bytes)));
+  }
+  return 0;
+}
+
+PetscErrorCode load_dmda_natural_binary_checkpoint(DM da, Vec v,
+                                                   const char *path) {
+  Vec natural = nullptr;
+  PetscCall(DMDACreateNaturalVector(da, &natural));
+  PetscCall(load_vec_binary_checkpoint(natural, path));
+  PetscCall(DMDANaturalToGlobalBegin(da, natural, INSERT_VALUES, v));
+  PetscCall(DMDANaturalToGlobalEnd(da, natural, INSERT_VALUES, v));
+  PetscCall(VecDestroy(&natural));
   return 0;
 }
 

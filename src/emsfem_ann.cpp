@@ -3478,6 +3478,262 @@ PetscErrorCode write_emsfem_ann_solution_vtk(Mat A,
   return 0;
 }
 
+PetscErrorCode run_emsfem_ann_postsolve(const Grid &grid,
+                                        const DensityOptions &density_options,
+                                        const OptimizerOptions &optimizer_options,
+                                        const EmSfemAnnOptions &ems_options,
+                                        const char *density_file,
+                                        const char *mask_file,
+                                        const char *output_prefix) {
+  PetscCheck(ems_options.cache_element_matrices, PETSC_COMM_WORLD, PETSC_ERR_SUP,
+             "EMsFEM ANN postsolve currently requires -ems_cache_element_matrices true");
+  PetscCheck(density_file != nullptr && density_file[0] != '\0',
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_NULL,
+             "EMsFEM ANN postsolve needs -density_file <*_rho_phys.petscbin>");
+
+  DM uda = nullptr, fda = nullptr, cda = nullptr;
+  Vec rho_phys = nullptr, mask = nullptr, u = nullptr, b = nullptr;
+  Vec coarse_rho = nullptr;
+  Mat A = nullptr, P = nullptr;
+  KSP ksp = nullptr;
+  EmsBlockJacobiContext *pc_ctx = nullptr;
+  EmSfemAnnContext *ctx = new EmSfemAnnContext();
+  char ems_pc_type[64] = "aux_ann_gamg";
+  PetscBool ems_uses_aux_matrix = PETSC_FALSE;
+  PetscInt local_size = 0;
+  PetscInt local_fixed = 0, global_fixed = 0;
+  PetscReal compliance = 0.0;
+  PetscReal rnorm_max = 0.0;
+  PetscInt total_its = 0;
+  PetscLogDouble t0 = 0.0;
+  PetscReal setup_s = 0.0, solve_s = 0.0;
+  OptimizerOptions write_options = optimizer_options;
+
+  write_options.write_checkpoint = PETSC_TRUE;
+  PetscCall(get_ems_pc_type_option(ems_pc_type, sizeof(ems_pc_type),
+                                   &ems_uses_aux_matrix));
+  const PetscReal fine_filter_radius =
+      optimizer_options.filter_radius *
+      static_cast<PetscReal>(ems_options.sub_n);
+  const PetscInt fine_stencil =
+      PetscMax(2 * ems_options.sub_n,
+               static_cast<PetscInt>(PetscCeilReal(fine_filter_radius)));
+
+  PetscCall(PetscTime(&t0));
+  PetscCall(create_ems_opt_dms(grid, ems_options.sub_n, fine_stencil,
+                               &uda, &fda));
+  ctx->da = uda;
+  ctx->grid = grid;
+  ctx->density_options = density_options;
+  ctx->ems_options = ems_options;
+  PetscCall(ctx->ann.load(ems_options.ann_dir, ems_options.sub_n));
+
+  {
+    const PetscReal hx =
+        domain_length(grid) /
+        static_cast<PetscReal>((grid.nx - 1) * ems_options.sub_n);
+    const PetscReal hy =
+        domain_width(grid) /
+        static_cast<PetscReal>((grid.ny - 1) * ems_options.sub_n);
+    const PetscReal hz =
+        domain_height(grid) /
+        static_cast<PetscReal>((grid.nz - 1) * ems_options.sub_n);
+    compute_h8_element_stiffness(hx, hy, hz, density_options.young_modulus,
+                                 ctx->fine_ke);
+    std::vector<PetscReal> shape;
+    std::vector<PetscReal> material(static_cast<std::size_t>(
+                                        ems_options.sub_n * ems_options.sub_n *
+                                        ems_options.sub_n),
+                                    1.0);
+    fill_trilinear_shape(ems_options.sub_n, &shape);
+    accumulate_shape_stiffness(ctx->fine_ke, shape, material, ems_options.sub_n,
+                               ctx->solid_ke);
+  }
+
+  PetscCall(DMCreateGlobalVector(fda, &rho_phys));
+  PetscCall(load_dmda_natural_binary_checkpoint(fda, rho_phys, density_file));
+  if (mask_file != nullptr && mask_file[0] != '\0') {
+    PetscCall(DMCreateGlobalVector(fda, &mask));
+    PetscCall(load_dmda_natural_binary_checkpoint(fda, mask, mask_file));
+  }
+
+  PetscCall(DMCreateGlobalVector(uda, &u));
+  PetscCall(VecDuplicate(u, &b));
+  PetscCall(DMCreateLocalVector(uda, &ctx->local_x));
+  PetscCall(VecGetLocalSize(u, &local_size));
+  {
+    PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+    PetscCall(DMDAGetCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
+    for (PetscInt k = zs; k < zs + zm; ++k) {
+      for (PetscInt j = ys; j < ys + ym; ++j) {
+        for (PetscInt i = xs; i < xs + xm; ++i) {
+          if (is_fixed_node(i, j, k, *ctx)) ++local_fixed;
+        }
+      }
+    }
+  }
+  PetscCallMPI(MPI_Allreduce(&local_fixed, &global_fixed, 1, MPIU_INT, MPI_SUM,
+                             PETSC_COMM_WORLD));
+  PetscCheck(global_fixed > 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "No fixed nodes were selected for EMsFEM ANN postsolve");
+
+  {
+    EmsCacheTiming cache_timing;
+    PetscCall(rebuild_local_k_cache_from_rho(ctx, fda, rho_phys,
+                                             &cache_timing));
+  }
+  PetscCall(MatCreateShell(PETSC_COMM_WORLD, local_size, local_size,
+                           dof_count(grid), dof_count(grid), ctx, &A));
+  PetscCall(MatShellSetOperation(A, MATOP_MULT,
+                                 reinterpret_cast<void (*)(void)>(emsfem_mult)));
+  PetscCall(MatShellSetOperation(A, MATOP_GET_DIAGONAL,
+                                 reinterpret_cast<void (*)(void)>(
+                                     emsfem_get_diagonal)));
+  PetscCall(MatShellSetOperation(A, MATOP_DESTROY,
+                                 reinterpret_cast<void (*)(void)>(
+                                     emsfem_destroy)));
+  PetscCall(MatSetOption(A, MAT_SYMMETRIC, PETSC_TRUE));
+
+  if (ems_pc_type_uses_coarse_density_aux_matrix(ems_pc_type)) {
+    PetscCall(create_ems_coarse_density_dm(uda, grid, &cda));
+    PetscCall(DMCreateGlobalVector(cda, &coarse_rho));
+    PetscCall(build_ems_coarse_density(cda, fda, rho_phys, grid,
+                                       ems_options.sub_n, coarse_rho));
+    if (ems_pc_type_uses_low_order_aux_matrix(ems_pc_type)) {
+      PetscCall(create_ems_aux_laplacian_matrix(uda, cda, coarse_rho,
+                                                *ctx, &P));
+    } else {
+      PetscCall(create_ems_aux_elasticity_matrix(uda, cda, coarse_rho,
+                                                 *ctx, &P));
+    }
+  } else if (ems_pc_type_uses_ann_aux_matrix(ems_pc_type)) {
+    PetscCall(create_ems_aux_ann_matrix(uda, ctx, &P));
+  } else if (std::strcmp(ems_pc_type, "block_jacobi") == 0) {
+    pc_ctx = new EmsBlockJacobiContext();
+    pc_ctx->ems = ctx;
+    PetscCall(setup_ems_block_jacobi(pc_ctx));
+  }
+
+  PetscCall(KSPCreate(PETSC_COMM_WORLD, &ksp));
+  PetscCall(configure_ems_ksp(ksp, A, P, pc_ctx, grid, optimizer_options,
+                              ems_pc_type));
+  PetscCall(elapsed_max_since(t0, &setup_s));
+
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                        "EMsFEM ANN postsolve: density=%s mask=%s nx=%lld ny=%lld nz=%lld sub_n=%lld dof=%lld pc=%s fixed_nodes=%lld\n",
+                        density_file,
+                        (mask_file != nullptr && mask_file[0] != '\0')
+                            ? mask_file
+                            : "(none)",
+                        static_cast<long long>(grid.nx),
+                        static_cast<long long>(grid.ny),
+                        static_cast<long long>(grid.nz),
+                        static_cast<long long>(ems_options.sub_n),
+                        static_cast<long long>(dof_count(grid)),
+                        ems_pc_type,
+                        static_cast<long long>(global_fixed)));
+
+  PetscCall(PetscTime(&t0));
+  {
+    const PetscBool multi_case =
+        (ems_options.control_arm_bc &&
+         (ems_options.load_case <= 0 || ems_options.load_case > 3))
+            ? PETSC_TRUE
+            : PETSC_FALSE;
+    const PetscInt first_case = multi_case ? 1 : ems_options.load_case;
+    const PetscInt last_case = multi_case ? 3 : ems_options.load_case;
+    for (PetscInt load_case = first_case; load_case <= last_case; ++load_case) {
+      PetscScalar dot = 0.0;
+      PetscInt case_its = 0;
+      PetscReal case_rnorm = 0.0;
+      const PetscReal weight =
+          multi_case ? control_arm_case_weight(load_case) : 1.0;
+      PetscCall(fill_optimizer_load(uda, grid, ems_options,
+                                    optimizer_options.load, load_case, b));
+      PetscCall(VecSet(u, 0.0));
+      PetscCall(KSPSolve(ksp, b, u));
+      PetscCall(KSPGetIterationNumber(ksp, &case_its));
+      PetscCall(KSPGetResidualNorm(ksp, &case_rnorm));
+      KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
+      PetscCall(KSPGetConvergedReason(ksp, &reason));
+      PetscCheck(reason > 0, PETSC_COMM_WORLD, PETSC_ERR_CONV_FAILED,
+                 "EMsFEM ANN postsolve did not converge for load_case=%lld",
+                 static_cast<long long>(load_case));
+      PetscCall(write_ems_displacement_checkpoint(write_options, multi_case,
+                                                  load_case, u));
+      PetscCall(VecDot(b, u, &dot));
+      compliance += weight * PetscRealPart(dot);
+      total_its += case_its;
+      rnorm_max = PetscMax(rnorm_max, case_rnorm);
+      PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                            "postsolve load_case=%lld ksp_it=%lld residual=%.3e compliance=%.6e\n",
+                            static_cast<long long>(load_case),
+                            static_cast<long long>(case_its),
+                            static_cast<double>(case_rnorm),
+                            static_cast<double>(PetscRealPart(dot))));
+    }
+  }
+  PetscCall(elapsed_max_since(t0, &solve_s));
+
+  {
+    char summary_path[PETSC_MAX_PATH_LEN];
+    PetscViewer viewer = nullptr;
+    PetscCall(PetscSNPrintf(summary_path, sizeof(summary_path),
+                            "%s_postsolve_summary.txt", output_prefix));
+    PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, summary_path, &viewer));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "mode=ems_ann_postsolve\n"));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "density_file=%s\n",
+                                     density_file));
+    PetscCall(PetscViewerASCIIPrintf(
+        viewer, "mask_file=%s\n",
+        (mask_file != nullptr && mask_file[0] != '\0') ? mask_file : ""));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "nx=%lld\n",
+                                     static_cast<long long>(grid.nx)));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "ny=%lld\n",
+                                     static_cast<long long>(grid.ny)));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "nz=%lld\n",
+                                     static_cast<long long>(grid.nz)));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "sub_n=%lld\n",
+                                     static_cast<long long>(ems_options.sub_n)));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "dof=%lld\n",
+                                     static_cast<long long>(dof_count(grid))));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "ems_pc_type=%s\n",
+                                     ems_pc_type));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "load_case=%lld\n",
+                                     static_cast<long long>(
+                                         ems_options.load_case)));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "ksp_iterations=%lld\n",
+                                     static_cast<long long>(total_its)));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "ksp_residual=%.12e\n",
+                                     static_cast<double>(rnorm_max)));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "compliance=%.12e\n",
+                                     static_cast<double>(compliance)));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "setup_time_s=%.12e\n",
+                                     static_cast<double>(setup_s)));
+    PetscCall(PetscViewerASCIIPrintf(viewer, "solve_time_s=%.12e\n",
+                                     static_cast<double>(solve_s)));
+    PetscCall(PetscViewerDestroy(&viewer));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                          "EMsFEM ANN postsolve summary: %s\n",
+                          summary_path));
+  }
+
+  PetscCall(KSPDestroy(&ksp));
+  delete pc_ctx;
+  pc_ctx = nullptr;
+  PetscCall(MatDestroy(&P));
+  PetscCall(MatDestroy(&A));
+  uda = nullptr;
+  PetscCall(VecDestroy(&coarse_rho));
+  PetscCall(VecDestroy(&b));
+  PetscCall(VecDestroy(&u));
+  PetscCall(VecDestroy(&mask));
+  PetscCall(VecDestroy(&rho_phys));
+  PetscCall(DMDestroy(&cda));
+  PetscCall(DMDestroy(&fda));
+  return 0;
+}
+
 PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                         const DensityOptions &density_options,
                                         const OptimizerOptions &optimizer_options,

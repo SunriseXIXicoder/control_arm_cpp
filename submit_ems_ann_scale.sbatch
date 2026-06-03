@@ -190,6 +190,8 @@ TASKS_PER_NODE_ALLOC="${SLURM_NTASKS_PER_NODE:-${SLURM_CPUS_ON_NODE:-28}}"
 TOTAL_TASKS="${SLURM_NPROCS:-${SLURM_NTASKS:-$((NODES_ALLOC * TASKS_PER_NODE_ALLOC))}}"
 MPI_LAUNCHER="${MPI_LAUNCHER:-mpirun}"
 MPI_LAUNCHER_ARGS="${MPI_LAUNCHER_ARGS:-}"
+DENSITY_FILE="${DENSITY_FILE:-}"
+MASK_FILE="${MASK_FILE:-}"
 
 DOF=$((NX * NY * NZ * 3))
 COARSE_ELEMS=$(((NX - 1) * (NY - 1) * (NZ - 1)))
@@ -212,6 +214,17 @@ if [ -n "${EMS_DM_PX:-}" ] || [ -n "${EMS_DM_PY:-}" ] || [ -n "${EMS_DM_PZ:-}" ]
 fi
 if [ "${KSP_TYPE}" = "gmres" ] || [ "${KSP_TYPE}" = "fgmres" ]; then
   KSP_EXTRA="${KSP_EXTRA} -ksp_gmres_restart ${KSP_GMRES_RESTART}"
+fi
+POSTSOLVE_ARGS=""
+if [ "${MODE}" = "ems_ann_postsolve" ]; then
+  if [ -z "${DENSITY_FILE}" ]; then
+    echo "MODE=ems_ann_postsolve requires DENSITY_FILE=<*_rho_phys.petscbin>." >&2
+    exit 2
+  fi
+  POSTSOLVE_ARGS="-density_file ${DENSITY_FILE}"
+  if [ -n "${MASK_FILE}" ]; then
+    POSTSOLVE_ARGS="${POSTSOLVE_ARGS} -mask_file ${MASK_FILE}"
+  fi
 fi
 
 cd "$SUBMIT_DIR"
@@ -249,6 +262,10 @@ echo "  hypre_profile=${HYPRE_PROFILE}"
 echo "  ksp_type=${KSP_TYPE} pc_type=${PC_TYPE} ksp_rtol=${KSP_RTOL} ksp_max_it=${KSP_MAX_IT}"
 echo "  output_prefix=${PREFIX}"
 echo "  mpi_launcher=${MPI_LAUNCHER}"
+if [ "${MODE}" = "ems_ann_postsolve" ]; then
+  echo "  density_file=${DENSITY_FILE}"
+  echo "  mask_file=${MASK_FILE:-none}"
+fi
 
 if [ "${MPI_LAUNCHER}" = "srun" ]; then
   LAUNCH_CMD="${MPI_LAUNCHER} ${MPI_LAUNCHER_ARGS} -n ${TOTAL_TASKS}"
@@ -304,6 +321,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -include_spring_load "${INCLUDE_SPRING_LOAD}" \
   -write_structured_vtk false \
   -write_solution false \
+  ${POSTSOLVE_ARGS} \
   -ksp_type "${KSP_TYPE}" \
   -pc_type "${PC_TYPE}" \
   -ksp_rtol "${KSP_RTOL}" \

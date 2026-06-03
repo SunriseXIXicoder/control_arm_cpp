@@ -21,7 +21,7 @@ static char help[] =
     "stage interfaces and are not silently approximated here.\n"
     "\n"
     "Main options:\n"
-    "  -mode geometry|density|solve|optimize|h8_initial_vtk|h8_postprocess|h8_full_vtk\n"
+    "  -mode geometry|density|solve|optimize|ems_ann_postsolve|h8_initial_vtk|h8_postprocess|h8_full_vtk\n"
     "  -nx -ny -nz\n"
     "  -operator low_order|h8_matrix_free|emsfem_ann\n"
     "  -output_prefix <path>\n"
@@ -418,6 +418,7 @@ int main(int argc, char **argv) {
   PetscBool is_solve_mode = PETSC_FALSE;
   PetscBool is_density_mode = PETSC_FALSE;
   PetscBool is_optimize_mode = PETSC_FALSE;
+  PetscBool is_ems_ann_postsolve_mode = PETSC_FALSE;
   PetscBool is_h8_initial_vtk_mode = PETSC_FALSE;
   PetscBool is_h8_postprocess_mode = PETSC_FALSE;
   PetscBool is_h8_full_vtk_mode = PETSC_FALSE;
@@ -602,6 +603,8 @@ int main(int argc, char **argv) {
   PetscCall(PetscStrcmp(mode, "solve", &is_solve_mode));
   PetscCall(PetscStrcmp(mode, "density", &is_density_mode));
   PetscCall(PetscStrcmp(mode, "optimize", &is_optimize_mode));
+  PetscCall(PetscStrcmp(mode, "ems_ann_postsolve",
+                        &is_ems_ann_postsolve_mode));
   PetscCall(PetscStrcmp(mode, "h8_initial_vtk", &is_h8_initial_vtk_mode));
   PetscCall(PetscStrcmp(mode, "h8_postprocess", &is_h8_postprocess_mode));
   PetscCall(PetscStrcmp(mode, "h8_full_vtk", &is_h8_full_vtk_mode));
@@ -610,20 +613,22 @@ int main(int argc, char **argv) {
   PetscCall(PetscStrcmp(operator_type, "emsfem_ann", &is_emsfem_ann));
 
   PetscCheck(is_geometry_mode || is_solve_mode || is_density_mode ||
-                 is_optimize_mode || is_h8_initial_vtk_mode ||
+                 is_optimize_mode || is_ems_ann_postsolve_mode ||
+                 is_h8_initial_vtk_mode ||
                  is_h8_postprocess_mode ||
                  is_h8_full_vtk_mode,
              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-             "-mode must be geometry, density, optimize, solve, h8_initial_vtk, h8_postprocess, or h8_full_vtk");
+             "-mode must be geometry, density, optimize, solve, ems_ann_postsolve, h8_initial_vtk, h8_postprocess, or h8_full_vtk");
   PetscCheck(is_low_order || is_h8_matrix_free || is_emsfem_ann,
              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
              "-operator must be low_order, h8_matrix_free, or emsfem_ann");
   PetscCheck(ems_options.sub_n >= 2, PETSC_COMM_WORLD, PETSC_ERR_ARG_OUTOFRANGE,
              "-ems_sub_n must be at least 2");
-  PetscCheck(!has_density_file || is_h8_postprocess_mode || is_h8_full_vtk_mode,
+  PetscCheck(!has_density_file || is_ems_ann_postsolve_mode ||
+                 is_h8_postprocess_mode || is_h8_full_vtk_mode,
              PETSC_COMM_WORLD,
              PETSC_ERR_SUP,
-             "-density_file is currently accepted only by -mode h8_postprocess or h8_full_vtk");
+             "-density_file is currently accepted only by -mode ems_ann_postsolve, h8_postprocess, or h8_full_vtk");
   PetscCheck(grid.nx >= 2 && grid.ny >= 2 && grid.nz >= 2, PETSC_COMM_WORLD,
              PETSC_ERR_ARG_OUTOFRANGE, "nx, ny, and nz must be at least 2");
   PetscCheck(grid.physical_height > 0.0, PETSC_COMM_WORLD,
@@ -682,6 +687,16 @@ int main(int argc, char **argv) {
     PetscCall(run_optimize_mode(grid, density_options, optimizer_options,
                                 ems_options,
                                 operator_type, output_prefix, opt_vtk_file));
+  } else if (is_ems_ann_postsolve_mode) {
+    PetscCheck(is_emsfem_ann, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+               "-mode ems_ann_postsolve requires -operator emsfem_ann");
+    PetscCheck(has_density_file, PETSC_COMM_WORLD, PETSC_ERR_ARG_NULL,
+               "-mode ems_ann_postsolve requires -density_file");
+    PetscCall(run_emsfem_ann_postsolve(grid, density_options,
+                                       optimizer_options, ems_options,
+                                       density_file,
+                                       has_mask_file ? mask_file : "",
+                                       output_prefix));
   } else if (is_h8_initial_vtk_mode) {
     PetscCall(run_h8_initial_vtk(grid, density_options, optimizer_options,
                                  post_vtk_file, post_stride,

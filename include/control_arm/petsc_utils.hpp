@@ -45,4 +45,9 @@ PetscErrorCode write_objective_volume_history(
     const std::vector<ObjectiveVolumePoint> &points,
     PetscReal volume_target);
 
+PetscErrorCode load_vec_binary_checkpoint(Vec v, const char *path);
+
+PetscErrorCode load_dmda_natural_binary_checkpoint(DM da, Vec v,
+                                                   const char *path);
+
 } // namespace control_arm
