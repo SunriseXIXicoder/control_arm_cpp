@@ -192,6 +192,8 @@ MPI_LAUNCHER="${MPI_LAUNCHER:-mpirun}"
 MPI_LAUNCHER_ARGS="${MPI_LAUNCHER_ARGS:-}"
 DENSITY_FILE="${DENSITY_FILE:-}"
 MASK_FILE="${MASK_FILE:-}"
+POSTSOLVE_CHECKPOINT="${POSTSOLVE_CHECKPOINT:-${CHECKPOINT_FILE:-}}"
+POSTSOLVE_PREFIX="${POSTSOLVE_PREFIX:-}"
 
 DOF=$((NX * NY * NZ * 3))
 COARSE_ELEMS=$(((NX - 1) * (NY - 1) * (NZ - 1)))
@@ -215,10 +217,72 @@ fi
 if [ "${KSP_TYPE}" = "gmres" ] || [ "${KSP_TYPE}" = "fgmres" ]; then
   KSP_EXTRA="${KSP_EXTRA} -ksp_gmres_restart ${KSP_GMRES_RESTART}"
 fi
+
+strip_petsc_info_suffix() {
+  case "$1" in
+    *.petscbin.info) printf '%s\n' "${1%.info}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+checkpoint_prefix_from_file() {
+  local path
+  path="$(strip_petsc_info_suffix "$1")"
+  case "${path}" in
+    *_final_rho_phys.petscbin) printf '%s\n' "${path%_final_rho_phys.petscbin}" ;;
+    *_final_rho_design.petscbin) printf '%s\n' "${path%_final_rho_design.petscbin}" ;;
+    *_final_mask.petscbin) printf '%s\n' "${path%_final_mask.petscbin}" ;;
+    *) printf '%s\n' "${path}" ;;
+  esac
+}
+
+resolve_result_path() {
+  local path="$1"
+  if [ -f "${path}" ]; then
+    printf '%s\n' "${path}"
+  elif [[ "${path}" != */* ]] && [ -f "result/${path}" ]; then
+    printf '%s\n' "result/${path}"
+  else
+    printf '%s\n' "${path}"
+  fi
+}
+
 POSTSOLVE_ARGS=""
 if [ "${MODE}" = "ems_ann_postsolve" ]; then
+  if [ -n "${POSTSOLVE_CHECKPOINT}" ] && [ -z "${POSTSOLVE_PREFIX}" ]; then
+    POSTSOLVE_PREFIX="$(checkpoint_prefix_from_file "${POSTSOLVE_CHECKPOINT}")"
+  fi
+  if [ -n "${POSTSOLVE_PREFIX}" ]; then
+    DENSITY_FILE="${DENSITY_FILE:-${POSTSOLVE_PREFIX}_final_rho_phys.petscbin}"
+    MASK_FILE="${MASK_FILE:-${POSTSOLVE_PREFIX}_final_mask.petscbin}"
+  fi
+  if [ -n "${DENSITY_FILE}" ]; then
+    DENSITY_FILE="$(strip_petsc_info_suffix "${DENSITY_FILE}")"
+  fi
+  if [ -n "${MASK_FILE}" ]; then
+    MASK_FILE="$(strip_petsc_info_suffix "${MASK_FILE}")"
+  fi
   if [ -z "${DENSITY_FILE}" ]; then
-    echo "MODE=ems_ann_postsolve requires DENSITY_FILE=<*_rho_phys.petscbin>." >&2
+    echo "MODE=ems_ann_postsolve requires DENSITY_FILE=<*_rho_phys.petscbin> or POSTSOLVE_CHECKPOINT=<final checkpoint file>." >&2
+    exit 2
+  fi
+fi
+
+cd "$SUBMIT_DIR"
+mkdir -p bin result logs
+if [ "${MODE}" = "ems_ann_postsolve" ]; then
+  DENSITY_FILE="$(resolve_result_path "${DENSITY_FILE}")"
+  if [ -n "${MASK_FILE}" ]; then
+    MASK_FILE="$(resolve_result_path "${MASK_FILE}")"
+  fi
+  if [ ! -f "${DENSITY_FILE}" ]; then
+    echo "EMsFEM ANN postsolve density file not found: ${DENSITY_FILE}" >&2
+    echo "If you copied a .petscbin.info name, use the matching .petscbin data file; the script strips .info automatically." >&2
+    exit 2
+  fi
+  if [ -n "${MASK_FILE}" ] && [ ! -f "${MASK_FILE}" ]; then
+    echo "EMsFEM ANN postsolve mask file not found: ${MASK_FILE}" >&2
+    echo "If you copied a .petscbin.info name, use the matching .petscbin data file; the script strips .info automatically." >&2
     exit 2
   fi
   POSTSOLVE_ARGS="-density_file ${DENSITY_FILE}"
@@ -226,9 +290,6 @@ if [ "${MODE}" = "ems_ann_postsolve" ]; then
     POSTSOLVE_ARGS="${POSTSOLVE_ARGS} -mask_file ${MASK_FILE}"
   fi
 fi
-
-cd "$SUBMIT_DIR"
-mkdir -p bin result logs
 echo "Start time: $(date)"
 echo "Submit dir: ${SUBMIT_DIR}"
 echo "Run host: $(hostname)"
