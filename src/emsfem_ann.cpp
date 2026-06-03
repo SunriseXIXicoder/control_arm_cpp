@@ -3087,6 +3087,29 @@ PetscErrorCode write_ems_checkpoint(const OptimizerOptions &opt, PetscInt iter,
   return 0;
 }
 
+PetscErrorCode write_ems_displacement_checkpoint(const OptimizerOptions &opt,
+                                                 PetscBool multi_case,
+                                                 PetscInt load_case,
+                                                 Vec u) {
+  char u_path[PETSC_MAX_PATH_LEN];
+  if (!opt.write_checkpoint) return 0;
+  if (multi_case) {
+    PetscCall(PetscSNPrintf(u_path, sizeof(u_path),
+                            "%s_final_u_case_%03lld.petscbin",
+                            opt.checkpoint_prefix,
+                            static_cast<long long>(load_case)));
+  } else {
+    PetscCall(PetscSNPrintf(u_path, sizeof(u_path),
+                            "%s_final_u.petscbin",
+                            opt.checkpoint_prefix));
+  }
+  PetscCall(write_vec_binary(u, u_path));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                        "Wrote EMsFEM ANN displacement checkpoint: %s\n",
+                        u_path));
+  return 0;
+}
+
 PetscErrorCode write_ems_summary(const char *output_prefix,
                                  const Grid &grid,
                                  const DensityOptions &density_options,
@@ -4117,6 +4140,15 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       PetscCheck(reason > 0, PETSC_COMM_WORLD, PETSC_ERR_CONV_FAILED,
                  "Final EMsFEM ANN linear solve did not converge for load_case=%lld",
                  static_cast<long long>(load_case));
+      {
+        PetscLogDouble stage_start = 0.0;
+        PetscReal elapsed = 0.0;
+        PetscCall(PetscTime(&stage_start));
+        PetscCall(write_ems_displacement_checkpoint(optimizer_options,
+                                                    multi_case, load_case, u));
+        PetscCall(elapsed_max_since(stage_start, &elapsed));
+        timings.checkpoint_write_s += elapsed;
+      }
       PetscCall(VecDot(b, u, &dot));
       {
         PetscLogDouble stage_start = 0.0;

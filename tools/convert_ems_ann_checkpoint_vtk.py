@@ -10,9 +10,11 @@ handle the 10M-DOF sub_n=5 checkpoint without loading all fine cells at once.
 from __future__ import annotations
 
 import argparse
+from array import array
 import math
 import os
 import struct
+import sys
 from pathlib import Path
 from typing import BinaryIO
 
@@ -62,9 +64,73 @@ def read_row(f: BinaryIO, data_offset: int, fnx: int, fny: int, j: int, k: int) 
     return struct.unpack(f">{fnx}d", raw)
 
 
+def read_petsc_vec_array(path: Path, expected_entries: int) -> array:
+    _, offset = check_vec(path, expected_entries)
+    data = array("d")
+    with path.open("rb") as f:
+        f.seek(offset)
+        data.fromfile(f, expected_entries)
+    if sys.byteorder == "little":
+        data.byteswap()
+    if len(data) != expected_entries:
+        raise EOFError(
+            f"unexpected end of PETSc Vec while reading {path}: "
+            f"got {len(data)} entries, expected {expected_entries}"
+        )
+    return data
+
+
 def sampled_indices(count: int, stride: int) -> list[int]:
     bins = max(1, math.ceil(count / stride))
     return [min(count - 1, c * stride + stride // 2) for c in range(bins)]
+
+
+def coarse_position(point_index: int, sampled_points: int, coarse_nodes: int) -> tuple[int, float]:
+    if coarse_nodes <= 1:
+        return 0, 0.0
+    if sampled_points <= 1:
+        return 0, 0.0
+    pos = (coarse_nodes - 1) * point_index / (sampled_points - 1)
+    base = int(math.floor(pos))
+    if base >= coarse_nodes - 1:
+        return coarse_nodes - 2, 1.0
+    return base, pos - base
+
+
+def write_displacement_vectors(
+    out,
+    displacement_path: Path,
+    nx: int,
+    ny: int,
+    nz: int,
+    ncx: int,
+    ncy: int,
+    ncz: int,
+) -> None:
+    u = read_petsc_vec_array(displacement_path, nx * ny * nz * 3)
+
+    def value(i: int, j: int, k: int, c: int) -> float:
+        return u[3 * (i + nx * (j + ny * k)) + c]
+
+    out.write(f"POINT_DATA {(ncx + 1) * (ncy + 1) * (ncz + 1)}\n")
+    out.write("VECTORS displacement double\n")
+    for pk in range(ncz + 1):
+        ck, tz = coarse_position(pk, ncz + 1, nz)
+        wz = (1.0 - tz, tz)
+        for pj in range(ncy + 1):
+            cj, ty = coarse_position(pj, ncy + 1, ny)
+            wy = (1.0 - ty, ty)
+            for pi in range(ncx + 1):
+                ci, tx = coarse_position(pi, ncx + 1, nx)
+                wx = (1.0 - tx, tx)
+                disp = [0.0, 0.0, 0.0]
+                for dz in (0, 1):
+                    for dy in (0, 1):
+                        for dx in (0, 1):
+                            w = wx[dx] * wy[dy] * wz[dz]
+                            for c in (0, 1, 2):
+                                disp[c] += w * value(ci + dx, cj + dy, ck + dz, c)
+                out.write(f"{disp[0]:.12e} {disp[1]:.12e} {disp[2]:.12e}\n")
 
 
 def write_scalar(
@@ -113,6 +179,7 @@ def write_scalar(
 def write_vtk(
     rho_path: Path,
     mask_path: Path | None,
+    displacement_path: Path | None,
     out_path: Path,
     nx: int,
     ny: int,
@@ -154,6 +221,10 @@ def write_vtk(
         out.write(f"DIMENSIONS {ncx + 1} {ncy + 1} {ncz + 1}\n")
         out.write("ORIGIN 0 0 0\n")
         out.write(f"SPACING {length / ncx:.17g} {width / ncy:.17g} {height / ncz:.17g}\n")
+
+        if displacement_path is not None:
+            write_displacement_vectors(out, displacement_path, nx, ny, nz, ncx, ncy, ncz)
+
         out.write(f"CELL_DATA {sampled_cells}\n")
 
         write_scalar(
@@ -181,6 +252,11 @@ def main() -> None:
     )
     parser.add_argument("--density", required=True, type=Path)
     parser.add_argument("--mask", type=Path)
+    parser.add_argument(
+        "--displacement",
+        type=Path,
+        help="optional coarse-node EMsFEM ANN *_final_u*.petscbin checkpoint",
+    )
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--nx", required=True, type=int)
     parser.add_argument("--ny", required=True, type=int)
@@ -211,6 +287,7 @@ def main() -> None:
     write_vtk(
         args.density,
         args.mask,
+        args.displacement,
         args.out,
         args.nx,
         args.ny,

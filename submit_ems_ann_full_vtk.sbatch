@@ -30,6 +30,17 @@ MASK_ARGS=()
 if [ -n "${MASK_FILE:-}" ]; then
   MASK_ARGS=(--mask "${MASK_FILE}")
 fi
+if [ -z "${DISPLACEMENT_FILE:-}" ]; then
+  CANDIDATE_U="${DENSITY_FILE%_rho_phys.petscbin}_u.petscbin"
+  if [ "${CANDIDATE_U}" != "${DENSITY_FILE}_u.petscbin" ] &&
+     [ -f "${CANDIDATE_U}" ]; then
+    DISPLACEMENT_FILE="${CANDIDATE_U}"
+  fi
+fi
+DISPLACEMENT_ARGS=()
+if [ -n "${DISPLACEMENT_FILE:-}" ]; then
+  DISPLACEMENT_ARGS=(--displacement "${DISPLACEMENT_FILE}")
+fi
 
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 mkdir -p result logs
@@ -37,6 +48,7 @@ mkdir -p result logs
 echo "Writing full EMsFEM ANN fine-grid VTK"
 echo "  density=${DENSITY_FILE}"
 echo "  mask=${MASK_FILE:-none}"
+echo "  displacement=${DISPLACEMENT_FILE:-none}"
 echo "  vtk=${VTK_FILE}"
 echo "  nx=${NX} ny=${NY} nz=${NZ} sub_n=${EMS_SUB_N}"
 echo "  stride=${STRIDE} max_cells=${MAX_CELLS}"
@@ -45,6 +57,7 @@ echo "  start=$(date)"
 python3 tools/convert_ems_ann_checkpoint_vtk.py \
   --density "${DENSITY_FILE}" \
   "${MASK_ARGS[@]}" \
+  "${DISPLACEMENT_ARGS[@]}" \
   --out "${VTK_FILE}" \
   --nx "${NX}" --ny "${NY}" --nz "${NZ}" \
   --sub-n "${EMS_SUB_N}" \
