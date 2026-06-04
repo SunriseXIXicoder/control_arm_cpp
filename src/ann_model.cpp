@@ -253,25 +253,41 @@ PetscErrorCode AnnShapeModel::predict_inside_shape(
              "ANN shape output size mismatch");
 
   inside_shape->assign(static_cast<std::size_t>(inside_dofs) * 24u, 0.0);
+  const bool output_uses_matlab_node_order = sub_n == 20;
+  // The 20^3 training generator writes coarse-basis columns in the
+  // D3_CSQ_2/MATLAB order [100,000,010,110,101,001,011,111].  The C++ H8
+  // kernels use [000,100,110,010,001,101,111,011], so only the 20^3 model
+  // needs this column permutation after reconstructing the omitted node.
+  static const PetscInt matlab_to_cpp_node[8] = {1, 0, 3, 2, 5, 4, 7, 6};
   for (PetscInt row = 0; row < inside_dofs; ++row) {
     PetscReal sx = 0.0, sy = 0.0, sz = 0.0;
+    PetscReal decoded[24] = {};
     for (PetscInt col = 0; col < 21; ++col) {
       const PetscReal value =
           concatenated[static_cast<std::size_t>(row) * 21u +
                        static_cast<std::size_t>(col)];
-      (*inside_shape)[static_cast<std::size_t>(row) * 24u +
-                      static_cast<std::size_t>(col)] = value;
+      decoded[col] = value;
       if (col % 3 == 0) sx += value;
       if (col % 3 == 1) sy += value;
       if (col % 3 == 2) sz += value;
     }
     const PetscInt component = row % 3;
-    (*inside_shape)[static_cast<std::size_t>(row) * 24u + 21u] =
-        (component == 0 ? 1.0 : 0.0) - sx;
-    (*inside_shape)[static_cast<std::size_t>(row) * 24u + 22u] =
-        (component == 1 ? 1.0 : 0.0) - sy;
-    (*inside_shape)[static_cast<std::size_t>(row) * 24u + 23u] =
-        (component == 2 ? 1.0 : 0.0) - sz;
+    decoded[21] = (component == 0 ? 1.0 : 0.0) - sx;
+    decoded[22] = (component == 1 ? 1.0 : 0.0) - sy;
+    decoded[23] = (component == 2 ? 1.0 : 0.0) - sz;
+
+    PetscReal *out = inside_shape->data() +
+                     static_cast<std::size_t>(row) * 24u;
+    if (output_uses_matlab_node_order) {
+      for (PetscInt node = 0; node < 8; ++node) {
+        const PetscInt cpp_node = matlab_to_cpp_node[node];
+        for (PetscInt c = 0; c < 3; ++c) {
+          out[3 * cpp_node + c] = decoded[3 * node + c];
+        }
+      }
+    } else {
+      std::copy(decoded, decoded + 24, out);
+    }
   }
   return 0;
 }
