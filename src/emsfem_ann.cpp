@@ -3515,8 +3515,9 @@ PetscErrorCode run_emsfem_ann_postsolve(const Grid &grid,
   const PetscReal fine_filter_radius =
       optimizer_options.filter_radius *
       static_cast<PetscReal>(ems_options.sub_n);
+  // K-cache 只需要一层粗单元宽度的细密度 ghost；密度过滤需要覆盖过滤半径。
   const PetscInt fine_stencil =
-      PetscMax(2 * ems_options.sub_n,
+      PetscMax(ems_options.sub_n,
                static_cast<PetscInt>(PetscCeilReal(fine_filter_radius)));
 
   PetscCall(PetscTime(&t0));
@@ -3784,8 +3785,9 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   const PetscReal fine_filter_radius =
       optimizer_options.filter_radius *
       static_cast<PetscReal>(ems_options.sub_n);
+  // K-cache 只需要一层粗单元宽度的细密度 ghost；密度过滤需要覆盖过滤半径。
   const PetscInt fine_stencil =
-      PetscMax(2 * ems_options.sub_n,
+      PetscMax(ems_options.sub_n,
                static_cast<PetscInt>(PetscCeilReal(fine_filter_radius)));
 
   PetscCall(create_ems_opt_dms(grid, ems_options.sub_n, fine_stencil,
