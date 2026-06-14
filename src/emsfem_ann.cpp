@@ -18,11 +18,16 @@ namespace {
 
 constexpr PetscInt kElementDofs = 24;
 
+// 记录当前 MPI rank 已经缓存了哪些粗单元的刚度矩阵。
+// xs/ys/zs 是缓存盒子的起点，xm/ym/zm 是三个方向上的单元数量。
 struct ElementCacheBox {
   PetscInt xs = 0, ys = 0, zs = 0;
   PetscInt xm = 0, ym = 0, zm = 0;
 };
 
+// EMsFEM ANN 算法的核心上下文。
+// 它把网格、材料参数、神经网络模型、单元刚度缓存和边界条件信息打包在一起，
+// 之后 MatShell 的矩阵乘法、灵敏度计算、辅助预条件器都会通过这个对象取数据。
 struct EmSfemAnnContext {
   DM da = nullptr;
   Vec local_x = nullptr;
@@ -36,6 +41,8 @@ struct EmSfemAnnContext {
   std::vector<PetscReal> k_cache;
 };
 
+// 自定义 block-Jacobi 预条件器的上下文。
+// 每个粗节点保存一个 3x3 对角块逆矩阵，用来近似求解局部位移自由度。
 struct EmsBlockJacobiContext {
   EmSfemAnnContext *ems = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0;
@@ -43,6 +50,8 @@ struct EmsBlockJacobiContext {
   std::vector<PetscReal> inverse_blocks;
 };
 
+// 优化流程的分阶段计时统计。
+// 这些字段会累加 ANN 读取、K-cache 重建、KSP 求解、灵敏度和 VTK/结果写出等耗时。
 struct TimingTotals {
   PetscReal setup_s = 0.0;
   PetscReal ann_load_s = 0.0;
@@ -66,6 +75,8 @@ struct TimingTotals {
   PetscReal total_s = 0.0;
 };
 
+// 单次 EMsFEM 单元刚度缓存重建的细分计时。
+// 用来区分材料采样、ANN 形函数预测、单元矩阵积分装配和总耗时。
 struct EmsCacheTiming {
   PetscReal total_s = 0.0;
   PetscReal material_sampling_s = 0.0;
@@ -73,6 +84,9 @@ struct EmsCacheTiming {
   PetscReal matrix_assembly_s = 0.0;
 };
 
+// 计算从 start 到当前时刻的并行最大耗时。
+// 每个 rank 先计算自己的本地耗时，然后用 MPI_MAX 取所有 rank 中最慢的那个。
+// 并行程序的实际等待时间由最慢 rank 决定，所以日志里一般记录这个最大值。
 PetscErrorCode elapsed_max_since(PetscLogDouble start, PetscReal *elapsed) {
   PetscLogDouble now = 0.0;
   PetscLogDouble local_elapsed = 0.0;
@@ -94,6 +108,9 @@ PetscInt h8_local_node(PetscInt lx, PetscInt ly, PetscInt lz) {
   return lx == 0 ? 7 : 6;
 }
 
+// 给定粗单元编号 ex/ey/ez，列出 H8 单元 8 个角点的粗节点坐标。
+// nodes[a][0..2] 分别保存第 a 个角点的 i/j/k 索引。
+// 后续装配单元矩阵、提取局部位移、施加单元贡献时都依赖这个节点顺序。
 void h8_node_coords(PetscInt ex, PetscInt ey, PetscInt ez,
                     PetscInt node, PetscInt *i, PetscInt *j, PetscInt *k) {
   static const PetscInt dx[8] = {0, 1, 1, 0, 0, 1, 1, 0};
@@ -130,6 +147,9 @@ PetscInt fine_cell_count(const Grid &grid, PetscInt sub_n) {
          fine_nelz(grid, sub_n);
 }
 
+// 检查 EMsFEM 细网格尺寸是否有效，并避免 PetscInt 溢出。
+// 粗节点数是 grid.nx/ny/nz，粗单元数是节点数减一，细密度单元数再乘 sub_n。
+// 如果尺寸非法或超过当前 PETSc 整数范围，就提前报错，避免后面创建 Vec/DMDA 时崩溃。
 PetscErrorCode check_ems_fine_grid_size(const Grid &grid, PetscInt sub_n) {
   const long double fnx = static_cast<long double>(grid.nx - 1) *
                           static_cast<long double>(sub_n);
@@ -147,6 +167,9 @@ PetscErrorCode check_ems_fine_grid_size(const Grid &grid, PetscInt sub_n) {
   return 0;
 }
 
+// 返回细密度单元 (i,j,k) 的初始几何密度/设计域掩码密度。
+// 它把细网格坐标映射回控制臂几何函数，用于初始化 mask 和 rho。
+// 设计域内通常返回实体密度，设计域外返回 void_density。
 PetscReal fine_cell_density(PetscInt i, PetscInt j, PetscInt k,
                             const Grid &grid,
                             const DensityOptions &options,
@@ -160,6 +183,9 @@ PetscReal fine_cell_density(PetscInt i, PetscInt j, PetscInt k,
   return density_at_normalized(x, y, z, grid, options);
 }
 
+// 判断细密度单元是否属于必须保持实体的硬约束区域。
+// 这些区域通常对应固定端、加载端或连接孔附近，不允许优化器把它们挖空。
+// 返回 PETSC_TRUE 时，后续 mask 会标成硬实体，并把密度固定为 1。
 PetscBool hard_solid_fine_cell(PetscInt i, PetscInt j, PetscInt k,
                                const Grid &grid,
                                const DensityOptions &options,
@@ -222,6 +248,9 @@ PetscBool hard_solid_fine_cell(PetscInt i, PetscInt j, PetscInt k,
   return (ringA || ringB || ringC || spring_mount) ? PETSC_TRUE : PETSC_FALSE;
 }
 
+// 计算规则 H8 八节点六面体单元的 24x24 实体弹性刚度矩阵。
+// hx/hy/hz 是单元物理尺寸，young/nu 是材料弹性参数。
+// 这个矩阵既可作为普通 H8 单元刚度，也作为 EMsFEM 细胞积分的基础刚度。
 void compute_h8_element_stiffness(PetscReal hx, PetscReal hy, PetscReal hz,
                                   PetscReal young_modulus, PetscReal *ke) {
   const PetscReal nu = 0.30;
@@ -290,6 +319,9 @@ void compute_h8_element_stiffness(PetscReal hx, PetscReal hy, PetscReal hz,
   }
 }
 
+// 构造粗 H8 单元内部细节点上的三线性形函数。
+// shape 存的是“细节点自由度到粗单元 24 个自由度”的映射矩阵。
+// 当 ANN 没有覆盖内部节点，或需要边界一致性时，这个三线性形函数是基准形函数。
 void fill_trilinear_shape(PetscInt sub_n, std::vector<PetscReal> *shape) {
   const PetscInt nn = sub_n + 1;
   shape->assign(static_cast<std::size_t>(3 * nn * nn * nn) * kElementDofs, 0.0);
@@ -321,6 +353,9 @@ void fill_trilinear_shape(PetscInt sub_n, std::vector<PetscReal> *shape) {
   }
 }
 
+// 用 ANN 预测结果覆盖粗单元内部细节点的形函数。
+// 边界细节点仍保留三线性形函数，以保证相邻粗单元之间的位移连续性。
+// inside_shape 只包含内部节点，函数负责把它放回完整 shape 数组的正确位置。
 void overwrite_inside_shape(PetscInt sub_n,
                             const std::vector<PetscReal> &inside_shape,
                             std::vector<PetscReal> *shape) {
@@ -343,6 +378,9 @@ void overwrite_inside_shape(PetscInt sub_n,
   }
 }
 
+// 根据一个粗单元内部的细材料分布构造多尺度形函数。
+// 流程是先生成三线性基准形函数，再调用 ANN 预测内部形函数并覆盖内部节点。
+// timing 不为空时会累计 ANN 预测耗时，便于分析 K-cache 重建瓶颈。
 PetscErrorCode build_shape_from_material(EmSfemAnnContext *ctx,
                                          const std::vector<PetscReal> &material,
                                          std::vector<PetscReal> *shape,
@@ -372,6 +410,9 @@ PetscErrorCode build_shape_from_material(EmSfemAnnContext *ctx,
   return 0;
 }
 
+// 读取粗单元 (ex,ey,ez) 内第 (fx,fy,fz) 个细胞的 SIMP 后材料刚度比例。
+// 当前版本从 ctx->fine_density 按全局细单元编号取密度，再通过 simp_scale 转成材料比例。
+// 这个函数主要用于非优化或旧路径，优化路径通常从 rho_phys 的 local vector 直接采样。
 PetscReal material_at_fine_cell(PetscInt ex, PetscInt ey, PetscInt ez,
                                 PetscInt fx, PetscInt fy, PetscInt fz,
                                 const EmSfemAnnContext &ctx) {
@@ -392,6 +433,9 @@ PetscReal material_at_fine_cell(PetscInt ex, PetscInt ey, PetscInt ez,
                           ctx.density_options.penal);
 }
 
+// 用多尺度形函数把细胞刚度积分/凝聚成粗单元 24x24 刚度矩阵。
+// material[fine_id] 是每个细胞的材料比例，shape 是细节点到粗自由度的形函数映射。
+// 本质上是在做 ke += B_shape^T * fine_ke * B_shape 的离散累加。
 void accumulate_shape_stiffness(const PetscReal *fine_ke,
                                 const std::vector<PetscReal> &shape,
                                 const std::vector<PetscReal> &material,
@@ -442,6 +486,9 @@ void accumulate_shape_stiffness(const PetscReal *fine_ke,
   }
 }
 
+// 计算一个粗单元内部每个细胞对单元应变能的贡献。
+// ue 是粗单元 24 个位移自由度，energies[fine_id] 输出每个细胞的能量密度贡献。
+// 灵敏度计算会用这些细胞能量乘以 SIMP 导数，得到细密度设计变量的梯度。
 PetscErrorCode compute_fine_cell_energies(EmSfemAnnContext *ctx,
                                           const std::vector<PetscReal> &material,
                                           const PetscReal ue[kElementDofs],
@@ -486,6 +533,9 @@ PetscErrorCode compute_fine_cell_energies(EmSfemAnnContext *ctx,
   return 0;
 }
 
+// 根据一个粗单元内部 sub_n^3 个细胞的材料比例计算 EMsFEM 等效刚度矩阵。
+// 全实体或近全空时走快速路径；一般情况先构造 ANN 多尺度形函数，再积分得到 ke。
+// 输出 ke 是粗 H8 单元层面的 24x24 刚度矩阵，后续 MatMult 和辅助矩阵都会用它。
 PetscErrorCode compute_ems_element_matrix_from_material(
     EmSfemAnnContext *ctx,
     const std::vector<PetscReal> &material,
@@ -536,6 +586,9 @@ PetscErrorCode compute_ems_element_matrix_from_material(
   return 0;
 }
 
+// 从 ctx->fine_density 采样指定粗单元内部的细材料，并计算对应的 EMsFEM 单元刚度矩阵。
+// 这是按粗单元编号直接计算 ke 的便捷封装。
+// 优化主循环中更常用 rebuild_local_k_cache_from_rho，因为它从当前 rho_phys 并行向量采样。
 PetscErrorCode compute_ems_element_matrix(EmSfemAnnContext *ctx,
                                           PetscInt ex,
                                           PetscInt ey,
@@ -556,6 +609,9 @@ PetscErrorCode compute_ems_element_matrix(EmSfemAnnContext *ctx,
   return 0;
 }
 
+// 判断粗单元 (ex,ey,ez) 是否落在当前 rank 的 K-cache 盒子里。
+// MatMult 只能直接使用本 rank 已缓存的单元刚度；不在盒子内就返回 false。
+// 这个检查用于避免错误索引 k_cache。
 PetscBool cache_contains(const ElementCacheBox &box,
                          PetscInt ex,
                          PetscInt ey,
@@ -567,6 +623,9 @@ PetscBool cache_contains(const ElementCacheBox &box,
              : PETSC_FALSE;
 }
 
+// 返回粗单元 (ex,ey,ez) 在本地 K-cache 中对应的 24x24 矩阵指针。
+// 如果缓存关闭或单元不在 cache_box 内，返回 nullptr。
+// 返回的指针直接指向 ctx->k_cache 内部连续存储区域，不需要释放。
 PetscReal *cached_element_matrix(EmSfemAnnContext *ctx,
                                  PetscInt ex,
                                  PetscInt ey,
@@ -585,6 +644,9 @@ PetscReal *cached_element_matrix(EmSfemAnnContext *ctx,
   return ctx->k_cache.data() + idx * kElementDofs * kElementDofs;
 }
 
+// 根据 ctx->fine_density 为当前 rank 需要的粗单元建立本地 K-cache。
+// cache_box 会覆盖本 rank 拥有节点周围的一层粗单元，保证 matrix-free MatMult 能本地取到 ke。
+// 这个版本从 ctx->fine_density 采样，主要服务旧的 solve/postsolve 路径。
 PetscErrorCode build_local_k_cache(EmSfemAnnContext *ctx) {
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
   PetscCall(DMDAGetCorners(ctx->da, &xs, &ys, &zs, &xm, &ym, &zm));
@@ -628,16 +690,25 @@ PetscErrorCode build_local_k_cache(EmSfemAnnContext *ctx) {
   return 0;
 }
 
+// SIMP 材料插值：把密度 rho 转成有效刚度比例。
+// emin 给空材料保留极小刚度，penal 用来惩罚中间密度，使优化结果趋向 0/1。
+// 返回值会乘到单元刚度上。
 PetscReal simp_scale(PetscReal rho, const DensityOptions &opts) {
   rho = PetscMax(1.0e-12, PetscMin(1.0, rho));
   return opts.emin + (1.0 - opts.emin) * PetscPowReal(rho, opts.penal);
 }
 
+// SIMP 插值对密度 rho 的导数。
+// 灵敏度分析需要 dK/drho，因此细胞能量会乘以这个导数得到目标函数梯度。
+// rho 会被限制在合理范围内，避免 0 附近出现数值问题。
 PetscReal simp_derivative(PetscReal rho, const DensityOptions &opts) {
   rho = PetscMax(1.0e-12, PetscMin(1.0, rho));
   return (1.0 - opts.emin) * opts.penal * PetscPowReal(rho, opts.penal - 1.0);
 }
 
+// 计算密度过滤器的锥形权重。
+// 距离越近权重越大，超过 radius 的邻居权重为 0。
+// dx/dy/dz 是细网格索引偏移，radius 是细网格单位下的过滤半径。
 PetscReal cone_weight(PetscInt dx, PetscInt dy, PetscInt dz, PetscReal radius) {
   const PetscReal dist =
       PetscSqrtReal(static_cast<PetscReal>(dx * dx + dy * dy + dz * dz));
@@ -648,6 +719,9 @@ PetscInt ceil_div(PetscInt a, PetscInt b) {
   return (a + b - 1) / b;
 }
 
+// 自动或手动选择 EMsFEM 的三维 MPI 进程分区 px/py/pz。
+// 如果用户传了 -ems_dm_px/-ems_dm_py/-ems_dm_pz，就严格检查后采用；
+// 否则枚举所有 px*py*pz=ranks 的分区，用局部块大小、ghost 开销和长宽比评分选最优。
 PetscErrorCode choose_ems_process_grid(const Grid &grid,
                                        PetscInt sub_n,
                                        PetscInt fine_stencil_width,
@@ -744,6 +818,9 @@ PetscErrorCode choose_ems_process_grid(const Grid &grid,
   return 0;
 }
 
+// 把某一方向的“粗节点 ownership”转换成“粗单元 ownership”和“细密度 ownership”。
+// node_lens 由 uda 给出；elem_lens 让粗单元和节点分区对齐；fine_lens 再乘 sub_n。
+// 这样 fda 的细密度分区边界会落在粗单元边界上，避免 K-cache 采样跨 rank 错位。
 void ems_ownership_from_nodal_range(const PetscInt *node_lens,
                                     PetscInt p,
                                     PetscInt n_nodes,
@@ -764,6 +841,9 @@ void ems_ownership_from_nodal_range(const PetscInt *node_lens,
   }
 }
 
+// 从已经 setup 好的粗位移 DMDA 读取实际分区，并推导 fda/cda 需要的 ownership 数组。
+// PETSc 可能通过 DMSetFromOptions 调整 uda，所以这里重新读取实际 px/py/pz。
+// 输出的 ex/ey/ez 和 fx/fy/fz 会用于创建与 uda 对齐的粗单元/细密度 DMDA。
 PetscErrorCode ems_get_aligned_ownership(DM uda,
                                          const Grid &grid,
                                          PetscInt sub_n,
@@ -789,6 +869,9 @@ PetscErrorCode ems_get_aligned_ownership(DM uda,
   return 0;
 }
 
+// 运行时检查 fda 的 ghost 区是否覆盖当前 K-cache 需要读取的细密度范围。
+// 如果 fine_stencil 或 ownership 设置不够，这里会直接报错，避免静默越界读 rho。
+// stage 用于在错误信息里标明是哪个计算阶段触发检查。
 PetscErrorCode check_ems_fda_ghost_covers_element_box(DM fda,
                                                       const ElementCacheBox &box,
                                                       PetscInt sub_n,
@@ -822,6 +905,9 @@ PetscErrorCode check_ems_fda_ghost_covers_element_box(DM fda,
   return 0;
 }
 
+// 运行时检查 uda 的 ghost 节点是否覆盖当前粗单元盒子需要的位移节点范围。
+// 一个 H8 粗单元需要 8 个角节点，因此单元盒子的节点范围比单元范围右端多一层。
+// 该检查用于保护 MatMult 和灵敏度计算中的局部位移访问。
 PetscErrorCode check_ems_uda_ghost_covers_element_box(DM uda,
                                                       const ElementCacheBox &box,
                                                       const char *stage) {
@@ -854,6 +940,9 @@ PetscErrorCode check_ems_uda_ghost_covers_element_box(DM uda,
   return 0;
 }
 
+// 创建 EMsFEM 优化所需的两个核心 DMDA：uda 和 fda。
+// uda 管理粗节点位移场，每个节点 3 个自由度；fda 管理细密度场，每个细胞 1 个密度。
+// 关键点是先创建 uda，再根据 uda 的节点 ownership 推导 fda 的细密度 ownership，保证两者分区对齐。
 PetscErrorCode create_ems_opt_dms(const Grid &grid,
                                   PetscInt sub_n,
                                   PetscInt fine_stencil_width,
@@ -894,6 +983,9 @@ PetscErrorCode create_ems_opt_dms(const Grid &grid,
   return 0;
 }
 
+// 在细密度 DMDA 上创建设计域 mask 和初始密度 rho。
+// mask=0 表示非设计/空域，mask=1 表示可设计区域，mask=2 表示强制实体区域。
+// 初始 rho 在设计域内取体积分数，在强制实体处取 1，在 void 区取 void_density。
 PetscErrorCode create_fine_mask_and_density(DM fda,
                                             const Grid &grid,
                                             const DensityOptions &density_options,
@@ -934,6 +1026,9 @@ PetscErrorCode create_fine_mask_and_density(DM fda,
   return 0;
 }
 
+// 预计算密度过滤器的分母，也就是每个细胞邻域内有效 mask 权重之和。
+// 分母只和 mask 与过滤半径有关，优化迭代中可重复使用，避免每步重复计算。
+// radius<=0 时不做过滤，分母统一设为 1。
 PetscErrorCode compute_filter_denominator(DM eda, Vec mask, PetscReal radius,
                                           Vec denom) {
   if (radius <= 0.0) {
@@ -981,6 +1076,9 @@ PetscErrorCode compute_filter_denominator(DM eda, Vec mask, PetscReal radius,
   return 0;
 }
 
+// 对设计密度 rho_design 做锥形密度过滤，得到物理密度 rho_phys。
+// 过滤只在 mask 有效区域内进行；硬实体保持 1，非设计 void 保持 void_density。
+// 需要通过 DMGlobalToLocal 同步 ghost 区，因为过滤会读取邻居细胞密度。
 PetscErrorCode apply_density_filter(DM eda, Vec rho_design, Vec mask,
                                     Vec denom, PetscReal radius,
                                     PetscReal void_density, Vec rho_phys) {
@@ -1063,6 +1161,9 @@ PetscErrorCode apply_density_filter(DM eda, Vec rho_design, Vec mask,
   return 0;
 }
 
+// 根据当前优化迭代步数计算 Heaviside 投影的 beta。
+// beta 会按 interval 逐步放大，直到 beta_max，用于让密度从灰度逐渐变成更接近 0/1。
+// 如果未启用 Heaviside，则该函数的结果通常不会被使用。
 PetscReal heaviside_beta_for_iter(const OptimizerOptions &opt, PetscInt iter) {
   if (!opt.heaviside_projection) return 0.0;
   PetscReal beta = PetscMax(1.0e-12, opt.heaviside_beta_initial);
@@ -1090,6 +1191,9 @@ PetscReal heaviside_beta_for_iter(const OptimizerOptions &opt, PetscInt iter) {
   return PetscMin(beta, opt.heaviside_beta_max);
 }
 
+// 平滑 Heaviside 投影函数。
+// eta 是阈值位置，beta 控制曲线陡峭程度；beta 越大，中间密度越快被推向 0 或 1。
+// 返回值用于把过滤后的密度转换为投影后的物理密度。
 PetscReal smooth_heaviside_value(PetscReal x, PetscReal beta, PetscReal eta) {
   const PetscReal den =
       PetscTanhReal(beta * eta) + PetscTanhReal(beta * (1.0 - eta));
@@ -1097,6 +1201,9 @@ PetscReal smooth_heaviside_value(PetscReal x, PetscReal beta, PetscReal eta) {
   return (PetscTanhReal(beta * eta) + PetscTanhReal(beta * (x - eta))) / den;
 }
 
+// 平滑 Heaviside 投影对输入密度 x 的导数。
+// 灵敏度反传时需要乘以这个导数，把投影后目标函数梯度传回过滤密度。
+// beta 较大时导数会在 eta 附近集中，优化会更接近硬阈值行为。
 PetscReal smooth_heaviside_derivative(PetscReal x, PetscReal beta,
                                       PetscReal eta) {
   const PetscReal den =
@@ -1106,6 +1213,9 @@ PetscReal smooth_heaviside_derivative(PetscReal x, PetscReal beta,
   return beta * (1.0 - t * t) / den;
 }
 
+// 对过滤后的密度执行 Heaviside 投影。
+// 可设计区域使用 smooth_heaviside_value，硬实体和 void 区域保持固定值。
+// 输出 projected 通常作为本步用于刚度计算的物理密度。
 PetscErrorCode apply_heaviside_projection(DM fda, Vec filtered, Vec mask,
                                           const OptimizerOptions &opt,
                                           PetscReal beta,
@@ -1143,6 +1253,9 @@ PetscErrorCode apply_heaviside_projection(DM fda, Vec filtered, Vec mask,
   return 0;
 }
 
+// 将投影后密度上的目标函数梯度反传到过滤密度上。
+// 可设计区域乘以 Heaviside 导数；硬实体/void 区域不参与设计更新。
+// 输出 dc_filtered 后续还要经过密度过滤器的伴随反传。
 PetscErrorCode apply_heaviside_sensitivity(DM fda, Vec dc_projected,
                                            Vec filtered, Vec mask,
                                            const OptimizerOptions &opt,
@@ -1179,6 +1292,9 @@ PetscErrorCode apply_heaviside_sensitivity(DM fda, Vec dc_projected,
   return 0;
 }
 
+// 密度过滤器的伴随灵敏度反传。
+// 正向过滤是 rho_phys_i = sum_j w_ij rho_j / denom_i；反向要把 dc_phys_i 分配回邻域 j。
+// 该函数得到设计变量上的梯度 dc_design，并保持硬实体/void 区域不参与更新。
 PetscErrorCode apply_sensitivity_filter_adjoint(DM eda, Vec dc_phys, Vec mask,
                                                 Vec denom, PetscReal radius,
                                                 Vec dc_design) {
@@ -1266,6 +1382,9 @@ PetscErrorCode apply_sensitivity_filter_adjoint(DM eda, Vec dc_phys, Vec mask,
   return 0;
 }
 
+// 设置体积约束对每个设计变量的导数 dv。
+// 可设计区域 dv=1，硬实体和 void 区域 dv=0，因为它们不由优化器更新。
+// OC 更新中会用 dc/dv 的比值决定密度增减方向。
 PetscErrorCode set_active_volume_vector(DM fda, Vec mask, Vec dv) {
   PetscScalar ***m = nullptr, ***v = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
@@ -1285,6 +1404,9 @@ PetscErrorCode set_active_volume_vector(DM fda, Vec mask, Vec dv) {
   return 0;
 }
 
+// 统计全局可设计细胞数量。
+// 每个 rank 只遍历自己拥有的 fda 范围，然后用 MPI/PETSc 全局求和。
+// 结果用于把目标体积分数换算成可设计区域的平均密度约束。
 PetscErrorCode design_mask_sum(DM fda, Vec mask, PetscReal *global_design_sum) {
   PetscScalar ***m = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
@@ -1305,6 +1427,9 @@ PetscErrorCode design_mask_sum(DM fda, Vec mask, PetscReal *global_design_sum) {
   return 0;
 }
 
+// 计算可设计区域内当前密度的全局平均值。
+// 只统计 mask=1 的细胞，硬实体和 void 区域不计入可设计体积分数。
+// 该值常用于日志输出，判断优化是否满足体积约束。
 PetscErrorCode compute_design_mean(DM fda, Vec rho, Vec mask,
                                    PetscReal *global_mean) {
   PetscScalar ***r = nullptr, ***m = nullptr;
@@ -1335,6 +1460,9 @@ PetscErrorCode compute_design_mean(DM fda, Vec rho, Vec mask,
   return 0;
 }
 
+// 对细密度场执行 z 方向拔模闭合/可制造性处理。
+// 该操作沿 z 方向传播密度约束，减少不符合拔模方向的孤立或倒扣特征。
+// 同时会输出 sensitivity_scale，供灵敏度回传时近似考虑该闭合操作的影响。
 PetscErrorCode apply_z_draft_closure(DM fda,
                                      Vec mask,
                                      PetscReal void_density,
@@ -1461,6 +1589,9 @@ PetscErrorCode apply_z_draft_closure(DM fda,
   return 0;
 }
 
+// 根据当前物理密度 rho_phys 重建本 rank 的 EMsFEM 单元刚度缓存。
+// 先把 rho_phys 同步到带 ghost 的 local_rho，再为 cache_box 内每个粗单元采样 sub_n^3 个细胞。
+// 每个单元会通过 ANN 多尺度形函数计算 24x24 ke，供后续 KSP 的多次 MatMult 重复使用。
 PetscErrorCode rebuild_local_k_cache_from_rho(EmSfemAnnContext *ctx,
                                               DM fda,
                                               Vec rho_phys,
@@ -1559,6 +1690,9 @@ PetscErrorCode rebuild_local_k_cache_from_rho(EmSfemAnnContext *ctx,
   return 0;
 }
 
+// 把粗节点索引 (i,j,k) 转换成实际物理坐标 (x,y,z)。
+// 控制臂几何、固定端选择、载荷节点筛选和力矩分配都会用这个坐标。
+// 坐标尺度由 Grid 中的物理高度和几何比例函数决定。
 void node_xyz(PetscInt i, PetscInt j, PetscInt k,
               const Grid &grid,
               PetscReal *x,
@@ -1572,6 +1706,9 @@ void node_xyz(PetscInt i, PetscInt j, PetscInt k,
        static_cast<PetscReal>(grid.nz - 1);
 }
 
+// 判断控制臂算例中某个粗节点是否属于固定约束区域。
+// 通常固定区域对应车身连接端或安装孔附近，所有 3 个位移自由度会被约束。
+// 该函数只负责几何判断，真正施加边界条件在矩阵乘法/载荷或 KSP 约束处理中完成。
 PetscBool control_arm_fixed_node(PetscInt i, PetscInt j, PetscInt k,
                                  const Grid &grid) {
   PetscReal x = 0.0, y = 0.0, z = 0.0;
@@ -1594,10 +1731,15 @@ PetscBool control_arm_fixed_node(PetscInt i, PetscInt j, PetscInt k,
              : PETSC_FALSE;
 }
 
+// 简单测试算例的固定节点判断。
+// 这里通常把 x=0 平面固定，用于非控制臂几何的小规模验证。
 PetscBool simple_fixed_node(PetscInt i) {
   return i == 0 ? PETSC_TRUE : PETSC_FALSE;
 }
 
+// 根据当前几何模式统一判断节点是否固定。
+// 控制臂模式调用 control_arm_fixed_node，简单模式调用 simple_fixed_node。
+// 这样矩阵乘法和载荷装配不需要关心具体几何类型。
 PetscBool is_fixed_node(PetscInt i, PetscInt j, PetscInt k,
                         const EmSfemAnnContext &ctx) {
   return ctx.ems_options.control_arm_bc
@@ -1605,6 +1747,9 @@ PetscBool is_fixed_node(PetscInt i, PetscInt j, PetscInt k,
              : simple_fixed_node(i);
 }
 
+// 为弹性辅助矩阵附加近零空间 near-nullspace。
+// 三维弹性问题的刚体平移和转动模态会影响 AMG/GAMG 的粗网格构造；
+// 给矩阵附加这些近零空间向量，可以显著改善弹性类预条件器的收敛性。
 PetscErrorCode attach_ems_elasticity_near_nullspace(DM uda,
                                                     const EmSfemAnnContext &ctx,
                                                     Mat P) {
@@ -1693,6 +1838,9 @@ PetscErrorCode attach_ems_elasticity_near_nullspace(DM uda,
   return 0;
 }
 
+// 判断粗节点是否位于控制臂加载/连接孔附近。
+// 该选择函数用于把集中力或力矩分配到一组孔周节点，而不是单个节点上。
+// 返回值基于节点物理坐标与孔中心/半径的几何关系。
 PetscBool select_hole_node(PetscInt i, PetscInt j, PetscInt k,
                            const Grid &grid,
                            PetscInt which) {
@@ -1716,6 +1864,9 @@ PetscBool select_hole_node(PetscInt i, PetscInt j, PetscInt k,
              : PETSC_FALSE;
 }
 
+// 判断粗节点是否位于弹簧/衬套加载区域。
+// 多载荷控制臂算例会用不同的选择函数构造不同工况的载荷分布。
+// 这里同样只做几何筛选，不直接写入力向量。
 PetscBool select_spring_node(PetscInt i, PetscInt j, PetscInt k,
                              const Grid &grid) {
   PetscReal x = 0.0, y = 0.0, z = 0.0;
@@ -1730,6 +1881,9 @@ PetscBool select_spring_node(PetscInt i, PetscInt j, PetscInt k,
              : PETSC_FALSE;
 }
 
+// 向 6x6 wrench 分配矩阵中累加一个节点的力/力矩贡献关系。
+// 目标是求出一组节点力，使它们合力和合力矩满足指定 wrench。
+// x/y/z 是节点相对参考点的坐标，A 是正规方程矩阵。
 void add_wrench_matrix(PetscReal x, PetscReal y, PetscReal z,
                        const PetscReal center[3],
                        PetscReal S[6][6]) {
@@ -1750,6 +1904,9 @@ void add_wrench_matrix(PetscReal x, PetscReal y, PetscReal z,
   }
 }
 
+// 用简单高斯消元求解 6x6 线性系统 A x = b。
+// 这里系统规模固定且很小，用手写求解器避免引入额外 LAPACK 调用。
+// 主要用于把目标合力/力矩分配成节点力的中间计算。
 void solve_6x6(PetscReal A[6][6], const PetscReal b[6], PetscReal x[6]) {
   PetscReal aug[6][7] = {};
   for (PetscInt i = 0; i < 6; ++i) {
@@ -1780,6 +1937,9 @@ void solve_6x6(PetscReal A[6][6], const PetscReal b[6], PetscReal x[6]) {
   for (PetscInt i = 0; i < 6; ++i) x[i] = aug[i][6];
 }
 
+// 根据已求得的 wrench 分配系数，计算某个节点上应施加的三维力。
+// 该力场在所有被选节点上累加后，会匹配目标合力和目标力矩。
+// x/y/z 是节点相对载荷参考点的位置。
 void wrench_force_at_node(PetscReal x, PetscReal y, PetscReal z,
                           const PetscReal center[3],
                           const PetscReal q[6],
@@ -1792,6 +1952,9 @@ void wrench_force_at_node(PetscReal x, PetscReal y, PetscReal z,
   f[2] = q[2] + ry * q[3] - rx * q[4];
 }
 
+// 为控制臂孔/弹簧节点构造满足目标合力和力矩的分布式载荷向量。
+// 函数先收集被选节点的几何矩阵，再解 6x6 系统得到节点力分配系数。
+// 输出 q 是与 uda 匹配的全局力向量，可直接作为 KSP 右端项。
 PetscErrorCode control_arm_wrench_q(DM da,
                                     const Grid &grid,
                                     PetscInt which,
@@ -1836,6 +1999,9 @@ PetscErrorCode control_arm_wrench_q(DM da,
   return 0;
 }
 
+// 根据控制臂工况编号填充全局载荷向量。
+// 不同 load_case 会选择不同加载区域和力/力矩组合，用于多工况优化。
+// 该函数封装了控制臂专用的载荷生成逻辑。
 PetscErrorCode fill_control_arm_load(DM da,
                                      const Grid &grid,
                                      const EmSfemAnnOptions &options,
@@ -1944,6 +2110,9 @@ PetscErrorCode fill_control_arm_load(DM da,
   return 0;
 }
 
+// 为简单悬臂梁/测试几何填充端部载荷。
+// 通常在自由端某个节点或端面施加竖向力，用于小规模验证 matrix-free 和 KSP 流程。
+// 控制臂生产算例一般不会走这个简单载荷路径。
 PetscErrorCode fill_simple_tip_load(DM da,
                                     const Grid &grid,
                                     PetscReal load,
@@ -1966,6 +2135,9 @@ PetscErrorCode fill_simple_tip_load(DM da,
   return 0;
 }
 
+// EMsFEM ANN 的 matrix-free 矩阵向量乘法 y = A*x。
+// PETSc KSP 每次需要 MatMult 时都会回调这个函数；它遍历本 rank 相关粗单元，
+// 用缓存好的 24x24 ke 乘局部位移，再把单元贡献装配到 y。
 PetscErrorCode emsfem_mult(Mat A, Vec x, Vec y) {
   EmSfemAnnContext *ctx = nullptr;
   PetscScalar ****xg = nullptr;
@@ -2029,6 +2201,9 @@ PetscErrorCode emsfem_mult(Mat A, Vec x, Vec y) {
   return 0;
 }
 
+// 近似提取 matrix-free EMsFEM 刚度矩阵的对角线。
+// 对角线常用于 Jacobi 或 block-Jacobi 预条件，也可帮助 PETSc 估计缩放信息。
+// 由于 A 没有显式存储，这里需要遍历缓存单元 ke 并累加本地节点的对角项。
 PetscErrorCode emsfem_get_diagonal(Mat A, Vec diag_vec) {
   EmSfemAnnContext *ctx = nullptr;
   PetscScalar ****diag = nullptr;
@@ -2077,6 +2252,9 @@ PetscErrorCode emsfem_get_diagonal(Mat A, Vec diag_vec) {
   return 0;
 }
 
+// 求一个 3x3 小矩阵的逆矩阵，并在病态时加入保护。
+// 每个粗节点有 ux/uy/uz 三个自由度，block-Jacobi 需要反转对应的 3x3 对角块。
+// 若块接近奇异，函数会使用安全的对角近似，避免预条件器产生 NaN。
 void invert_3x3_block(const PetscReal a_in[9], PetscReal inv[9]) {
   PetscReal a[9] = {};
   PetscReal scale = 0.0;
@@ -2116,6 +2294,9 @@ void invert_3x3_block(const PetscReal a_in[9], PetscReal inv[9]) {
   inv[8] = (a[0] * a[4] - a[1] * a[3]) * idet;
 }
 
+// 构造 EMsFEM 自定义 block-Jacobi 预条件器的数据。
+// 它从 matrix-free A 的对角块中为每个本地节点提取 3x3 块并求逆。
+// 后续 PCApply 时只需要把每个节点的残差乘以这个小块逆矩阵。
 PetscErrorCode setup_ems_block_jacobi(EmsBlockJacobiContext *pc_ctx) {
   PetscCheck(pc_ctx && pc_ctx->ems, PETSC_COMM_WORLD, PETSC_ERR_ARG_NULL,
              "Missing EMsFEM block-Jacobi context");
@@ -2180,6 +2361,9 @@ PetscErrorCode setup_ems_block_jacobi(EmsBlockJacobiContext *pc_ctx) {
   return 0;
 }
 
+// 应用自定义 block-Jacobi 预条件器 y = B^{-1} x。
+// 每个节点的三个位移分量作为一个 3x3 小块一起处理，比普通 Jacobi 更适合弹性问题。
+// 该函数会被 PETSc PCShell 在 KSP 迭代中反复调用。
 PetscErrorCode ems_block_jacobi_apply(PC pc, Vec x, Vec y) {
   EmsBlockJacobiContext *pc_ctx = nullptr;
   PetscScalar ****xg = nullptr;
@@ -2213,6 +2397,9 @@ PetscErrorCode ems_block_jacobi_apply(PC pc, Vec x, Vec y) {
   return 0;
 }
 
+// 创建与 uda 分区对齐的粗单元密度 DMDA cda。
+// cda 的网格尺寸是粗单元数 (nx-1, ny-1, nz-1)，每个单元一个平均密度。
+// 低阶辅助矩阵会用 cda 上的粗密度来近似真实 EMsFEM 刚度。
 PetscErrorCode create_ems_coarse_density_dm(DM uda, const Grid &grid, DM *cda) {
   PetscInt px = 1, py = 1, pz = 1;
   std::vector<PetscInt> ex_lens, ey_lens, ez_lens;
@@ -2229,6 +2416,9 @@ PetscErrorCode create_ems_coarse_density_dm(DM uda, const Grid &grid, DM *cda) {
   return 0;
 }
 
+// 从细密度 fine_rho 平均得到每个粗单元的粗密度 coarse_rho。
+// 对每个粗单元，函数读取其内部 sub_n^3 个细胞密度并取平均。
+// 结果用于 aux_laplacian/aux_elastic 等低阶辅助预条件矩阵。
 PetscErrorCode build_ems_coarse_density(DM cda, DM fda, Vec fine_rho,
                                         const Grid &grid, PetscInt sub_n,
                                         Vec coarse_rho) {
@@ -2281,6 +2471,9 @@ PetscErrorCode build_ems_coarse_density(DM cda, DM fda, Vec fine_rho,
   return 0;
 }
 
+// 计算某个粗节点周围相邻粗单元密度的平均值。
+// 辅助矩阵装配节点/边刚度时需要一个局部材料比例，这里用周围单元平均来平滑近似。
+// 函数会自动跳过越界单元。
 PetscReal ems_average_adjacent_coarse_density(PetscScalar ***rho,
                                               const Grid &grid,
                                               PetscInt i, PetscInt j,
@@ -2304,6 +2497,9 @@ PetscReal ems_average_adjacent_coarse_density(PetscScalar ***rho,
   return count > 0 ? sum / static_cast<PetscReal>(count) : 0.0;
 }
 
+// 装配标量 Laplacian 风格的辅助预条件矩阵。
+// 该矩阵比真实弹性矩阵简单，主要捕捉密度导致的局部刚度分布，用于较轻量的预条件。
+// 它不是物理精确刚度矩阵，而是给 KSP 提供更容易构造的 P 矩阵。
 PetscErrorCode assemble_ems_aux_laplacian_matrix(DM uda, DM cda,
                                                 Vec coarse_rho,
                                                 const EmSfemAnnContext &ctx,
@@ -2397,6 +2593,9 @@ PetscErrorCode assemble_ems_aux_laplacian_matrix(DM uda, DM cda,
   return 0;
 }
 
+// 创建并装配 Laplacian 辅助矩阵。
+// 先根据 uda 创建稀疏矩阵结构，再调用 assemble_ems_aux_laplacian_matrix 填值。
+// 返回的 P 可交给 PETSc 的 GAMG/HYPRE 等预条件器。
 PetscErrorCode create_ems_aux_laplacian_matrix(DM uda, DM cda,
                                                Vec coarse_rho,
                                                const EmSfemAnnContext &ctx,
@@ -2408,6 +2607,9 @@ PetscErrorCode create_ems_aux_laplacian_matrix(DM uda, DM cda,
   return 0;
 }
 
+// 装配低阶弹性辅助矩阵。
+// 它用粗单元平均密度和标准 H8 弹性刚度近似真实 EMsFEM ANN 刚度，
+// 既保留弹性耦合结构，又比完整 ANN 等效矩阵更便宜。
 PetscErrorCode assemble_ems_aux_elasticity_matrix(DM uda, DM cda,
                                                  Vec coarse_rho,
                                                  const EmSfemAnnContext &ctx,
@@ -2500,6 +2702,9 @@ PetscErrorCode assemble_ems_aux_elasticity_matrix(DM uda, DM cda,
   return 0;
 }
 
+// 创建并装配低阶弹性辅助矩阵 P。
+// 装配完成后会附加弹性近零空间，帮助 GAMG/HYPRE 更好识别刚体模态。
+// 该矩阵常作为 aux_elastic_gamg/aux_elastic_hypre 的预条件输入。
 PetscErrorCode create_ems_aux_elasticity_matrix(DM uda, DM cda,
                                                 Vec coarse_rho,
                                                 const EmSfemAnnContext &ctx,
@@ -2513,6 +2718,9 @@ PetscErrorCode create_ems_aux_elasticity_matrix(DM uda, DM cda,
   return 0;
 }
 
+// 装配基于 ANN 等效单元刚度的辅助矩阵。
+// 它把当前 K-cache 中的 EMsFEM 24x24 ke 显式装配成稀疏矩阵 P，
+// 预条件质量通常更接近真实 A，但内存和装配成本也更高。
 PetscErrorCode assemble_ems_aux_ann_matrix(DM uda, EmSfemAnnContext *ctx,
                                            Mat P) {
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
@@ -2589,6 +2797,9 @@ PetscErrorCode assemble_ems_aux_ann_matrix(DM uda, EmSfemAnnContext *ctx,
   return 0;
 }
 
+// 创建并装配 ANN 辅助矩阵 P。
+// 该 P 使用当前设计下的 EMsFEM 等效刚度，适合交给 AMG 类预条件器。
+// 当自由度很大时，这一步可能成为内存和 setup 时间的主要来源。
 PetscErrorCode create_ems_aux_ann_matrix(DM uda, EmSfemAnnContext *ctx,
                                          Mat *P) {
   PetscCall(DMCreateMatrix(uda, P));
@@ -2600,6 +2811,9 @@ PetscErrorCode create_ems_aux_ann_matrix(DM uda, EmSfemAnnContext *ctx,
   return 0;
 }
 
+// 判断给定 EMsFEM 预条件器类型是否需要显式辅助矩阵 P。
+// 返回 true 的类型会在 KSPSetOperators(ksp, A, P) 中使用 P 供 PC 构造。
+// block_jacobi 等 shell 预条件器不需要额外辅助矩阵。
 PetscBool ems_pc_type_uses_aux_matrix(const char *ems_pc_type) {
   return (std::strcmp(ems_pc_type, "aux_gamg") == 0 ||
           std::strcmp(ems_pc_type, "aux_hypre") == 0 ||
@@ -2611,6 +2825,9 @@ PetscBool ems_pc_type_uses_aux_matrix(const char *ems_pc_type) {
              : PETSC_FALSE;
 }
 
+// 判断预条件器类型是否使用低阶辅助矩阵。
+// 低阶辅助矩阵通常来自粗密度平均，而不是完整 ANN 等效单元刚度。
+// 这类 P 内存更省，但对真实 A 的近似会弱一些。
 PetscBool ems_pc_type_uses_low_order_aux_matrix(const char *ems_pc_type) {
   return (std::strcmp(ems_pc_type, "aux_gamg") == 0 ||
           std::strcmp(ems_pc_type, "aux_hypre") == 0)
@@ -2618,6 +2835,8 @@ PetscBool ems_pc_type_uses_low_order_aux_matrix(const char *ems_pc_type) {
              : PETSC_FALSE;
 }
 
+// 判断预条件器类型是否使用弹性辅助矩阵。
+// 弹性辅助矩阵保留三维弹性耦合和刚体模态信息，适合 GAMG/HYPRE。
 PetscBool ems_pc_type_uses_elastic_aux_matrix(const char *ems_pc_type) {
   return (std::strcmp(ems_pc_type, "aux_elastic_gamg") == 0 ||
           std::strcmp(ems_pc_type, "aux_elastic_hypre") == 0)
@@ -2625,6 +2844,8 @@ PetscBool ems_pc_type_uses_elastic_aux_matrix(const char *ems_pc_type) {
              : PETSC_FALSE;
 }
 
+// 判断预条件器类型是否需要先构造粗单元平均密度 cda/coarse_rho。
+// aux_laplacian 和 aux_elastic 路径都需要粗密度；aux_ann 直接用 K-cache，不需要。
 PetscBool ems_pc_type_uses_coarse_density_aux_matrix(const char *ems_pc_type) {
   return (ems_pc_type_uses_low_order_aux_matrix(ems_pc_type) ||
           ems_pc_type_uses_elastic_aux_matrix(ems_pc_type))
@@ -2632,6 +2853,8 @@ PetscBool ems_pc_type_uses_coarse_density_aux_matrix(const char *ems_pc_type) {
              : PETSC_FALSE;
 }
 
+// 判断预条件器类型是否使用 ANN 等效刚度辅助矩阵。
+// aux_ann_* 会把当前 EMsFEM 单元 ke 显式装配成 P，因此更接近真实 matrix-free A。
 PetscBool ems_pc_type_uses_ann_aux_matrix(const char *ems_pc_type) {
   return (std::strcmp(ems_pc_type, "aux_ann_gamg") == 0 ||
           std::strcmp(ems_pc_type, "aux_ann_hypre") == 0)
@@ -2639,6 +2862,9 @@ PetscBool ems_pc_type_uses_ann_aux_matrix(const char *ems_pc_type) {
              : PETSC_FALSE;
 }
 
+// 读取命令行选项 -ems_pc_type，并返回该类型是否需要辅助矩阵。
+// 如果用户没有指定，默认使用 aux_ann_gamg。
+// ems_pc_type 是输出字符串缓冲区，uses_aux_matrix 是输出布尔标记。
 PetscErrorCode get_ems_pc_type_option(char *ems_pc_type,
                                       size_t ems_pc_type_size,
                                       PetscBool *uses_aux_matrix) {
@@ -2652,6 +2878,9 @@ PetscErrorCode get_ems_pc_type_option(char *ems_pc_type,
   return 0;
 }
 
+// 根据 ems_pc_type 配置 KSP 的预条件器 PC。
+// 这里会选择 GAMG/HYPRE、block-Jacobi 或无预条件，并设置对应的 PC 矩阵与参数。
+// A 是真实 matrix-free 算子，P 是可选的显式辅助矩阵。
 PetscErrorCode setup_ems_preconditioner(KSP ksp, Mat A, Mat P, DM uda, DM cda,
                                         Vec coarse_rho,
                                         EmsBlockJacobiContext *pc_ctx,
@@ -2681,6 +2910,9 @@ PetscErrorCode setup_ems_preconditioner(KSP ksp, Mat A, Mat P, DM uda, DM cda,
   return 0;
 }
 
+// 配置 EMsFEM 线性求解器 KSP。
+// 函数设置真实算子 A、可选预条件矩阵 P、默认 KSP 类型/容差以及对应 PC。
+// 最后调用 KSPSetFromOptions，允许命令行覆盖求解器和预条件器参数。
 PetscErrorCode configure_ems_ksp(KSP ksp, Mat A, Mat P,
                                  EmsBlockJacobiContext *pc_ctx,
                                  const Grid &grid,
@@ -2796,6 +3028,9 @@ PetscErrorCode configure_ems_ksp(KSP ksp, Mat A, Mat P,
   return 0;
 }
 
+// 销毁 MatShell 绑定的 EMsFEM 上下文。
+// PETSc 销毁 shell matrix 时会调用该函数，释放 new 出来的 EmSfemAnnContext。
+// 这里只负责 shell matrix 的上下文，不销毁外部单独管理的 Vec/DM。
 PetscErrorCode emsfem_destroy(Mat A) {
   EmSfemAnnContext *ctx = nullptr;
   PetscCall(MatShellGetContext(A, &ctx));
@@ -2807,6 +3042,9 @@ PetscErrorCode emsfem_destroy(Mat A) {
   return 0;
 }
 
+// 计算细密度设计变量上的柔度灵敏度。
+// 对每个粗单元，先提取粗单元位移 ue，再计算内部每个细胞能量并乘以 SIMP 导数。
+// 输出 dc_phys 是物理密度上的梯度，后续会经过 Heaviside 和过滤器伴随反传。
 PetscErrorCode compute_ems_fine_sensitivity(EmSfemAnnContext *ctx,
                                             DM uda,
                                             DM fda,
@@ -2949,6 +3187,9 @@ PetscErrorCode compute_ems_fine_sensitivity(EmSfemAnnContext *ctx,
   return 0;
 }
 
+// OC 更新中的单个设计变量试探密度公式。
+// 根据目标梯度 dc、体积梯度 dv 和拉格朗日乘子 lambda 决定 rho 增减，
+// 同时施加 move limit、上下界和 mask 约束。
 PetscReal trial_rho(PetscReal rho, PetscReal dc, PetscReal dv, PetscReal mask,
                     PetscReal lambda, const OptimizerOptions &opt) {
   if (mask > 1.5) return 1.0;
@@ -2960,6 +3201,9 @@ PetscReal trial_rho(PetscReal rho, PetscReal dc, PetscReal dv, PetscReal mask,
   return PetscMax(opt.rho_min, PetscMin(1.0, value));
 }
 
+// 执行一次 Optimality Criteria 密度更新。
+// 函数通过二分搜索体积约束的拉格朗日乘子，使更新后的可设计区域平均密度接近 volfrac。
+// rho 会被原地更新；硬实体和 void 区域由 mask 保持不变。
 PetscErrorCode oc_update(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
                          const DensityOptions &density_options,
                          const OptimizerOptions &opt,
@@ -3038,6 +3282,9 @@ PetscErrorCode oc_update(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
   return 0;
 }
 
+// 将 PETSc Vec 以二进制 PETSc viewer 格式写到 path。
+// 这种 .petscbin 文件可用于 checkpoint、后处理脚本读取和本地 VTK 转换。
+// 写出是并行 collective 操作，所有 rank 都要参与。
 PetscErrorCode write_vec_binary(Vec v, const char *path) {
   PetscViewer viewer = nullptr;
   PetscCall(PetscViewerBinaryOpen(PetscObjectComm(reinterpret_cast<PetscObject>(v)),
@@ -3047,6 +3294,9 @@ PetscErrorCode write_vec_binary(Vec v, const char *path) {
   return 0;
 }
 
+// 写出 EMsFEM 优化的密度 checkpoint。
+// 根据 iter 生成中间步或 final 文件名，并保存设计密度、物理密度、mask 等结果。
+// 这些文件用于断点查看、后处理成 VTK，或后续恢复/比较优化结果。
 PetscErrorCode write_ems_checkpoint(const OptimizerOptions &opt, PetscInt iter,
                                     PetscBool final, Vec rho_design,
                                     Vec rho_phys, Vec mask) {
@@ -3087,6 +3337,9 @@ PetscErrorCode write_ems_checkpoint(const OptimizerOptions &opt, PetscInt iter,
   return 0;
 }
 
+// 写出某个载荷工况对应的位移向量 checkpoint。
+// 多工况时文件名会带 case 编号，避免不同载荷的位移场互相覆盖。
+// 后处理合成 VTK 时可以把密度和位移放到同一个可视化文件中。
 PetscErrorCode write_ems_displacement_checkpoint(const OptimizerOptions &opt,
                                                  PetscBool multi_case,
                                                  PetscInt load_case,
@@ -3110,6 +3363,9 @@ PetscErrorCode write_ems_displacement_checkpoint(const OptimizerOptions &opt,
   return 0;
 }
 
+// 写出优化过程摘要文本文件。
+// 摘要包含网格、体积分数、最终柔度、KSP 迭代、收敛状态和各阶段耗时。
+// 该文件便于不用打开完整 out 日志也能快速确认一次算例是否正常。
 PetscErrorCode write_ems_summary(const char *output_prefix,
                                  const Grid &grid,
                                  const DensityOptions &density_options,
@@ -3206,6 +3462,9 @@ PetscErrorCode write_ems_summary(const char *output_prefix,
   return 0;
 }
 
+// 写出 EMsFEM 优化结果 VTK。
+// 函数把细密度/掩码和可选位移场转换成可视化网格数据，供 ParaView 查看。
+// 大规模全细网格写出会非常大，因此实际使用时要谨慎选择 stride 或专门后处理脚本。
 PetscErrorCode write_ems_opt_vtk(DM uda, DM fda, const char *path,
                                  const Grid &grid, PetscInt sub_n, Vec u,
                                  Vec rho, Vec mask) {
@@ -3346,12 +3605,17 @@ PetscErrorCode write_ems_opt_vtk(DM uda, DM fda, const char *path,
   return 0;
 }
 
+// 返回控制臂多工况中某个载荷工况的权重。
+// 优化目标通常是各工况柔度的加权和，权重用于平衡不同方向/大小的载荷贡献。
 PetscReal control_arm_case_weight(PetscInt load_case) {
   static const PetscReal weights[3] = {0.25, 0.50, 0.25};
   if (load_case >= 1 && load_case <= 3) return weights[load_case - 1];
   return 1.0;
 }
 
+// 为优化器填充指定 load_case 的右端载荷向量 b。
+// 控制臂模式走真实控制臂载荷；简单模式走端部载荷。
+// 输出 b 会在每个优化迭代里交给 KSPSolve 求解对应位移场。
 PetscErrorCode fill_optimizer_load(DM uda,
                                    const Grid &grid,
                                    const EmSfemAnnOptions &ems_options,
@@ -3370,6 +3634,9 @@ PetscErrorCode fill_optimizer_load(DM uda,
 
 } // namespace
 
+// 创建单次 EMsFEM ANN 线性系统。
+// 函数创建 uda、密度、载荷、matrix-free A、可选辅助 P 和 KSP，适合 solve/postsolve 路径。
+// 优化主循环有自己的更完整初始化流程，但核心对象关系与这里一致。
 PetscErrorCode create_emsfem_ann_system(const Grid &grid,
                                         const DensityOptions &density_options,
                                         const EmSfemAnnOptions &ems_options,
@@ -3462,6 +3729,9 @@ PetscErrorCode create_emsfem_ann_system(const Grid &grid,
   return 0;
 }
 
+// 将单次 EMsFEM ANN 求解结果写成 VTK。
+// 从 MatShell 中取出上下文，使用其中的 uda/fda/密度和位移向量进行可视化输出。
+// 主要服务 -mode solve 或 postsolve 后处理。
 PetscErrorCode write_emsfem_ann_solution_vtk(Mat A,
                                              Vec displacement,
                                              const char *path,
@@ -3478,6 +3748,9 @@ PetscErrorCode write_emsfem_ann_solution_vtk(Mat A,
   return 0;
 }
 
+// EMsFEM ANN 的 postsolve 模式入口。
+// 它读取已有密度/结构文件，重建 K-cache 和线性系统，求解位移并写 checkpoint/VTK。
+// 该模式用于优化完成后补算位移场、检查线性求解或生成可视化结果。
 PetscErrorCode run_emsfem_ann_postsolve(const Grid &grid,
                                         const DensityOptions &density_options,
                                         const OptimizerOptions &optimizer_options,
@@ -3735,6 +4008,9 @@ PetscErrorCode run_emsfem_ann_postsolve(const Grid &grid,
   return 0;
 }
 
+// EMsFEM ANN 拓扑优化主入口。
+// 该函数负责创建 DMDA、初始化密度/mask、配置 KSP/预条件器，并执行多步优化循环。
+// 每步会过滤/投影密度、重建 K-cache、逐工况求解、累计柔度灵敏度、OC 更新并按需写 checkpoint。
 PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                         const DensityOptions &density_options,
                                         const OptimizerOptions &optimizer_options,
