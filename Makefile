@@ -55,7 +55,7 @@ ${TARGET}: ${SRC} | bin
 	@printf '#include <petscsys.h>\n' | ${CXX} ${CPPFLAGS} ${PETSC_CFLAGS} -x c++ -E - >/dev/null 2>&1 || \
 	  (echo "PETSc headers not found by the active compiler flags." >&2; \
 	   echo "Set PETSC_DIR/PETSC_ARCH or PKG_CONFIG_PATH, for example:" >&2; \
-	   echo "  find /data/home/dlutmyx /data/app -name petscsys.h 2>/dev/null | head" >&2; \
+	   echo "  find /data/home/dlut_ycx /data/app -name petscsys.h 2>/dev/null | head" >&2; \
 	   echo "  make all CXXSTD=c++11 PETSC_DIR=/path/to/petsc PETSC_ARCH=/path-or-arch-if-needed" >&2; \
 	   exit 2)
 	${CXX} ${CXXFLAGS} ${CPPFLAGS} ${PETSC_CFLAGS} -o $@ ${SRC} ${PETSC_LIBS} -lm

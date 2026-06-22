@@ -25,7 +25,7 @@ if command -v module >/dev/null 2>&1; then
   module load intel/2020u4 2>/dev/null || true
 fi
 
-PETSC_DIR="${PETSC_DIR:-/data/home/dlutmxy/petsc/petsc-v3.19.3}"
+PETSC_DIR="${PETSC_DIR:-/data/home/dlut_ycx/petsc/petsc-v3.19.3}"
 PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-opt-hypre}"
 export PETSC_DIR PETSC_ARCH
 

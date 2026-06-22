@@ -25,7 +25,7 @@ else
   echo "Warning: module command is unavailable; relying on inherited PATH/LD_LIBRARY_PATH" >&2
 fi
 
-PETSC_DIR="${PETSC_DIR:-/data/home/dlutmxy/petsc/petsc-v3.19.3}"
+PETSC_DIR="${PETSC_DIR:-/data/home/dlut_ycx/petsc/petsc-v3.19.3}"
 PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-opt-hypre}"
 export PETSC_DIR PETSC_ARCH
 if [ ! -f "${PETSC_DIR}/lib/petsc/conf/variables" ]; then

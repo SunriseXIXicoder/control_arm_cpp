@@ -12,7 +12,7 @@ trap 'echo "Job failed at line ${LINENO} with exit code $?" >&2' ERR
 module load gcc/11.3.0 >/dev/null 2>&1 || true
 module load intel/2020u4 >/dev/null 2>&1 || true
 
-export PETSC_DIR="${PETSC_DIR:-/data/home/dlutmxy/petsc/petsc-v3.19.3}"
+export PETSC_DIR="${PETSC_DIR:-/data/home/dlut_ycx/petsc/petsc-v3.19.3}"
 export PETSC_ARCH="${PETSC_ARCH:-arch-linux-c-debug}"
 export LD_LIBRARY_PATH="${PETSC_DIR}/${PETSC_ARCH}/lib:${PETSC_DIR}/lib:${LD_LIBRARY_PATH:-}"
 
