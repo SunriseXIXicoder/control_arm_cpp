@@ -3,7 +3,7 @@
 # 默认使用无 mask 矩形悬臂梁，适合先看约束是否改变密度形态。
 # 提交方式：sbatch submit_h8_draft_small_5cases.sbatch
 # 默认网格为 81x31x21 节点，约 1.58e5 位移自由度；OPT_LOAD=1e5 将柔度放大到约 1e2 量级。
-# 默认跑 500 步，Heaviside beta 每 50 步翻倍到 16；同一 beta 阶段内拒绝柔度上升。
+# 默认跑 500 步，Heaviside beta 每 50 步翻倍到 16；同一 beta 阶段内柔度小幅震荡可接受，超过阈值才回滚缩步。
 # 常用覆盖示例：NX=121 NY=41 NZ=31 OPT_MAX_ITER=500 sbatch submit_h8_draft_small_5cases.sbatch
 #SBATCH -J h8_draft5
 #SBATCH -N 1
@@ -73,7 +73,7 @@ OPT_MOVE="${OPT_MOVE:-0.025}"
 OPT_MOVE_MIN="${OPT_MOVE_MIN:-0.004}"
 OPT_MOVE_SHRINK="${OPT_MOVE_SHRINK:-0.5}"
 OPT_MOVE_GROWTH="${OPT_MOVE_GROWTH:-1.05}"
-OPT_MAX_COMPLIANCE_INCREASE="${OPT_MAX_COMPLIANCE_INCREASE:-0.0}"
+OPT_MAX_COMPLIANCE_INCREASE="${OPT_MAX_COMPLIANCE_INCREASE:-0.08}"
 OPT_HEAVISIDE="${OPT_HEAVISIDE:-true}"
 OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
 OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"

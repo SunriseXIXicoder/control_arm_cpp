@@ -261,9 +261,9 @@ The prepared Slurm array script for the five small H8 verification cases is:
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
 
-This script defaults to `81 x 31 x 21` nodes (`80 x 30 x 20` H8 elements, `158193` displacement DOF), `OPT_MAX_ITER=500`, `OPT_LOAD=1e5`, `OPT_HEAVISIDE=true`, `OPT_HEAVISIDE_BETA_INTERVAL=50`, `OPT_MOVE=0.025`, and `OPT_CHECKPOINT_INTERVAL=0`, so intermediate checkpoints are skipped and only the final checkpoint/final VTK are kept. It also sets `OPT_MAX_COMPLIANCE_INCREASE=0.0` for strict same-beta acceptance and `OPT_PROJECTED_VOLUME_CORRECTION=true` to constrain the post-closure physical volume through a smooth raw-target correction.
+This script defaults to `81 x 31 x 21` nodes (`80 x 30 x 20` H8 elements, `158193` displacement DOF), `OPT_MAX_ITER=500`, `OPT_LOAD=1e5`, `OPT_HEAVISIDE=true`, `OPT_HEAVISIDE_BETA_INTERVAL=50`, `OPT_MOVE=0.025`, and `OPT_CHECKPOINT_INTERVAL=0`, so intermediate checkpoints are skipped and only the final checkpoint/final VTK are kept. It also sets `OPT_MAX_COMPLIANCE_INCREASE=0.08`, allowing small same-beta compliance oscillations while still rejecting large unstable jumps, and `OPT_PROJECTED_VOLUME_CORRECTION=true` to constrain the post-closure physical volume through a smooth raw-target correction.
 
-For Heaviside continuation, read `heaviside_beta` and `accepted` in the H8 history CSV: monotonic acceptance is enforced within the same beta stage, while a beta stage change is a new projected-density mapping.
+For Heaviside continuation, read `heaviside_beta` and `accepted` in the H8 history CSV: the stability guard allows the configured small same-beta increase, while a beta stage change is a new projected-density mapping.
 
 For EMsFEM ANN optimization, keep `-opt_draft_axes +z`; this change extends the H8 optimizer to signed x/y/z closure while the EMsFEM ANN optimizer remains a Z-direction draft-closure path.
 
@@ -762,9 +762,9 @@ H8 拔模方向验证时，只需要修改 `-opt_draft_axes` 和输出前缀：
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
 
-该脚本默认使用 `81 x 31 x 21` 节点网格，即 `80 x 30 x 20` 个 H8 单元、`158193` 个位移自由度；默认 `OPT_MAX_ITER=500`、`OPT_LOAD=1e5`、`OPT_HEAVISIDE=true`、`OPT_HEAVISIDE_BETA_INTERVAL=50`、`OPT_MOVE=0.025`、`OPT_CHECKPOINT_INTERVAL=0`，不写中间 checkpoint，只保留最终 checkpoint 和最终 VTK。脚本同时设置 `OPT_MAX_COMPLIANCE_INCREASE=0.0` 做同一 beta 阶段内的严格接受判据，并设置 `OPT_PROJECTED_VOLUME_CORRECTION=true`，通过平滑 raw-target 修正约束闭包后的物理体积。
+该脚本默认使用 `81 x 31 x 21` 节点网格，即 `80 x 30 x 20` 个 H8 单元、`158193` 个位移自由度；默认 `OPT_MAX_ITER=500`、`OPT_LOAD=1e5`、`OPT_HEAVISIDE=true`、`OPT_HEAVISIDE_BETA_INTERVAL=50`、`OPT_MOVE=0.025`、`OPT_CHECKPOINT_INTERVAL=0`，不写中间 checkpoint，只保留最终 checkpoint 和最终 VTK。脚本同时设置 `OPT_MAX_COMPLIANCE_INCREASE=0.08`，允许同一 beta 阶段内柔度小幅震荡，只拒绝明显不稳定的大幅上升；并设置 `OPT_PROJECTED_VOLUME_CORRECTION=true`，通过平滑 raw-target 修正约束闭包后的物理体积。
 
-使用 Heaviside continuation 时，请结合 H8 history CSV 里的 `heaviside_beta` 和 `accepted` 字段解读曲线：同一 beta 阶段内执行单调接受，beta 阶段切换则代表投影密度映射发生了变化。
+使用 Heaviside continuation 时，请结合 H8 history CSV 里的 `heaviside_beta` 和 `accepted` 字段解读曲线：稳定性保护会允许配置范围内的同一 beta 阶段小幅上升，beta 阶段切换则代表投影密度映射发生了变化。
 
 EMsFEM ANN 优化仍保持 `-opt_draft_axes +z`；本次改动扩展的是 H8 优化器的有符号 x/y/z 闭包，EMsFEM ANN 仍是 Z 方向拔模闭包路径。
 
