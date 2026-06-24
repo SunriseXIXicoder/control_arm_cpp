@@ -709,24 +709,96 @@ PetscErrorCode apply_density_filter(DM eda, Vec rho_design, Vec mask,
   return 0;
 }
 
-PetscErrorCode apply_z_draft_closure(DM eda, Vec mask, PetscReal eta, Vec rho) {
+char lowercase_ascii(char c) {
+  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+PetscErrorCode parse_h8_draft_axis(const char *text, PetscInt *axis) {
+  PetscInt selected_axis = -1;
+
+  PetscCheck(axis != nullptr, PETSC_COMM_WORLD, PETSC_ERR_ARG_NULL,
+             "draft axis output pointer is null");
+  PetscCheck(text != nullptr && text[0] != '\0', PETSC_COMM_WORLD,
+             PETSC_ERR_ARG_WRONG,
+             "-opt_draft_axis must be x, y, or z");
+  for (const char *p = text; *p != '\0'; ++p) {
+    const char c = lowercase_ascii(*p);
+    if (c == ' ' || c == '\t' || c == '+' || c == '-' || c == ',' ||
+        c == ';' || c == '/') {
+      continue;
+    }
+    PetscInt current_axis = -1;
+    if (c == 'x') current_axis = 0;
+    if (c == 'y') current_axis = 1;
+    if (c == 'z') current_axis = 2;
+    PetscCheck(current_axis >= 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+               "-opt_draft_axis must be x, y, or z");
+    PetscCheck(selected_axis < 0 || selected_axis == current_axis,
+               PETSC_COMM_WORLD, PETSC_ERR_SUP,
+               "H8 optimization currently supports one draft axis per run");
+    selected_axis = current_axis;
+  }
+  PetscCheck(selected_axis >= 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "-opt_draft_axis must be x, y, or z");
+  *axis = selected_axis;
+  return 0;
+}
+
+PetscInt h8_draft_axis_length(PetscInt axis, PetscInt ex, PetscInt ey,
+                              PetscInt ez) {
+  if (axis == 0) return ex;
+  if (axis == 1) return ey;
+  return ez;
+}
+
+PetscInt h8_draft_column_count(PetscInt axis, PetscInt ex, PetscInt ey,
+                               PetscInt ez) {
+  if (axis == 0) return ey * ez;
+  if (axis == 1) return ex * ez;
+  return ex * ey;
+}
+
+PetscInt h8_draft_axis_coordinate(PetscInt axis, PetscInt i, PetscInt j,
+                                  PetscInt k) {
+  if (axis == 0) return i;
+  if (axis == 1) return j;
+  return k;
+}
+
+PetscInt h8_draft_column_id(PetscInt axis, PetscInt i, PetscInt j, PetscInt k,
+                            PetscInt ex, PetscInt ey, PetscInt ez) {
+  (void)ez;
+  if (axis == 0) return k * ey + j;
+  if (axis == 1) return k * ex + i;
+  return j * ex + i;
+}
+
+PetscErrorCode apply_axis_draft_closure(DM eda, Vec mask, PetscReal eta,
+                                        const char *draft_axis, Vec rho) {
   PetscScalar ***r = nullptr;
   PetscScalar ***m = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
   PetscInt ex = 0, ey = 0, ez = 0;
+  PetscInt axis = 2;
   PetscMPIInt reduce_count = 0;
 
+  PetscCall(parse_h8_draft_axis(draft_axis, &axis));
   PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
-  const PetscInt nxy = ex * ey;
-  PetscCall(PetscMPIIntCast(nxy, &reduce_count));
+  const PetscInt axis_length = h8_draft_axis_length(axis, ex, ey, ez);
+  const PetscInt column_count = h8_draft_column_count(axis, ex, ey, ez);
+  PetscCall(PetscMPIIntCast(column_count, &reduce_count));
   const PetscReal threshold = PetscMax(0.0, PetscMin(1.0, eta));
-  std::vector<PetscInt> local_min(static_cast<std::size_t>(nxy), ez);
-  std::vector<PetscInt> local_max(static_cast<std::size_t>(nxy), -1);
-  std::vector<PetscInt> global_min(static_cast<std::size_t>(nxy), ez);
-  std::vector<PetscInt> global_max(static_cast<std::size_t>(nxy), -1);
-  std::vector<PetscReal> local_peak(static_cast<std::size_t>(nxy), 0.0);
-  std::vector<PetscReal> global_peak(static_cast<std::size_t>(nxy), 0.0);
+  std::vector<PetscInt> local_min(static_cast<std::size_t>(column_count),
+                                  axis_length);
+  std::vector<PetscInt> local_max(static_cast<std::size_t>(column_count), -1);
+  std::vector<PetscInt> global_min(static_cast<std::size_t>(column_count),
+                                   axis_length);
+  std::vector<PetscInt> global_max(static_cast<std::size_t>(column_count), -1);
+  std::vector<PetscReal> local_peak(static_cast<std::size_t>(column_count),
+                                    0.0);
+  std::vector<PetscReal> global_peak(static_cast<std::size_t>(column_count),
+                                     0.0);
 
   PetscCall(DMDAVecGetArrayRead(eda, rho, &r));
   PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
@@ -737,11 +809,12 @@ PetscErrorCode apply_z_draft_closure(DM eda, Vec mask, PetscReal eta, Vec rho) {
         const PetscReal mask_value = PetscRealPart(m[k][j][i]);
         const PetscReal rho_value = PetscRealPart(r[k][j][i]);
         if (!h8_mask_is_active(mask_value) || rho_value < threshold) continue;
-        const PetscInt id = j * ex + i;
+        const PetscInt id = h8_draft_column_id(axis, i, j, k, ex, ey, ez);
+        const PetscInt coord = h8_draft_axis_coordinate(axis, i, j, k);
         local_min[static_cast<std::size_t>(id)] =
-            PetscMin(local_min[static_cast<std::size_t>(id)], k);
+            PetscMin(local_min[static_cast<std::size_t>(id)], coord);
         local_max[static_cast<std::size_t>(id)] =
-            PetscMax(local_max[static_cast<std::size_t>(id)], k);
+            PetscMax(local_max[static_cast<std::size_t>(id)], coord);
         local_peak[static_cast<std::size_t>(id)] =
             PetscMax(local_peak[static_cast<std::size_t>(id)], rho_value);
       }
@@ -764,10 +837,12 @@ PetscErrorCode apply_z_draft_closure(DM eda, Vec mask, PetscReal eta, Vec rho) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         const PetscReal mask_value = PetscRealPart(m[k][j][i]);
         if (!h8_mask_is_active(mask_value)) continue;
-        const PetscInt id = j * ex + i;
-        const PetscInt kmin = global_min[static_cast<std::size_t>(id)];
-        const PetscInt kmax = global_max[static_cast<std::size_t>(id)];
-        if (kmin <= k && k <= kmax) {
+        const PetscInt id = h8_draft_column_id(axis, i, j, k, ex, ey, ez);
+        const PetscInt coord = h8_draft_axis_coordinate(axis, i, j, k);
+        const PetscInt axis_min = global_min[static_cast<std::size_t>(id)];
+        const PetscInt axis_max = global_max[static_cast<std::size_t>(id)];
+        if (axis_min <= coord && coord <= axis_max) {
+          // 沿指定开模轴填满同一柱内的空隙，避免局部闭孔或倒扣。
           r[k][j][i] = PetscMax(PetscRealPart(r[k][j][i]),
                                 global_peak[static_cast<std::size_t>(id)]);
         }
@@ -776,6 +851,15 @@ PetscErrorCode apply_z_draft_closure(DM eda, Vec mask, PetscReal eta, Vec rho) {
   }
   PetscCall(DMDAVecRestoreArray(eda, rho, &r));
   PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  return 0;
+}
+
+PetscErrorCode apply_h8_draft_closure(DM eda, Vec mask,
+                                      const OptimizerOptions &options,
+                                      Vec rho) {
+  if (!options.z_draft_closure) return 0;
+  PetscCall(apply_axis_draft_closure(eda, mask, options.z_draft_eta,
+                                     options.draft_axis, rho));
   return 0;
 }
 
@@ -2784,6 +2868,12 @@ PetscErrorCode write_h8_summary(const char *output_prefix, const Grid &grid,
                                    static_cast<double>(opt.volfrac)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "filter_radius=%.12e\n",
                                    static_cast<double>(opt.filter_radius)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "draft_closure=%s\n",
+                                   opt.z_draft_closure ? "true" : "false"));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "draft_axis=%s\n",
+                                   opt.draft_axis));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "draft_eta=%.12e\n",
+                                   static_cast<double>(opt.z_draft_eta)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "z_draft_closure=%s\n",
                                    opt.z_draft_closure ? "true" : "false"));
   PetscCall(PetscViewerASCIIPrintf(viewer, "z_draft_eta=%.12e\n",
@@ -2906,9 +2996,8 @@ PetscErrorCode run_h8_density_postprocess(const Grid &grid,
   } else {
     PetscCall(VecSet(mask, 1.0));
   }
-  if (have_mask_file && optimizer_options.z_draft_closure) {
-    PetscCall(apply_z_draft_closure(eda, mask, optimizer_options.z_draft_eta,
-                                    rho));
+  if (have_mask_file) {
+    PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho));
   }
 
   PetscCall(write_downsampled_h8_density_vtk(eda, vtk_file, grid, rho, mask,
@@ -2951,10 +3040,7 @@ PetscErrorCode run_h8_initial_vtk(const Grid &grid,
   PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
                                  optimizer_options.filter_radius,
                                  density_options.void_density, rho_phys));
-  if (optimizer_options.z_draft_closure) {
-    PetscCall(apply_z_draft_closure(eda, mask, optimizer_options.z_draft_eta,
-                                    rho_phys));
-  }
+  PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
   PetscCall(write_downsampled_h8_density_vtk(eda, vtk_file, grid, rho_phys,
                                              mask, stride, max_samples));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
@@ -3011,9 +3097,8 @@ PetscErrorCode run_h8_full_vtk_postprocess(const Grid &grid,
   } else {
     PetscCall(VecSet(mask, 1.0));
   }
-  if (have_mask_file && optimizer_options.z_draft_closure) {
-    PetscCall(apply_z_draft_closure(eda, mask, optimizer_options.z_draft_eta,
-                                    rho));
+  if (have_mask_file) {
+    PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho));
   }
 
   PetscCall(DMCreateGlobalVector(uda, &u));
@@ -3135,10 +3220,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
                                  optimizer_options.filter_radius,
                                  density_options.void_density, rho_phys));
-  if (optimizer_options.z_draft_closure) {
-    PetscCall(apply_z_draft_closure(eda, mask, optimizer_options.z_draft_eta,
-                                    rho_phys));
-  }
+  PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
   PetscCall(VecDuplicate(rho_design, &dv_design));
   PetscCall(apply_sensitivity_filter_adjoint(eda, mask, mask, filter_denom,
                                              optimizer_options.filter_radius,
@@ -3197,8 +3279,9 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                         stop_on_ksp_divergence ? "true" : "false"));
   if (density_options.use_control_arm_mask) {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                          "H8 hard regions/BC: A/B/C rings and spring mount are locked; C ring is fixed; A/B rings plus spring mount are loaded; z_draft_closure=%s eta=%g\n",
+                          "H8 hard regions/BC: A/B/C rings and spring mount are locked; C ring is fixed; A/B rings plus spring mount are loaded; draft_closure=%s axis=%s eta=%g\n",
                           optimizer_options.z_draft_closure ? "true" : "false",
+                          optimizer_options.draft_axis,
                           static_cast<double>(optimizer_options.z_draft_eta)));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "H8 load options: load_case=%lld (%s), include_spring_load=%s\n",
@@ -3209,9 +3292,10 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                           h8_include_spring_load ? "true" : "false"));
   } else {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                          "H8 rectangular benchmark: case=%s, left face fixed, right face loaded; z_draft_closure=%s eta=%g\n",
+                          "H8 rectangular benchmark: case=%s, left face fixed, right face loaded; draft_closure=%s axis=%s eta=%g\n",
                           optimizer_options.benchmark_case,
                           optimizer_options.z_draft_closure ? "true" : "false",
+                          optimizer_options.draft_axis,
                           static_cast<double>(optimizer_options.z_draft_eta)));
   }
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
@@ -3244,10 +3328,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
                                    optimizer_options.filter_radius,
                                    density_options.void_density, rho_phys));
-    if (optimizer_options.z_draft_closure) {
-      PetscCall(apply_z_draft_closure(eda, mask, optimizer_options.z_draft_eta,
-                                      rho_phys));
-    }
+    PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
     PetscCall(elapsed_max(stage_start, &filter_time));
 
     PetscCall(PetscTime(&stage_start));
@@ -3344,10 +3425,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
       PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
                                      optimizer_options.filter_radius,
                                      density_options.void_density, rho_phys));
-      if (optimizer_options.z_draft_closure) {
-        PetscCall(apply_z_draft_closure(eda, mask, optimizer_options.z_draft_eta,
-                                        rho_phys));
-      }
+      PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
       PetscCall(write_h8_checkpoint(optimizer_options, iter, PETSC_FALSE,
                                     rho_design, rho_phys, mask));
     }
@@ -3404,10 +3482,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
                                    optimizer_options.filter_radius,
                                    density_options.void_density, rho_phys));
-    if (optimizer_options.z_draft_closure) {
-      PetscCall(apply_z_draft_closure(eda, mask, optimizer_options.z_draft_eta,
-                                      rho_phys));
-    }
+    PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
     PetscCall(KSPSetInitialGuessNonzero(ksp, reuse_initial_guess));
     if (!reuse_initial_guess) PetscCall(VecSet(u, 0.0));
     PetscCall(set_h8_ksp_operators(ksp, A, P, uda, eda, rho_phys, grid,

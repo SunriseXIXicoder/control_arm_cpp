@@ -193,7 +193,7 @@ mpirun -np 8 ./bin/control_arm_cpp \
   -volfrac 0.30 \
   -opt_max_iter 200 \
   -opt_filter_radius 1.5 \
-  -opt_z_draft_closure false \
+  -opt_draft_closure false \
   -opt_write_checkpoint true \
   -opt_checkpoint_interval 50 \
   -h8_pc_type aux_hypre \
@@ -202,13 +202,13 @@ mpirun -np 8 ./bin/control_arm_cpp \
   -output_prefix result/layer2_h8_cantilever_nodraft
 ```
 
-H8 `+Z` draft, H8 `+Z` draft with Heaviside, and EMsFEM ANN `+Z` draft:
+H8 axis draft, H8 axis draft with Heaviside, and EMsFEM ANN `+Z` draft:
 
 ```sh
 mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
   -control_arm_mask false -benchmark_case cantilever \
   -nx 121 -ny 41 -nz 31 -volfrac 0.30 -opt_max_iter 200 \
-  -opt_filter_radius 1.5 -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_filter_radius 1.5 -opt_draft_closure true -opt_draft_axis z -opt_draft_eta 0.5 \
   -opt_write_checkpoint true -opt_checkpoint_interval 50 \
   -h8_pc_type aux_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
   -output_prefix result/layer2_h8_cantilever_zdraft
@@ -216,7 +216,7 @@ mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
 mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
   -control_arm_mask false -benchmark_case cantilever \
   -nx 121 -ny 41 -nz 31 -volfrac 0.30 -opt_max_iter 200 \
-  -opt_filter_radius 1.5 -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_filter_radius 1.5 -opt_draft_closure true -opt_draft_axis z -opt_draft_eta 0.5 \
   -opt_heaviside_projection true -opt_heaviside_eta 0.5 \
   -opt_heaviside_beta_initial 1 -opt_heaviside_beta_max 16 \
   -opt_heaviside_beta_interval 50 \
@@ -228,7 +228,7 @@ mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator emsfem_ann \
   -control_arm_mask false -control_arm_bc false -benchmark_case cantilever \
   -nx 121 -ny 41 -nz 31 -ems_sub_n 5 -ems_ann_dir ../input_5 \
   -volfrac 0.30 -opt_max_iter 200 -opt_filter_radius 1.5 \
-  -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_draft_closure true -opt_draft_axis z -opt_draft_eta 0.5 \
   -opt_write_checkpoint true -opt_checkpoint_interval 50 \
   -ems_pc_type aux_ann_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
   -output_prefix result/layer2_ems_ann_cantilever_zdraft
@@ -240,6 +240,18 @@ For the torsion beam, keep the same options and change only the benchmark case a
   -benchmark_case torsion \
   -output_prefix result/layer2_h8_torsion_zdraft
 ```
+
+For H8 draft-direction verification, change only `-opt_draft_axis` and the output prefix:
+
+```sh
+  -opt_draft_axis x -output_prefix result/layer2_h8_cantilever_xdraft
+  -opt_draft_axis y -output_prefix result/layer2_h8_cantilever_ydraft
+  -opt_draft_axis z -output_prefix result/layer2_h8_cantilever_zdraft
+```
+
+`-opt_draft_axis` is a single-axis H8 closure option. `x`, `+x`, `-x`, and `+x,-x` all select the same x-axis closure because the optimizer fills the interval between solid cells along each axis-aligned column. Use the density pipeline `-draft_dirs` interface when you need signed `+/-` direction diagnostics before optimization.
+
+For EMsFEM ANN optimization, keep `-opt_draft_axis z`; this change extends the H8 optimizer to x/y/z axis closure while the EMsFEM ANN optimizer remains a Z-direction draft-closure path.
 
 ## Solve Interface
 
@@ -292,7 +304,7 @@ Format:
   [-opt_heaviside_projection true -opt_heaviside_eta <real> \
    -opt_heaviside_beta_initial <real> -opt_heaviside_beta_max <real> \
    -opt_heaviside_beta_interval <int>] \
-  [-opt_z_draft_closure true -opt_z_draft_eta <real>] \
+  [-opt_draft_closure true -opt_draft_axis <x|y|z> -opt_draft_eta <real>] \
   [-opt_write_checkpoint true -opt_checkpoint_interval <int> \
    -opt_checkpoint_prefix <prefix>] \
   [-opt_write_final_vtk true -opt_vtk_file <file.vtk>] \
@@ -307,6 +319,7 @@ Important optimization options:
 | `-opt_max_compliance_increase` | Stability guard threshold for rejecting unsafe updates. |
 | `-opt_projected_volume_correction` | Correct volume after projection. |
 | `-opt_rho_min` | Lower bound on design density. |
+| `-opt_draft_closure`, `-opt_draft_axis`, `-opt_draft_eta` | Draft closure controls. H8 supports single-axis `x/y/z`; EMsFEM ANN currently uses Z closure. The old `-opt_z_draft_closure` and `-opt_z_draft_eta` names remain compatibility aliases for z-axis scripts. |
 | `-opt_write_checkpoint` | Write PETSc binary density/mask checkpoints. |
 | `-opt_stop_on_ksp_divergence` | Stop or skip unsafe optimization updates when KSP diverges. |
 | `-benchmark_case` | `cantilever` or `torsion` when `-control_arm_mask false`. |
@@ -667,7 +680,7 @@ mpirun -np 8 ./bin/control_arm_cpp \
   -volfrac 0.30 \
   -opt_max_iter 200 \
   -opt_filter_radius 1.5 \
-  -opt_z_draft_closure false \
+  -opt_draft_closure false \
   -opt_write_checkpoint true \
   -opt_checkpoint_interval 50 \
   -h8_pc_type aux_hypre \
@@ -676,13 +689,13 @@ mpirun -np 8 ./bin/control_arm_cpp \
   -output_prefix result/layer2_h8_cantilever_nodraft
 ```
 
-H8 `+Z` 拔模、H8 `+Z` 拔模加 Heaviside，以及 EMsFEM ANN `+Z` 拔模：
+H8 轴向拔模、H8 轴向拔模加 Heaviside，以及 EMsFEM ANN `+Z` 拔模：
 
 ```sh
 mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
   -control_arm_mask false -benchmark_case cantilever \
   -nx 121 -ny 41 -nz 31 -volfrac 0.30 -opt_max_iter 200 \
-  -opt_filter_radius 1.5 -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_filter_radius 1.5 -opt_draft_closure true -opt_draft_axis z -opt_draft_eta 0.5 \
   -opt_write_checkpoint true -opt_checkpoint_interval 50 \
   -h8_pc_type aux_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
   -output_prefix result/layer2_h8_cantilever_zdraft
@@ -690,7 +703,7 @@ mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
 mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
   -control_arm_mask false -benchmark_case cantilever \
   -nx 121 -ny 41 -nz 31 -volfrac 0.30 -opt_max_iter 200 \
-  -opt_filter_radius 1.5 -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_filter_radius 1.5 -opt_draft_closure true -opt_draft_axis z -opt_draft_eta 0.5 \
   -opt_heaviside_projection true -opt_heaviside_eta 0.5 \
   -opt_heaviside_beta_initial 1 -opt_heaviside_beta_max 16 \
   -opt_heaviside_beta_interval 50 \
@@ -702,7 +715,7 @@ mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator emsfem_ann \
   -control_arm_mask false -control_arm_bc false -benchmark_case cantilever \
   -nx 121 -ny 41 -nz 31 -ems_sub_n 5 -ems_ann_dir ../input_5 \
   -volfrac 0.30 -opt_max_iter 200 -opt_filter_radius 1.5 \
-  -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_draft_closure true -opt_draft_axis z -opt_draft_eta 0.5 \
   -opt_write_checkpoint true -opt_checkpoint_interval 50 \
   -ems_pc_type aux_ann_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
   -output_prefix result/layer2_ems_ann_cantilever_zdraft
@@ -714,6 +727,18 @@ mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator emsfem_ann \
   -benchmark_case torsion \
   -output_prefix result/layer2_h8_torsion_zdraft
 ```
+
+H8 拔模方向验证时，只需要修改 `-opt_draft_axis` 和输出前缀：
+
+```sh
+  -opt_draft_axis x -output_prefix result/layer2_h8_cantilever_xdraft
+  -opt_draft_axis y -output_prefix result/layer2_h8_cantilever_ydraft
+  -opt_draft_axis z -output_prefix result/layer2_h8_cantilever_zdraft
+```
+
+`-opt_draft_axis` 是 H8 优化里的单轴闭包选项。`x`、`+x`、`-x` 和 `+x,-x` 都会选择同一个 x 轴闭包，因为这里的实现是在每根轴向柱内填满实体单元之间的间隙。若要在优化前诊断带正负号的方向投影，请使用 density pipeline 的 `-draft_dirs` 接口。
+
+EMsFEM ANN 优化仍保持 `-opt_draft_axis z`；本次改动扩展的是 H8 优化器的 x/y/z 轴向闭包，EMsFEM ANN 仍是 Z 方向拔模闭包路径。
 
 ## 求解接口
 
@@ -766,7 +791,7 @@ mpirun -np 4 ./bin/control_arm_cpp \
   [-opt_heaviside_projection true -opt_heaviside_eta <实数> \
    -opt_heaviside_beta_initial <实数> -opt_heaviside_beta_max <实数> \
    -opt_heaviside_beta_interval <整数>] \
-  [-opt_z_draft_closure true -opt_z_draft_eta <实数>] \
+  [-opt_draft_closure true -opt_draft_axis <x|y|z> -opt_draft_eta <实数>] \
   [-opt_write_checkpoint true -opt_checkpoint_interval <整数> \
    -opt_checkpoint_prefix <前缀>] \
   [-opt_write_final_vtk true -opt_vtk_file <文件.vtk>] \
@@ -781,6 +806,7 @@ mpirun -np 4 ./bin/control_arm_cpp \
 | `-opt_max_compliance_increase` | 稳定性保护阈值，用于拒绝不可靠更新。 |
 | `-opt_projected_volume_correction` | 投影后体积分数修正。 |
 | `-opt_rho_min` | 设计变量密度下界。 |
+| `-opt_draft_closure`, `-opt_draft_axis`, `-opt_draft_eta` | 拔模闭包控制。H8 支持单轴 `x/y/z`；EMsFEM ANN 当前仍使用 Z 方向闭包。旧的 `-opt_z_draft_closure` 和 `-opt_z_draft_eta` 仍作为 z 轴脚本兼容别名。 |
 | `-opt_write_checkpoint` | 写 PETSc 二进制密度/mask checkpoint。 |
 | `-opt_stop_on_ksp_divergence` | KSP 发散时停止或跳过不可靠更新。 |
 | `-benchmark_case` | `-control_arm_mask false` 时选择 `cantilever` 或 `torsion`。 |

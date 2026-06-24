@@ -559,6 +559,14 @@ int main(int argc, char **argv) {
                                 &optimizer_options.z_draft_closure, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_z_draft_eta",
                                 &optimizer_options.z_draft_eta, nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_draft_closure",
+                                &optimizer_options.z_draft_closure, nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_draft_eta",
+                                &optimizer_options.z_draft_eta, nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-opt_draft_axis",
+                                  optimizer_options.draft_axis,
+                                  sizeof(optimizer_options.draft_axis),
+                                  nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_load",
                                  &optimizer_options.load, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_ksp_rtol",

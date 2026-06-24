@@ -24,6 +24,8 @@ struct OptimizerOptions {
   PetscInt heaviside_beta_interval = 0;
   PetscBool z_draft_closure = PETSC_TRUE;
   PetscReal z_draft_eta = 0.50;
+  // H8 优化的轴向拔模闭包方向；旧 z_draft_* 参数仍作为兼容别名。
+  char draft_axis[16] = "z";
   PetscReal load = 1.0;
   PetscReal ksp_rtol = 1.0e-6;
   PetscInt ksp_max_it = 1000;
