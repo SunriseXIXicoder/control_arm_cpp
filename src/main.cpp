@@ -563,10 +563,26 @@ int main(int argc, char **argv) {
                                 &optimizer_options.z_draft_closure, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_draft_eta",
                                 &optimizer_options.z_draft_eta, nullptr));
+  PetscBool has_opt_draft_axis = PETSC_FALSE;
+  PetscBool has_opt_draft_axes = PETSC_FALSE;
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-opt_draft_axis",
                                   optimizer_options.draft_axis,
                                   sizeof(optimizer_options.draft_axis),
-                                  nullptr));
+                                  &has_opt_draft_axis));
+  if (has_opt_draft_axis) {
+    PetscCall(PetscStrncpy(optimizer_options.draft_axes,
+                           optimizer_options.draft_axis,
+                           sizeof(optimizer_options.draft_axes)));
+  }
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-opt_draft_axes",
+                                  optimizer_options.draft_axes,
+                                  sizeof(optimizer_options.draft_axes),
+                                  &has_opt_draft_axes));
+  if (has_opt_draft_axes) {
+    PetscCall(PetscStrncpy(optimizer_options.draft_axis,
+                           optimizer_options.draft_axes,
+                           sizeof(optimizer_options.draft_axis)));
+  }
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_load",
                                  &optimizer_options.load, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_ksp_rtol",

@@ -713,34 +713,48 @@ char lowercase_ascii(char c) {
   return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
 }
 
-PetscErrorCode parse_h8_draft_axis(const char *text, PetscInt *axis) {
-  PetscInt selected_axis = -1;
+struct H8DraftDirection {
+  PetscInt axis = 2;
+  PetscInt sign = 0;
+};
 
-  PetscCheck(axis != nullptr, PETSC_COMM_WORLD, PETSC_ERR_ARG_NULL,
-             "draft axis output pointer is null");
+PetscErrorCode parse_h8_draft_axes(const char *text,
+                                   std::vector<H8DraftDirection> *dirs) {
+  dirs->clear();
   PetscCheck(text != nullptr && text[0] != '\0', PETSC_COMM_WORLD,
              PETSC_ERR_ARG_WRONG,
-             "-opt_draft_axis must be x, y, or z");
+             "-opt_draft_axes must use +x,-x,+y,-y,+z,-z, x, y, z, or none");
   for (const char *p = text; *p != '\0'; ++p) {
-    const char c = lowercase_ascii(*p);
-    if (c == ' ' || c == '\t' || c == '+' || c == '-' || c == ',' ||
-        c == ';' || c == '/') {
+    char c = lowercase_ascii(*p);
+    if (c == ' ' || c == '\t' || c == ',' || c == ';' || c == '/') {
       continue;
     }
-    PetscInt current_axis = -1;
-    if (c == 'x') current_axis = 0;
-    if (c == 'y') current_axis = 1;
-    if (c == 'z') current_axis = 2;
-    PetscCheck(current_axis >= 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-               "-opt_draft_axis must be x, y, or z");
-    PetscCheck(selected_axis < 0 || selected_axis == current_axis,
-               PETSC_COMM_WORLD, PETSC_ERR_SUP,
-               "H8 optimization currently supports one draft axis per run");
-    selected_axis = current_axis;
+    if (c == 'n' && lowercase_ascii(*(p + 1)) == 'o' &&
+        lowercase_ascii(*(p + 2)) == 'n' &&
+        lowercase_ascii(*(p + 3)) == 'e') {
+      p += 3;
+      continue;
+    }
+
+    PetscInt sign = 0;
+    if (c == '+' || c == '-') {
+      sign = (c == '+') ? 1 : -1;
+      ++p;
+      while (*p == ' ' || *p == '\t') ++p;
+      c = lowercase_ascii(*p);
+    }
+
+    PetscInt axis = -1;
+    if (c == 'x') axis = 0;
+    if (c == 'y') axis = 1;
+    if (c == 'z') axis = 2;
+    PetscCheck(axis >= 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+               "-opt_draft_axes must use +x,-x,+y,-y,+z,-z, x, y, z, or none");
+    H8DraftDirection parsed;
+    parsed.axis = axis;
+    parsed.sign = sign;
+    dirs->push_back(parsed);
   }
-  PetscCheck(selected_axis >= 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-             "-opt_draft_axis must be x, y, or z");
-  *axis = selected_axis;
   return 0;
 }
 
@@ -774,15 +788,13 @@ PetscInt h8_draft_column_id(PetscInt axis, PetscInt i, PetscInt j, PetscInt k,
 }
 
 PetscErrorCode apply_axis_draft_closure(DM eda, Vec mask, PetscReal eta,
-                                        const char *draft_axis, Vec rho) {
+                                        PetscInt axis, PetscInt sign, Vec rho) {
   PetscScalar ***r = nullptr;
   PetscScalar ***m = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
   PetscInt ex = 0, ey = 0, ez = 0;
-  PetscInt axis = 2;
   PetscMPIInt reduce_count = 0;
 
-  PetscCall(parse_h8_draft_axis(draft_axis, &axis));
   PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
   const PetscInt axis_length = h8_draft_axis_length(axis, ex, ey, ez);
@@ -841,8 +853,13 @@ PetscErrorCode apply_axis_draft_closure(DM eda, Vec mask, PetscReal eta,
         const PetscInt coord = h8_draft_axis_coordinate(axis, i, j, k);
         const PetscInt axis_min = global_min[static_cast<std::size_t>(id)];
         const PetscInt axis_max = global_max[static_cast<std::size_t>(id)];
-        if (axis_min <= coord && coord <= axis_max) {
-          // 沿指定开模轴填满同一柱内的空隙，避免局部闭孔或倒扣。
+        const bool fill_split = (axis_min <= coord && coord <= axis_max);
+        const bool fill_plus = (axis_min < axis_length && coord >= axis_min);
+        const bool fill_minus = (axis_max >= 0 && coord <= axis_max);
+        const bool should_fill =
+            sign > 0 ? fill_plus : (sign < 0 ? fill_minus : fill_split);
+        if (should_fill) {
+          // sign=0 是 split 闭包；sign>0/<0 是向正/负开模侧的保守单向闭包。
           r[k][j][i] = PetscMax(PetscRealPart(r[k][j][i]),
                                 global_peak[static_cast<std::size_t>(id)]);
         }
@@ -857,9 +874,36 @@ PetscErrorCode apply_axis_draft_closure(DM eda, Vec mask, PetscReal eta,
 PetscErrorCode apply_h8_draft_closure(DM eda, Vec mask,
                                       const OptimizerOptions &options,
                                       Vec rho) {
+  std::vector<H8DraftDirection> dirs;
+  bool processed_axis[3] = {false, false, false};
+
   if (!options.z_draft_closure) return 0;
-  PetscCall(apply_axis_draft_closure(eda, mask, options.z_draft_eta,
-                                     options.draft_axis, rho));
+  PetscCall(parse_h8_draft_axes(options.draft_axes, &dirs));
+  if (dirs.empty()) return 0;
+
+  for (const H8DraftDirection &dir : dirs) {
+    const PetscInt axis = dir.axis;
+    if (processed_axis[axis]) continue;
+
+    bool has_plus = false;
+    bool has_minus = false;
+    bool has_split = false;
+    for (const H8DraftDirection &same_axis : dirs) {
+      if (same_axis.axis != axis) continue;
+      has_plus = has_plus || same_axis.sign > 0;
+      has_minus = has_minus || same_axis.sign < 0;
+      has_split = has_split || same_axis.sign == 0;
+    }
+
+    PetscInt effective_sign = 0;
+    if (!has_split && !(has_plus && has_minus)) {
+      effective_sign = has_plus ? 1 : -1;
+    }
+
+    PetscCall(apply_axis_draft_closure(eda, mask, options.z_draft_eta, axis,
+                                       effective_sign, rho));
+    processed_axis[axis] = true;
+  }
   return 0;
 }
 
@@ -2872,6 +2916,8 @@ PetscErrorCode write_h8_summary(const char *output_prefix, const Grid &grid,
                                    opt.z_draft_closure ? "true" : "false"));
   PetscCall(PetscViewerASCIIPrintf(viewer, "draft_axis=%s\n",
                                    opt.draft_axis));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "draft_axes=%s\n",
+                                   opt.draft_axes));
   PetscCall(PetscViewerASCIIPrintf(viewer, "draft_eta=%.12e\n",
                                    static_cast<double>(opt.z_draft_eta)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "z_draft_closure=%s\n",
@@ -3279,9 +3325,9 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                         stop_on_ksp_divergence ? "true" : "false"));
   if (density_options.use_control_arm_mask) {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                          "H8 hard regions/BC: A/B/C rings and spring mount are locked; C ring is fixed; A/B rings plus spring mount are loaded; draft_closure=%s axis=%s eta=%g\n",
+                          "H8 hard regions/BC: A/B/C rings and spring mount are locked; C ring is fixed; A/B rings plus spring mount are loaded; draft_closure=%s axes=%s eta=%g\n",
                           optimizer_options.z_draft_closure ? "true" : "false",
-                          optimizer_options.draft_axis,
+                          optimizer_options.draft_axes,
                           static_cast<double>(optimizer_options.z_draft_eta)));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "H8 load options: load_case=%lld (%s), include_spring_load=%s\n",
@@ -3292,10 +3338,10 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                           h8_include_spring_load ? "true" : "false"));
   } else {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                          "H8 rectangular benchmark: case=%s, left face fixed, right face loaded; draft_closure=%s axis=%s eta=%g\n",
+                          "H8 rectangular benchmark: case=%s, left face fixed, right face loaded; draft_closure=%s axes=%s eta=%g\n",
                           optimizer_options.benchmark_case,
                           optimizer_options.z_draft_closure ? "true" : "false",
-                          optimizer_options.draft_axis,
+                          optimizer_options.draft_axes,
                           static_cast<double>(optimizer_options.z_draft_eta)));
   }
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
