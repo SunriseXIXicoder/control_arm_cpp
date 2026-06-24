@@ -3,6 +3,7 @@
 # 默认使用无 mask 矩形悬臂梁，适合先看约束是否改变密度形态。
 # 提交方式：sbatch submit_h8_draft_small_5cases.sbatch
 # 默认网格为 81x31x21 节点，约 1.58e5 位移自由度；OPT_LOAD=1e5 将柔度放大到约 1e2 量级。
+# 默认跑 500 步，Heaviside beta 每 50 步翻倍到 16；同一 beta 阶段内拒绝柔度上升。
 # 常用覆盖示例：NX=121 NY=41 NZ=31 OPT_MAX_ITER=500 sbatch submit_h8_draft_small_5cases.sbatch
 #SBATCH -J h8_draft5
 #SBATCH -N 1
@@ -64,20 +65,22 @@ NZ="${NZ:-21}"
 DOMAIN_HEIGHT="${DOMAIN_HEIGHT:-0.08}"
 BENCHMARK_CASE="${BENCHMARK_CASE:-cantilever}"
 VOLFRAC="${VOLFRAC:-0.30}"
-OPT_MAX_ITER="${OPT_MAX_ITER:-200}"
+OPT_MAX_ITER="${OPT_MAX_ITER:-500}"
 OPT_FILTER_RADIUS="${OPT_FILTER_RADIUS:-1.5}"
 OPT_DRAFT_ETA="${OPT_DRAFT_ETA:-0.5}"
 OPT_LOAD="${OPT_LOAD:-1e5}"
-OPT_MOVE="${OPT_MOVE:-0.08}"
-OPT_MOVE_MIN="${OPT_MOVE_MIN:-0.005}"
+OPT_MOVE="${OPT_MOVE:-0.025}"
+OPT_MOVE_MIN="${OPT_MOVE_MIN:-0.004}"
 OPT_MOVE_SHRINK="${OPT_MOVE_SHRINK:-0.5}"
 OPT_MOVE_GROWTH="${OPT_MOVE_GROWTH:-1.05}"
-OPT_MAX_COMPLIANCE_INCREASE="${OPT_MAX_COMPLIANCE_INCREASE:-0.10}"
-OPT_HEAVISIDE="${OPT_HEAVISIDE:-false}"
+OPT_MAX_COMPLIANCE_INCREASE="${OPT_MAX_COMPLIANCE_INCREASE:-0.0}"
+OPT_HEAVISIDE="${OPT_HEAVISIDE:-true}"
 OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
 OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"
 OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
-OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-0}"
+OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-50}"
+# H8 小算例使用平滑的闭包后体积修正：修正下一步 raw 体积分数，不做 trial 级闭包后二分。
+OPT_PROJECTED_VOLUME_CORRECTION="${OPT_PROJECTED_VOLUME_CORRECTION:-true}"
 YOUNG_MODULUS="${YOUNG_MODULUS:-2.1e11}"
 PENAL="${PENAL:-3.0}"
 EMIN="${EMIN:-1e-6}"
@@ -146,6 +149,7 @@ echo "  volfrac=${VOLFRAC}"
 echo "  filter_radius=${OPT_FILTER_RADIUS}"
 echo "  draft_axes=${DRAFT_AXES}"
 echo "  opt_load=${OPT_LOAD}"
+echo "  heaviside=${OPT_HEAVISIDE} beta0=${OPT_HEAVISIDE_BETA_INITIAL} beta_max=${OPT_HEAVISIDE_BETA_MAX} beta_interval=${OPT_HEAVISIDE_BETA_INTERVAL}"
 echo "  h8_pc_type=${H8_PC_TYPE}"
 echo "  output_prefix=${PREFIX}"
 
@@ -175,6 +179,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -opt_move_growth "${OPT_MOVE_GROWTH}" \
   -opt_max_compliance_increase "${OPT_MAX_COMPLIANCE_INCREASE}" \
   -opt_stability_guard true \
+  -opt_projected_volume_correction "${OPT_PROJECTED_VOLUME_CORRECTION}" \
   -opt_filter_radius "${OPT_FILTER_RADIUS}" \
   -opt_draft_closure true \
   -opt_draft_axes "${DRAFT_AXES}" \

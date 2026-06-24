@@ -251,7 +251,7 @@ For H8 draft-direction verification, change only `-opt_draft_axes` and the outpu
   -opt_draft_axes +x,+y,+z -output_prefix result/layer2_h8_cantilever_plus_x_plus_y_plus_z
 ```
 
-`-opt_draft_axes` is the H8 signed draft-closure list. A single signed direction such as `+x` conservatively fills from detected solid cells toward the positive draw side. Opposite signs on the same axis, such as `+z,-z`, are treated as split draw and fill only the interval between solid cells in each axis-aligned column. Multiple axes, such as `+x,+y,+z`, are applied sequentially with max-density closure. H8 then applies `-opt_projected_volume_correction true` by default: the OC multiplier search evaluates each trial after filtering and draft closure, so the plotted post-closure physical volume is the constrained quantity.
+`-opt_draft_axes` is the H8 signed draft-closure list. A single signed direction such as `+x` conservatively fills from detected solid cells toward the positive draw side. Opposite signs on the same axis, such as `+z,-z`, are treated as split draw and fill only the interval between solid cells in each axis-aligned column. Multiple axes, such as `+x,+y,+z`, are applied sequentially with max-density closure. H8 uses the original control-arm H8 OC update path; when `-opt_heaviside_projection true` is enabled, the H8 density chain is filter -> Heaviside projection -> draft closure, and the sensitivity is back-propagated through the Heaviside derivative before the density-filter adjoint. With `-opt_projected_volume_correction true`, H8 smoothly corrects the next OC raw-volume target from the current post-closure physical volume gap instead of doing a more aggressive trial-by-trial projected-volume bisection.
 
 The absolute compliance in these rectangular examples is reported in SI units with the default load scale `-opt_load 1.0`, so values around `1e-8` can occur on small stiff meshes. For paper figures, compare relative compliance between cases or set a larger common load scale.
 
@@ -261,7 +261,9 @@ The prepared Slurm array script for the five small H8 verification cases is:
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
 
-This script defaults to `81 x 31 x 21` nodes (`80 x 30 x 20` H8 elements, `158193` displacement DOF), `OPT_LOAD=1e5`, and `OPT_CHECKPOINT_INTERVAL=0`, so intermediate checkpoints are skipped and only the final checkpoint/final VTK are kept.
+This script defaults to `81 x 31 x 21` nodes (`80 x 30 x 20` H8 elements, `158193` displacement DOF), `OPT_MAX_ITER=500`, `OPT_LOAD=1e5`, `OPT_HEAVISIDE=true`, `OPT_HEAVISIDE_BETA_INTERVAL=50`, `OPT_MOVE=0.025`, and `OPT_CHECKPOINT_INTERVAL=0`, so intermediate checkpoints are skipped and only the final checkpoint/final VTK are kept. It also sets `OPT_MAX_COMPLIANCE_INCREASE=0.0` for strict same-beta acceptance and `OPT_PROJECTED_VOLUME_CORRECTION=true` to constrain the post-closure physical volume through a smooth raw-target correction.
+
+For Heaviside continuation, read `heaviside_beta` and `accepted` in the H8 history CSV: monotonic acceptance is enforced within the same beta stage, while a beta stage change is a new projected-density mapping.
 
 For EMsFEM ANN optimization, keep `-opt_draft_axes +z`; this change extends the H8 optimizer to signed x/y/z closure while the EMsFEM ANN optimizer remains a Z-direction draft-closure path.
 
@@ -329,7 +331,7 @@ Important optimization options:
 | --- | --- |
 | `-opt_move`, `-opt_move_min`, `-opt_move_shrink`, `-opt_move_growth` | Move-limit control. |
 | `-opt_max_compliance_increase` | Stability guard threshold for rejecting unsafe updates. |
-| `-opt_projected_volume_correction` | Correct volume after projection. |
+| `-opt_projected_volume_correction` | Raw-volume target correction after projection. H8 uses the current post-closure volume gap to adjust the next OC raw target; EMsFEM uses the same idea on its fine-density grid. |
 | `-opt_rho_min` | Lower bound on design density. |
 | `-opt_draft_closure`, `-opt_draft_axes`, `-opt_draft_eta` | Draft closure controls. H8 supports signed and multi-axis lists such as `+x`, `+z,+x`, `+z,-z`, and `+x,+y,+z`; EMsFEM ANN currently uses Z closure. The old `-opt_z_draft_closure`, `-opt_z_draft_eta`, and single-axis `-opt_draft_axis` names remain compatibility aliases. |
 | `-opt_write_checkpoint` | Write PETSc binary density/mask checkpoints. |
@@ -750,7 +752,7 @@ H8 拔模方向验证时，只需要修改 `-opt_draft_axes` 和输出前缀：
   -opt_draft_axes +x,+y,+z -output_prefix result/layer2_h8_cantilever_plus_x_plus_y_plus_z
 ```
 
-`-opt_draft_axes` 是 H8 的有符号拔模闭包列表。单个有符号方向例如 `+x` 会从检测到的实体单元向正向开模侧做保守补齐；同一轴同时给出正负方向，例如 `+z,-z`，会按 split draw 处理，只填每根轴向柱内实体单元之间的间隙。多个轴例如 `+x,+y,+z` 会按顺序执行 max-density 闭包。H8 随后默认使用 `-opt_projected_volume_correction true`：OC 乘子搜索会对每个 trial 先做滤波和拔模闭包，再用闭包后的物理体积判断体积约束，因此图里绘制的闭包后物理体积就是被约束的量。
+`-opt_draft_axes` 是 H8 的有符号拔模闭包列表。单个有符号方向例如 `+x` 会从检测到的实体单元向正向开模侧做保守补齐；同一轴同时给出正负方向，例如 `+z,-z`，会按 split draw 处理，只填每根轴向柱内实体单元之间的间隙。多个轴例如 `+x,+y,+z` 会按顺序执行 max-density 闭包。H8 使用原控制臂 H8 的 OC 更新路径；启用 `-opt_heaviside_projection true` 时，H8 的密度链路为“滤波 -> Heaviside 投影 -> 拔模闭包”，灵敏度会先经过 Heaviside 导数反传，再进入密度滤波伴随反传。启用 `-opt_projected_volume_correction true` 时，H8 会根据当前闭包后物理体积与 raw 设计体积的差，平滑修正下一步 OC 的 raw 体积分数目标，而不是做更激进的 trial 级闭包后二分。
 
 这些矩形域算例的柔度按 SI 单位输出，默认载荷是 `-opt_load 1.0`，小网格高刚度结构出现 `1e-8` 量级并不奇怪。论文图中建议比较相对柔度，或统一设置更大的载荷尺度。
 
@@ -760,7 +762,9 @@ H8 拔模方向验证时，只需要修改 `-opt_draft_axes` 和输出前缀：
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
 
-该脚本默认使用 `81 x 31 x 21` 节点网格，即 `80 x 30 x 20` 个 H8 单元、`158193` 个位移自由度；默认 `OPT_LOAD=1e5`，把柔度放大到约 `1e2` 量级；默认 `OPT_CHECKPOINT_INTERVAL=0`，不写中间 checkpoint，只保留最终 checkpoint 和最终 VTK。
+该脚本默认使用 `81 x 31 x 21` 节点网格，即 `80 x 30 x 20` 个 H8 单元、`158193` 个位移自由度；默认 `OPT_MAX_ITER=500`、`OPT_LOAD=1e5`、`OPT_HEAVISIDE=true`、`OPT_HEAVISIDE_BETA_INTERVAL=50`、`OPT_MOVE=0.025`、`OPT_CHECKPOINT_INTERVAL=0`，不写中间 checkpoint，只保留最终 checkpoint 和最终 VTK。脚本同时设置 `OPT_MAX_COMPLIANCE_INCREASE=0.0` 做同一 beta 阶段内的严格接受判据，并设置 `OPT_PROJECTED_VOLUME_CORRECTION=true`，通过平滑 raw-target 修正约束闭包后的物理体积。
+
+使用 Heaviside continuation 时，请结合 H8 history CSV 里的 `heaviside_beta` 和 `accepted` 字段解读曲线：同一 beta 阶段内执行单调接受，beta 阶段切换则代表投影密度映射发生了变化。
 
 EMsFEM ANN 优化仍保持 `-opt_draft_axes +z`；本次改动扩展的是 H8 优化器的有符号 x/y/z 闭包，EMsFEM ANN 仍是 Z 方向拔模闭包路径。
 
@@ -828,7 +832,7 @@ mpirun -np 4 ./bin/control_arm_cpp \
 | --- | --- |
 | `-opt_move`, `-opt_move_min`, `-opt_move_shrink`, `-opt_move_growth` | 移动限控制。 |
 | `-opt_max_compliance_increase` | 稳定性保护阈值，用于拒绝不可靠更新。 |
-| `-opt_projected_volume_correction` | 投影后体积分数修正。 |
+| `-opt_projected_volume_correction` | 投影后的 raw volume 目标修正。H8 根据当前闭包后体积差修正下一步 OC raw 目标；EMsFEM 在细密度网格上使用同样思路。 |
 | `-opt_rho_min` | 设计变量密度下界。 |
 | `-opt_draft_closure`, `-opt_draft_axes`, `-opt_draft_eta` | 拔模闭包控制。H8 支持 `+x`、`+z,+x`、`+z,-z`、`+x,+y,+z` 等有符号多轴列表；EMsFEM ANN 当前仍使用 Z 方向闭包。旧的 `-opt_z_draft_closure`、`-opt_z_draft_eta` 和单轴 `-opt_draft_axis` 仍作为兼容别名。 |
 | `-opt_write_checkpoint` | 写 PETSc 二进制密度/mask checkpoint。 |
