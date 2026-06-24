@@ -261,9 +261,9 @@ The prepared Slurm array script for the five small H8 verification cases is:
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
 
-This script defaults to `81 x 31 x 21` nodes (`80 x 30 x 20` H8 elements, `158193` displacement DOF), `OPT_MAX_ITER=500`, `OPT_LOAD=1e5`, `OPT_HEAVISIDE=true`, `OPT_HEAVISIDE_BETA_INTERVAL=50`, `OPT_MOVE=0.025`, and `OPT_CHECKPOINT_INTERVAL=0`, so intermediate checkpoints are skipped and only the final checkpoint/final VTK are kept. It also sets `OPT_MAX_COMPLIANCE_INCREASE=0.08`, allowing small same-beta compliance oscillations while still rejecting large unstable jumps, and `OPT_PROJECTED_VOLUME_CORRECTION=true` to constrain the post-closure physical volume through a smooth raw-target correction.
+This script defaults to `81 x 31 x 21` nodes (`80 x 30 x 20` H8 elements, `158193` displacement DOF), `OPT_MAX_ITER=500`, `OPT_LOAD=1e5`, `OPT_HEAVISIDE=true`, `OPT_HEAVISIDE_BETA_INTERVAL=50`, `OPT_MOVE=0.025`, and `OPT_CHECKPOINT_INTERVAL=0`, so intermediate checkpoints are skipped and only the final checkpoint/final VTK are kept. It keeps the full H8 optimization history without candidate rollback and sets `OPT_PROJECTED_VOLUME_CORRECTION=true` to constrain the post-closure physical volume through a smooth raw-target correction.
 
-For Heaviside continuation, read `heaviside_beta` and `accepted` in the H8 history CSV: the stability guard allows the configured small same-beta increase, while a beta stage change is a new projected-density mapping.
+For Heaviside continuation, read `heaviside_beta` in the H8 history CSV; a beta stage change is a new projected-density mapping, so interpret compliance curves stage by stage.
 
 For EMsFEM ANN optimization, keep `-opt_draft_axes +z`; this change extends the H8 optimizer to signed x/y/z closure while the EMsFEM ANN optimizer remains a Z-direction draft-closure path.
 
@@ -330,7 +330,7 @@ Important optimization options:
 | Option | Meaning |
 | --- | --- |
 | `-opt_move`, `-opt_move_min`, `-opt_move_shrink`, `-opt_move_growth` | Move-limit control. |
-| `-opt_max_compliance_increase` | Stability guard threshold for rejecting unsafe updates. |
+| `-opt_max_compliance_increase` | Stability guard threshold used by guarded optimizers such as EMsFEM ANN; the H8 optimizer no longer rolls back candidates. |
 | `-opt_projected_volume_correction` | Raw-volume target correction after projection. H8 uses the current post-closure volume gap to adjust the next OC raw target; EMsFEM uses the same idea on its fine-density grid. |
 | `-opt_rho_min` | Lower bound on design density. |
 | `-opt_draft_closure`, `-opt_draft_axes`, `-opt_draft_eta` | Draft closure controls. H8 supports signed and multi-axis lists such as `+x`, `+z,+x`, `+z,-z`, and `+x,+y,+z`; EMsFEM ANN currently uses Z closure. The old `-opt_z_draft_closure`, `-opt_z_draft_eta`, and single-axis `-opt_draft_axis` names remain compatibility aliases. |
@@ -762,9 +762,9 @@ H8 拔模方向验证时，只需要修改 `-opt_draft_axes` 和输出前缀：
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
 
-该脚本默认使用 `81 x 31 x 21` 节点网格，即 `80 x 30 x 20` 个 H8 单元、`158193` 个位移自由度；默认 `OPT_MAX_ITER=500`、`OPT_LOAD=1e5`、`OPT_HEAVISIDE=true`、`OPT_HEAVISIDE_BETA_INTERVAL=50`、`OPT_MOVE=0.025`、`OPT_CHECKPOINT_INTERVAL=0`，不写中间 checkpoint，只保留最终 checkpoint 和最终 VTK。脚本同时设置 `OPT_MAX_COMPLIANCE_INCREASE=0.08`，允许同一 beta 阶段内柔度小幅震荡，只拒绝明显不稳定的大幅上升；并设置 `OPT_PROJECTED_VOLUME_CORRECTION=true`，通过平滑 raw-target 修正约束闭包后的物理体积。
+该脚本默认使用 `81 x 31 x 21` 节点网格，即 `80 x 30 x 20` 个 H8 单元、`158193` 个位移自由度；默认 `OPT_MAX_ITER=500`、`OPT_LOAD=1e5`、`OPT_HEAVISIDE=true`、`OPT_HEAVISIDE_BETA_INTERVAL=50`、`OPT_MOVE=0.025`、`OPT_CHECKPOINT_INTERVAL=0`，不写中间 checkpoint，只保留最终 checkpoint 和最终 VTK。脚本保留完整 H8 优化历史，不做候选回滚；并设置 `OPT_PROJECTED_VOLUME_CORRECTION=true`，通过平滑 raw-target 修正约束闭包后的物理体积。
 
-使用 Heaviside continuation 时，请结合 H8 history CSV 里的 `heaviside_beta` 和 `accepted` 字段解读曲线：稳定性保护会允许配置范围内的同一 beta 阶段小幅上升，beta 阶段切换则代表投影密度映射发生了变化。
+使用 Heaviside continuation 时，请结合 H8 history CSV 里的 `heaviside_beta` 字段分阶段解读曲线；beta 阶段切换代表投影密度映射发生了变化。
 
 EMsFEM ANN 优化仍保持 `-opt_draft_axes +z`；本次改动扩展的是 H8 优化器的有符号 x/y/z 闭包，EMsFEM ANN 仍是 Z 方向拔模闭包路径。
 
@@ -831,7 +831,7 @@ mpirun -np 4 ./bin/control_arm_cpp \
 | 参数 | 含义 |
 | --- | --- |
 | `-opt_move`, `-opt_move_min`, `-opt_move_shrink`, `-opt_move_growth` | 移动限控制。 |
-| `-opt_max_compliance_increase` | 稳定性保护阈值，用于拒绝不可靠更新。 |
+| `-opt_max_compliance_increase` | EMsFEM ANN 等带保护优化器使用的稳定性阈值；H8 优化器不再回滚候选设计。 |
 | `-opt_projected_volume_correction` | 投影后的 raw volume 目标修正。H8 根据当前闭包后体积差修正下一步 OC raw 目标；EMsFEM 在细密度网格上使用同样思路。 |
 | `-opt_rho_min` | 设计变量密度下界。 |
 | `-opt_draft_closure`, `-opt_draft_axes`, `-opt_draft_eta` | 拔模闭包控制。H8 支持 `+x`、`+z,+x`、`+z,-z`、`+x,+y,+z` 等有符号多轴列表；EMsFEM ANN 当前仍使用 Z 方向闭包。旧的 `-opt_z_draft_closure`、`-opt_z_draft_eta` 和单轴 `-opt_draft_axis` 仍作为兼容别名。 |

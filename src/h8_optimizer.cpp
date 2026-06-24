@@ -3532,11 +3532,10 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   const char *final_vtk_file) {
   DM uda = nullptr, eda = nullptr;
   Vec rho_design = nullptr, rho_filtered = nullptr, rho_phys = nullptr;
-  Vec rho_last_good = nullptr;
   Vec mask = nullptr;
   Vec u = nullptr, b = nullptr;
   Vec dc_phys = nullptr, dc_filtered = nullptr, dc_design = nullptr;
-  Vec dc_last_good = nullptr, dv_design = nullptr;
+  Vec dv_design = nullptr;
   Vec filter_denom = nullptr;
   Mat A = nullptr;
   Mat P = nullptr;
@@ -3548,19 +3547,11 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscReal ke[24 * 24]{};
   PetscReal compliance = 0.0, volume = 0.0, change = 0.0;
   PetscReal rhs_norm = 0.0;
-  PetscReal accepted_compliance = PETSC_MAX_REAL;
-  PetscReal accepted_beta = 0.0;
-  PetscReal current_move = optimizer_options.move;
-  PetscReal last_good_effective_raw_volfrac = optimizer_options.volfrac;
   PetscLogDouble total_start = 0.0;
   PetscInt final_iter = 0;
-  PetscInt accepted_iter = 0;
-  PetscInt reject_streak = 0;
   PetscBool reuse_initial_guess = PETSC_TRUE;
   PetscBool stop_on_ksp_divergence = PETSC_TRUE;
   PetscBool stopped_on_ksp_divergence = PETSC_FALSE;
-  PetscBool have_last_good = PETSC_FALSE;
-  PetscBool last_iteration_accepted = PETSC_TRUE;
   PetscBool use_aux_matrix = PETSC_FALSE;
   PetscBool use_elastic_aux_matrix = PETSC_FALSE;
   PetscInt aux_rebuild_interval = 1;
@@ -3584,7 +3575,6 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                             optimizer_options, &mask, &rho_design));
   PetscCall(VecDuplicate(rho_design, &rho_filtered));
   PetscCall(VecDuplicate(rho_design, &rho_phys));
-  PetscCall(VecDuplicate(rho_design, &rho_last_good));
   PetscCall(VecDuplicate(rho_design, &filter_denom));
   PetscReal current_beta = h8_heaviside_beta_for_iter(optimizer_options, 1);
   PetscCall(compute_filter_denominator(eda, mask, optimizer_options.filter_radius,
@@ -3605,7 +3595,6 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(DMCreateGlobalVector(eda, &dc_phys));
   PetscCall(VecDuplicate(dc_phys, &dc_filtered));
   PetscCall(VecDuplicate(dc_phys, &dc_design));
-  PetscCall(VecDuplicate(dc_phys, &dc_last_good));
   PetscCall(fill_h8_load(uda, eda, mask, grid, density_options,
                          optimizer_options, b));
   PetscCall(VecNorm(b, NORM_2, &rhs_norm));
@@ -3636,7 +3625,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                           output_prefix));
   PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, hist_path, &hist));
   PetscCall(PetscViewerASCIIPrintf(hist,
-                                   "iter,compliance,volume,raw_design_volume,effective_raw_volfrac,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_reason,ksp_reason_name,ksp_residual,rhs_norm,ksp_relative_residual,accepted,effective_move,filter_s,linear_solve_s,sensitivity_s,update_s,checkpoint_s,iter_total_s\n"));
+                                   "iter,compliance,volume,raw_design_volume,effective_raw_volfrac,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_reason,ksp_reason_name,ksp_residual,rhs_norm,ksp_relative_residual,filter_s,linear_solve_s,sensitivity_s,update_s,checkpoint_s,iter_total_s\n"));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                         "Optimize mode: h8_matrix_free nx=%lld ny=%lld nz=%lld size=%.4gm x %.4gm x %.4gm max_iter=%lld volfrac=%g filter_radius=%g\n",
                         static_cast<long long>(grid.nx),
@@ -3664,13 +3653,6 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                             optimizer_options.heaviside_beta_max),
                         static_cast<long long>(
                             optimizer_options.heaviside_beta_interval)));
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "H8 stability guard: %s max_compliance_increase=%g move=%g move_min=%g\n",
-                        optimizer_options.stability_guard ? "true" : "false",
-                        static_cast<double>(
-                            optimizer_options.max_compliance_increase),
-                        static_cast<double>(optimizer_options.move),
-                        static_cast<double>(optimizer_options.move_min)));
   if (density_options.use_control_arm_mask) {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "H8 hard regions/BC: A/B/C rings and spring mount are locked; C ring is fixed; A/B rings plus spring mount are loaded; draft_closure=%s axes=%s eta=%g\n",
@@ -3765,43 +3747,16 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscReal raw_design_volume = 0.0;
     PetscReal projected_volume_gap = 0.0;
     PetscReal effective_raw_volfrac = optimizer_options.volfrac;
-    PetscBool accepted = PETSC_TRUE;
     const PetscBool ksp_failed = reason < 0 ? PETSC_TRUE : PETSC_FALSE;
-    if (!ksp_failed) {
-      PetscCall(compute_masked_volume_fraction(eda, rho_phys, mask, &volume));
-    }
-    const PetscBool same_beta_stage =
-        (have_last_good &&
-         PetscAbsReal(current_beta - accepted_beta) <=
-             1.0e-12 * PetscMax(1.0, PetscAbsReal(accepted_beta)))
-            ? PETSC_TRUE
-            : PETSC_FALSE;
-    const PetscBool compliance_spike =
-        (optimizer_options.stability_guard && !ksp_failed && same_beta_stage &&
-         accepted_compliance < PETSC_MAX_REAL &&
-         compliance >
-             accepted_compliance *
-                 (1.0 + optimizer_options.max_compliance_increase))
-            ? PETSC_TRUE
-            : PETSC_FALSE;
-    const PetscBool volume_violation =
-        (optimizer_options.projected_volume_correction && !ksp_failed &&
-         have_last_good && volume > optimizer_options.volfrac + 5.0e-3)
-            ? PETSC_TRUE
-            : PETSC_FALSE;
-    const PetscBool reject_candidate =
-        (optimizer_options.stability_guard && have_last_good &&
-         (ksp_failed || compliance_spike || volume_violation))
-            ? PETSC_TRUE
-            : PETSC_FALSE;
 
-    if (ksp_failed && !reject_candidate) {
+    if (ksp_failed) {
+      change = 0.0;
       PetscCall(compute_masked_volume_fraction(eda, rho_phys, mask, &volume));
       PetscCall(compute_masked_volume_fraction(eda, rho_design, mask,
                                                &raw_design_volume));
       projected_volume_gap = volume - raw_design_volume;
       PetscCall(elapsed_max(iter_start, &iter_time));
-      PetscCall(PetscViewerASCIIPrintf(hist, "%lld,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%lld,%d,%s,%.12e,%.12e,%.12e,%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
+      PetscCall(PetscViewerASCIIPrintf(hist, "%lld,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%lld,%d,%s,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
                                        static_cast<long long>(iter),
                                        static_cast<double>(compliance),
                                        static_cast<double>(volume),
@@ -3816,8 +3771,6 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                        static_cast<double>(rnorm),
                                        static_cast<double>(rhs_norm),
                                        static_cast<double>(rel_rnorm),
-                                       0,
-                                       static_cast<double>(current_move),
                                        static_cast<double>(filter_time),
                                        static_cast<double>(solve_time),
                                        0.0, 0.0, 0.0,
@@ -3838,95 +3791,45 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                             static_cast<double>(filter_time),
                             static_cast<double>(solve_time),
                             static_cast<double>(iter_time)));
-      stopped_on_ksp_divergence = PETSC_TRUE;
+      if (stop_on_ksp_divergence) {
+        stopped_on_ksp_divergence = PETSC_TRUE;
+        PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                              "Stopping H8 optimization because the linear solve did not converge; no OC update was applied for this step.\n"));
+        break;
+      }
       PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                            "Stopping H8 optimization because the first usable linear solve did not converge.\n"));
-      break;
-    }
-
-    if (reject_candidate) {
-      accepted = PETSC_FALSE;
-      last_iteration_accepted = PETSC_FALSE;
-      ++reject_streak;
-      PetscCall(compute_masked_volume_fraction(eda, rho_phys, mask, &volume));
-      PetscCall(compute_masked_volume_fraction(eda, rho_design, mask,
-                                               &raw_design_volume));
-      projected_volume_gap = volume - raw_design_volume;
-      PetscCall(PetscTime(&stage_start));
-      current_move = PetscMax(optimizer_options.move_min,
-                              current_move * optimizer_options.move_shrink);
-      OptimizerOptions step_options = optimizer_options;
-      step_options.move = current_move;
-      if (optimizer_options.projected_volume_correction) {
-        if (volume_violation) {
-          effective_raw_volfrac =
-              optimizer_options.volfrac - projected_volume_gap;
-          effective_raw_volfrac =
-              PetscMax(optimizer_options.rho_min,
-                       PetscMin(1.0, effective_raw_volfrac));
-        } else {
-          effective_raw_volfrac = last_good_effective_raw_volfrac;
-        }
-        step_options.volfrac = effective_raw_volfrac;
-      }
-      PetscCall(VecCopy(rho_last_good, rho_design));
-      PetscCall(VecCopy(dc_last_good, dc_design));
-      PetscCall(oc_update(eda, rho_design, mask, dc_design, dv_design,
-                          density_options, step_options, &change));
-      PetscCall(elapsed_max(stage_start, &update_time));
-      PetscCall(PetscPrintf(
-          PETSC_COMM_WORLD,
-          "it=%lld rejected H8 candidate: ksp_failed=%d compliance_spike=%d volume_violation=%d; restored previous accepted design and retried OC with move=%.3e raw_target=%.6f\n",
-          static_cast<long long>(iter), static_cast<int>(ksp_failed),
-          static_cast<int>(compliance_spike),
-          static_cast<int>(volume_violation), static_cast<double>(current_move),
-          static_cast<double>(effective_raw_volfrac)));
-    } else {
-      PetscCall(PetscTime(&stage_start));
-      PetscCall(compute_h8_sensitivity(uda, eda, u, rho_phys, mask, grid,
-                                       density_options, ke, dc_phys, &volume));
-      PetscCall(apply_h8_heaviside_sensitivity(
-          eda, dc_phys, rho_filtered, mask, optimizer_options, current_beta,
-          dc_filtered));
-      PetscCall(apply_sensitivity_filter_adjoint(
-          eda, dc_filtered, mask, filter_denom, optimizer_options.filter_radius,
-          dc_design));
-      PetscCall(elapsed_max(stage_start, &sensitivity_time));
-
-      PetscCall(PetscTime(&stage_start));
-      PetscCall(compute_masked_volume_fraction(eda, rho_design, mask,
-                                               &raw_design_volume));
-      projected_volume_gap = volume - raw_design_volume;
-      if (optimizer_options.projected_volume_correction) {
-        effective_raw_volfrac = optimizer_options.volfrac - projected_volume_gap;
-        effective_raw_volfrac =
-            PetscMax(optimizer_options.rho_min,
-                     PetscMin(1.0, effective_raw_volfrac));
-      }
-      OptimizerOptions step_options = optimizer_options;
-      step_options.move = current_move;
-      step_options.volfrac = effective_raw_volfrac;
-      PetscCall(VecCopy(rho_design, rho_last_good));
-      PetscCall(VecCopy(dc_design, dc_last_good));
-      accepted_compliance = compliance;
-      accepted_beta = current_beta;
-      accepted_iter = iter;
-      last_good_effective_raw_volfrac = effective_raw_volfrac;
-      have_last_good = PETSC_TRUE;
-      last_iteration_accepted = PETSC_TRUE;
-      reject_streak = 0;
-      PetscCall(oc_update(eda, rho_design, mask, dc_design, dv_design,
-                          density_options, step_options, &change));
-      if (optimizer_options.stability_guard) {
-        current_move =
-            PetscMin(optimizer_options.move,
-                     current_move * optimizer_options.move_growth);
-      }
-      PetscCall(elapsed_max(stage_start, &update_time));
+                            "Skipping this H8 OC update because the linear solve did not converge.\n"));
+      continue;
     }
 
     PetscCall(PetscTime(&stage_start));
-    if (accepted && optimizer_options.write_checkpoint &&
+    PetscCall(compute_h8_sensitivity(uda, eda, u, rho_phys, mask, grid,
+                                     density_options, ke, dc_phys, &volume));
+    PetscCall(apply_h8_heaviside_sensitivity(
+        eda, dc_phys, rho_filtered, mask, optimizer_options, current_beta,
+        dc_filtered));
+    PetscCall(apply_sensitivity_filter_adjoint(
+        eda, dc_filtered, mask, filter_denom, optimizer_options.filter_radius,
+        dc_design));
+    PetscCall(elapsed_max(stage_start, &sensitivity_time));
+
+    PetscCall(PetscTime(&stage_start));
+    PetscCall(compute_masked_volume_fraction(eda, rho_design, mask,
+                                             &raw_design_volume));
+    projected_volume_gap = volume - raw_design_volume;
+    if (optimizer_options.projected_volume_correction) {
+      effective_raw_volfrac = optimizer_options.volfrac - projected_volume_gap;
+      effective_raw_volfrac =
+          PetscMax(optimizer_options.rho_min, PetscMin(1.0, effective_raw_volfrac));
+    }
+    OptimizerOptions step_options = optimizer_options;
+    step_options.volfrac = effective_raw_volfrac;
+    PetscCall(oc_update(eda, rho_design, mask, dc_design, dv_design,
+                        density_options, step_options, &change));
+    PetscCall(elapsed_max(stage_start, &update_time));
+
+    PetscCall(PetscTime(&stage_start));
+    if (optimizer_options.write_checkpoint &&
         optimizer_options.checkpoint_interval > 0 &&
         iter % optimizer_options.checkpoint_interval == 0) {
       PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
@@ -3943,7 +3846,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscCall(elapsed_max(stage_start, &checkpoint_time));
     PetscCall(elapsed_max(iter_start, &iter_time));
     final_iter = iter;
-    PetscCall(PetscViewerASCIIPrintf(hist, "%lld,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%lld,%d,%s,%.12e,%.12e,%.12e,%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
+    PetscCall(PetscViewerASCIIPrintf(hist, "%lld,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%lld,%d,%s,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
                                      static_cast<long long>(iter),
                                      static_cast<double>(compliance),
                                      static_cast<double>(volume),
@@ -3958,8 +3861,6 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                      static_cast<double>(rnorm),
                                      static_cast<double>(rhs_norm),
                                      static_cast<double>(rel_rnorm),
-                                     static_cast<int>(accepted),
-                                     static_cast<double>(current_move),
                                      static_cast<double>(filter_time),
                                      static_cast<double>(solve_time),
                                      static_cast<double>(sensitivity_time),
@@ -3967,13 +3868,11 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                      static_cast<double>(checkpoint_time),
                                      static_cast<double>(iter_time)));
     PetscCall(PetscViewerFlush(hist));
-    if (accepted) {
-      objective_history.push_back({iter, compliance, volume});
-      PetscCall(write_objective_volume_history(output_prefix, objective_history,
-                                               optimizer_options.volfrac));
-    }
+    objective_history.push_back({iter, compliance, volume});
+    PetscCall(write_objective_volume_history(output_prefix, objective_history,
+                                             optimizer_options.volfrac));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                          "it=%lld compliance=%.6e volume=%.6f raw_volume=%.6f raw_target=%.6f projected_gap=%.3e beta=%.3g change=%.3e ksp_it=%lld ksp_reason=%d(%s) residual=%.3e rel_res=%.3e accepted=%d move=%.3e time[s]: filter=%.3g linear_solve=%.3g sens=%.3g update=%.3g checkpoint=%.3g total=%.3g\n",
+                          "it=%lld compliance=%.6e volume=%.6f raw_volume=%.6f raw_target=%.6f projected_gap=%.3e beta=%.3g change=%.3e ksp_it=%lld ksp_reason=%d(%s) residual=%.3e rel_res=%.3e time[s]: filter=%.3g linear_solve=%.3g sens=%.3g update=%.3g checkpoint=%.3g total=%.3g\n",
                           static_cast<long long>(iter),
                           static_cast<double>(compliance),
                           static_cast<double>(volume),
@@ -3987,25 +3886,12 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                           ksp_reason_name(reason),
                           static_cast<double>(rnorm),
                           static_cast<double>(rel_rnorm),
-                          static_cast<int>(accepted),
-                          static_cast<double>(current_move),
                           static_cast<double>(filter_time),
                           static_cast<double>(solve_time),
                           static_cast<double>(sensitivity_time),
                           static_cast<double>(update_time),
                           static_cast<double>(checkpoint_time),
                           static_cast<double>(iter_time)));
-    if (!accepted &&
-        current_move <= optimizer_options.move_min * (1.0 + 1.0e-10) &&
-        reject_streak >= 3) {
-      PetscCall(VecCopy(rho_last_good, rho_design));
-      change = 0.0;
-      PetscCall(PetscPrintf(
-          PETSC_COMM_WORLD,
-          "Stopping H8 optimization after %lld rejected minimum-move candidates; final design restored to the last accepted state.\n",
-          static_cast<long long>(reject_streak)));
-      break;
-    }
   }
   PetscCall(PetscViewerDestroy(&hist));
 
@@ -4015,18 +3901,8 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
     PetscReal rnorm = 0.0;
     PetscReal rel_rnorm = 0.0;
-    if (!last_iteration_accepted && have_last_good) {
-      PetscCall(VecCopy(rho_last_good, rho_design));
-      change = 0.0;
-      final_iter = accepted_iter;
-      PetscCall(PetscPrintf(
-          PETSC_COMM_WORLD,
-          "Final H8 evaluation uses the last accepted design, not the rejected candidate.\n"));
-    }
-    current_beta = (!last_iteration_accepted && have_last_good)
-                       ? accepted_beta
-                       : h8_heaviside_beta_for_iter(
-                             optimizer_options, PetscMax(1, final_iter));
+    current_beta =
+        h8_heaviside_beta_for_iter(optimizer_options, PetscMax(1, final_iter));
     PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
                                    optimizer_options.filter_radius,
                                    density_options.void_density,
@@ -4083,7 +3959,6 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(KSPDestroy(&ksp));
   PetscCall(MatDestroy(&P));
   PetscCall(MatDestroy(&A));
-  PetscCall(VecDestroy(&dc_last_good));
   PetscCall(VecDestroy(&dc_design));
   PetscCall(VecDestroy(&dc_filtered));
   PetscCall(VecDestroy(&dc_phys));
@@ -4093,7 +3968,6 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(VecDestroy(&filter_denom));
   PetscCall(VecDestroy(&rho_phys));
   PetscCall(VecDestroy(&rho_filtered));
-  PetscCall(VecDestroy(&rho_last_good));
   PetscCall(VecDestroy(&rho_design));
   PetscCall(VecDestroy(&mask));
   PetscCall(DMDestroy(&uda));
