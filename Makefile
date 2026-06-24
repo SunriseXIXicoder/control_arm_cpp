@@ -24,16 +24,12 @@ CPPFLAGS += -Iinclude
 
 ifneq ($(wildcard ${PETSC_CONF}/variables),)
 include ${PETSC_CONF}/variables
-include ${PETSC_CONF}/rules
 
 all: ${TARGET}
 wsl: ${TARGET}
 
-src/%.o: src/%.cpp
-	${CXX} ${CXXFLAGS} ${CPPFLAGS} ${PETSC_CC_INCLUDES} -c $< -o $@
-
-${TARGET}: ${OBJ} | bin
-	${CXXLINKER} -o $@ ${OBJ} ${PETSC_KSP_LIB}
+${TARGET}: ${SRC} | bin
+	${CXX} ${CXXFLAGS} ${CPPFLAGS} ${PETSC_CC_INCLUDES} -o $@ ${SRC} ${PETSC_KSP_LIB} -lm
 
 else
 ifeq ($(origin CXX),default)
