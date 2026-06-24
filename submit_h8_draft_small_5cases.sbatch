@@ -2,6 +2,7 @@
 # H8 小网格拔模方向验证：5 个 array 任务分别对应 +x、+y、+z/+x、+z/-z、+x/+y/+z。
 # 默认使用无 mask 矩形悬臂梁，适合先看约束是否改变密度形态。
 # 提交方式：sbatch submit_h8_draft_small_5cases.sbatch
+# 默认网格为 81x31x21 节点，约 1.58e5 位移自由度；OPT_LOAD=1e5 将柔度放大到约 1e2 量级。
 # 常用覆盖示例：NX=121 NY=41 NZ=31 OPT_MAX_ITER=500 sbatch submit_h8_draft_small_5cases.sbatch
 #SBATCH -J h8_draft5
 #SBATCH -N 1
@@ -66,6 +67,7 @@ VOLFRAC="${VOLFRAC:-0.30}"
 OPT_MAX_ITER="${OPT_MAX_ITER:-200}"
 OPT_FILTER_RADIUS="${OPT_FILTER_RADIUS:-1.5}"
 OPT_DRAFT_ETA="${OPT_DRAFT_ETA:-0.5}"
+OPT_LOAD="${OPT_LOAD:-1e5}"
 OPT_MOVE="${OPT_MOVE:-0.08}"
 OPT_MOVE_MIN="${OPT_MOVE_MIN:-0.005}"
 OPT_MOVE_SHRINK="${OPT_MOVE_SHRINK:-0.5}"
@@ -84,7 +86,8 @@ OPT_RHO_MIN="${OPT_RHO_MIN:-1e-3}"
 KSP_RTOL="${KSP_RTOL:-1e-6}"
 KSP_MAX_IT="${KSP_MAX_IT:-1000}"
 KSP_TYPE="${KSP_TYPE:-fgmres}"
-OPT_CHECKPOINT_INTERVAL="${OPT_CHECKPOINT_INTERVAL:-50}"
+# 0 表示不写中间 checkpoint；代码仍会在最终步写 final checkpoint。
+OPT_CHECKPOINT_INTERVAL="${OPT_CHECKPOINT_INTERVAL:-0}"
 OPT_WRITE_FINAL_VTK="${OPT_WRITE_FINAL_VTK:-true}"
 H8_PC_TYPE="${H8_PC_TYPE:-aux_hypre}"
 H8_AUX_REBUILD_INTERVAL="${H8_AUX_REBUILD_INTERVAL:-1}"
@@ -142,6 +145,7 @@ echo "  opt_max_iter=${OPT_MAX_ITER}"
 echo "  volfrac=${VOLFRAC}"
 echo "  filter_radius=${OPT_FILTER_RADIUS}"
 echo "  draft_axes=${DRAFT_AXES}"
+echo "  opt_load=${OPT_LOAD}"
 echo "  h8_pc_type=${H8_PC_TYPE}"
 echo "  output_prefix=${PREFIX}"
 
@@ -181,7 +185,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -opt_heaviside_beta_initial "${OPT_HEAVISIDE_BETA_INITIAL}" \
   -opt_heaviside_beta_max "${OPT_HEAVISIDE_BETA_MAX}" \
   -opt_heaviside_beta_interval "${OPT_HEAVISIDE_BETA_INTERVAL}" \
-  -opt_load 1.0 \
+  -opt_load "${OPT_LOAD}" \
   -opt_ksp_rtol "${KSP_RTOL}" \
   -opt_ksp_max_it "${KSP_MAX_IT}" \
   -opt_write_final_vtk "${OPT_WRITE_FINAL_VTK}" \

@@ -261,6 +261,8 @@ The prepared Slurm array script for the five small H8 verification cases is:
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
 
+This script defaults to `81 x 31 x 21` nodes (`80 x 30 x 20` H8 elements, `158193` displacement DOF), `OPT_LOAD=1e5`, and `OPT_CHECKPOINT_INTERVAL=0`, so intermediate checkpoints are skipped and only the final checkpoint/final VTK are kept.
+
 For EMsFEM ANN optimization, keep `-opt_draft_axes +z`; this change extends the H8 optimizer to signed x/y/z closure while the EMsFEM ANN optimizer remains a Z-direction draft-closure path.
 
 ## Solve Interface
@@ -757,6 +759,8 @@ H8 拔模方向验证时，只需要修改 `-opt_draft_axes` 和输出前缀：
 ```sh
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
+
+该脚本默认使用 `81 x 31 x 21` 节点网格，即 `80 x 30 x 20` 个 H8 单元、`158193` 个位移自由度；默认 `OPT_LOAD=1e5`，把柔度放大到约 `1e2` 量级；默认 `OPT_CHECKPOINT_INTERVAL=0`，不写中间 checkpoint，只保留最终 checkpoint 和最终 VTK。
 
 EMsFEM ANN 优化仍保持 `-opt_draft_axes +z`；本次改动扩展的是 H8 优化器的有符号 x/y/z 闭包，EMsFEM ANN 仍是 Z 方向拔模闭包路径。
 
