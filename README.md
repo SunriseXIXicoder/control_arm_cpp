@@ -251,7 +251,9 @@ For H8 draft-direction verification, change only `-opt_draft_axes` and the outpu
   -opt_draft_axes +x,+y,+z -output_prefix result/layer2_h8_cantilever_plus_x_plus_y_plus_z
 ```
 
-`-opt_draft_axes` is the H8 signed draft-closure list. A single signed direction such as `+x` conservatively fills from detected solid cells toward the positive draw side. Opposite signs on the same axis, such as `+z,-z`, are treated as split draw and fill only the interval between solid cells in each axis-aligned column. Multiple axes, such as `+x,+y,+z`, are applied sequentially with max-density closure.
+`-opt_draft_axes` is the H8 signed draft-closure list. A single signed direction such as `+x` conservatively fills from detected solid cells toward the positive draw side. Opposite signs on the same axis, such as `+z,-z`, are treated as split draw and fill only the interval between solid cells in each axis-aligned column. Multiple axes, such as `+x,+y,+z`, are applied sequentially with max-density closure. H8 then applies `-opt_projected_volume_correction true` by default: the OC multiplier search evaluates each trial after filtering and draft closure, so the plotted post-closure physical volume is the constrained quantity.
+
+The absolute compliance in these rectangular examples is reported in SI units with the default load scale `-opt_load 1.0`, so values around `1e-8` can occur on small stiff meshes. For paper figures, compare relative compliance between cases or set a larger common load scale.
 
 The prepared Slurm array script for the five small H8 verification cases is:
 
@@ -746,7 +748,9 @@ H8 拔模方向验证时，只需要修改 `-opt_draft_axes` 和输出前缀：
   -opt_draft_axes +x,+y,+z -output_prefix result/layer2_h8_cantilever_plus_x_plus_y_plus_z
 ```
 
-`-opt_draft_axes` 是 H8 的有符号拔模闭包列表。单个有符号方向例如 `+x` 会从检测到的实体单元向正向开模侧做保守补齐；同一轴同时给出正负方向，例如 `+z,-z`，会按 split draw 处理，只填每根轴向柱内实体单元之间的间隙。多个轴例如 `+x,+y,+z` 会按顺序执行 max-density 闭包。
+`-opt_draft_axes` 是 H8 的有符号拔模闭包列表。单个有符号方向例如 `+x` 会从检测到的实体单元向正向开模侧做保守补齐；同一轴同时给出正负方向，例如 `+z,-z`，会按 split draw 处理，只填每根轴向柱内实体单元之间的间隙。多个轴例如 `+x,+y,+z` 会按顺序执行 max-density 闭包。H8 随后默认使用 `-opt_projected_volume_correction true`：OC 乘子搜索会对每个 trial 先做滤波和拔模闭包，再用闭包后的物理体积判断体积约束，因此图里绘制的闭包后物理体积就是被约束的量。
+
+这些矩形域算例的柔度按 SI 单位输出，默认载荷是 `-opt_load 1.0`，小网格高刚度结构出现 `1e-8` 量级并不奇怪。论文图中建议比较相对柔度，或统一设置更大的载荷尺度。
 
 五个 H8 小网格验证算例已经准备成 Slurm array 脚本：
 
