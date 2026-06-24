@@ -33,6 +33,8 @@ struct OptimizerOptions {
   PetscReal filter_radius = 0.0;
   PetscBool write_checkpoint = PETSC_FALSE;
   PetscInt checkpoint_interval = 0;
+  // 无控制臂 mask 的矩形域 benchmark 工况：cantilever 为端部弯曲，torsion 为端部扭转载荷。
+  char benchmark_case[32] = "cantilever";
   char checkpoint_prefix[PETSC_MAX_PATH_LEN] = "";
 };
 

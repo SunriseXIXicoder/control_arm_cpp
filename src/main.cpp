@@ -571,6 +571,10 @@ int main(int argc, char **argv) {
                                &optimizer_options.vtk_max_points, nullptr));
   PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_write_final_vtk",
                                 &optimizer_options.write_final_vtk, nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-benchmark_case",
+                                  optimizer_options.benchmark_case,
+                                  sizeof(optimizer_options.benchmark_case),
+                                  nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_filter_radius",
                                 &optimizer_options.filter_radius, nullptr));
   PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_write_checkpoint",
@@ -598,6 +602,10 @@ int main(int argc, char **argv) {
                                &ems_options.load_case, nullptr));
   PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-include_spring_load",
                                 &ems_options.include_spring_load, nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-benchmark_case",
+                                  ems_options.benchmark_case,
+                                  sizeof(ems_options.benchmark_case),
+                                  nullptr));
 
   PetscCall(PetscStrcmp(mode, "geometry", &is_geometry_mode));
   PetscCall(PetscStrcmp(mode, "solve", &is_solve_mode));

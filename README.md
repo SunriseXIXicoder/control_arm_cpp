@@ -63,6 +63,7 @@ Rules:
 | `-nx`, `-ny`, `-nz` | Nodal grid dimensions. DOF is `3*nx*ny*nz`. | `80 40 24` |
 | `-domain_height` | Physical height in meters; length and width are derived by project geometry helpers. | `0.08` |
 | `-control_arm_mask` | Use the control-arm solid/void mask. | `true` |
+| `-benchmark_case` | Rectangular no-mask benchmark load when `-control_arm_mask false`: `cantilever` or `torsion`. | `cantilever` |
 | `-void_density` | Density assigned to void/non-design regions. | `0.02` |
 | `-young_modulus` | Elastic modulus. | `2.1e11` |
 | `-penal` | SIMP penalty. | `3.0` |
@@ -129,6 +130,117 @@ mpirun -np 4 ./bin/control_arm_cpp \
   -output_prefix result/density_80_40_24
 ```
 
+## Paper Verification And Benchmark Cases
+
+### Layer 1: Draft-Constraint Verification
+
+Use `-mode density` with `-control_arm_mask false` to generate regular rectangular-domain density fields. The VTK contains `rho_initial`, `rho_filtered`, and `rho_projected`, so ParaView can show the three columns directly.
+
+No draft constraint:
+
+```sh
+mpirun -np 4 ./bin/control_arm_cpp \
+  -mode density \
+  -control_arm_mask false \
+  -nx 121 -ny 41 -nz 31 \
+  -filter_radius 1.5 \
+  -draft_radius 0 \
+  -draft_dirs +z \
+  -write_density_vtk true \
+  -density_vtk_file result/layer1_nodraft.vtk \
+  -write_density_binary true \
+  -output_prefix result/layer1_nodraft
+```
+
+Single-draw `+z`, single-draw `-z`, and split-draw `+z/-z`:
+
+```sh
+mpirun -np 4 ./bin/control_arm_cpp -mode density -control_arm_mask false \
+  -nx 121 -ny 41 -nz 31 -filter_radius 1.5 \
+  -draft_radius 6 -draft_pnorm 8 -draft_beta 8 -draft_eta 0.5 \
+  -draft_dirs +z -draft_combine max \
+  -write_density_vtk true -density_vtk_file result/layer1_plus_z.vtk \
+  -write_density_binary true -output_prefix result/layer1_plus_z
+
+mpirun -np 4 ./bin/control_arm_cpp -mode density -control_arm_mask false \
+  -nx 121 -ny 41 -nz 31 -filter_radius 1.5 \
+  -draft_radius 6 -draft_pnorm 8 -draft_beta 8 -draft_eta 0.5 \
+  -draft_dirs -z -draft_combine max \
+  -write_density_vtk true -density_vtk_file result/layer1_minus_z.vtk \
+  -write_density_binary true -output_prefix result/layer1_minus_z
+
+mpirun -np 4 ./bin/control_arm_cpp -mode density -control_arm_mask false \
+  -nx 121 -ny 41 -nz 31 -filter_radius 1.5 \
+  -draft_radius 6 -draft_pnorm 8 -draft_beta 8 -draft_eta 0.5 \
+  -draft_dirs +z,-z -draft_combine max \
+  -write_density_vtk true -density_vtk_file result/layer1_split_z.vtk \
+  -write_density_binary true -output_prefix result/layer1_split_z
+```
+
+### Layer 2: Classical Rectangular Benchmarks
+
+Set `-control_arm_mask false` to use a regular design box. The benchmark interface fixes the left end face and supports `-benchmark_case cantilever` for a tip bending load or `-benchmark_case torsion` for a free-end torque about the x-axis. The commands below use the full model; strict half/quarter symmetry needs additional component-wise symmetry-plane constraints.
+
+H8 upper-bound baseline without draft:
+
+```sh
+mpirun -np 8 ./bin/control_arm_cpp \
+  -mode optimize \
+  -operator h8_matrix_free \
+  -control_arm_mask false \
+  -benchmark_case cantilever \
+  -nx 121 -ny 41 -nz 31 \
+  -volfrac 0.30 \
+  -opt_max_iter 200 \
+  -opt_filter_radius 1.5 \
+  -opt_z_draft_closure false \
+  -opt_write_checkpoint true \
+  -opt_checkpoint_interval 50 \
+  -h8_pc_type aux_hypre \
+  -ksp_type fgmres \
+  -ksp_gmres_restart 200 \
+  -output_prefix result/layer2_h8_cantilever_nodraft
+```
+
+H8 `+Z` draft, H8 `+Z` draft with Heaviside, and EMsFEM ANN `+Z` draft:
+
+```sh
+mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
+  -control_arm_mask false -benchmark_case cantilever \
+  -nx 121 -ny 41 -nz 31 -volfrac 0.30 -opt_max_iter 200 \
+  -opt_filter_radius 1.5 -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_write_checkpoint true -opt_checkpoint_interval 50 \
+  -h8_pc_type aux_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
+  -output_prefix result/layer2_h8_cantilever_zdraft
+
+mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
+  -control_arm_mask false -benchmark_case cantilever \
+  -nx 121 -ny 41 -nz 31 -volfrac 0.30 -opt_max_iter 200 \
+  -opt_filter_radius 1.5 -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_heaviside_projection true -opt_heaviside_eta 0.5 \
+  -opt_heaviside_beta_initial 1 -opt_heaviside_beta_max 16 \
+  -opt_heaviside_beta_interval 50 \
+  -opt_write_checkpoint true -opt_checkpoint_interval 50 \
+  -h8_pc_type aux_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
+  -output_prefix result/layer2_h8_cantilever_zdraft_heaviside
+
+mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator emsfem_ann \
+  -control_arm_mask false -control_arm_bc false -benchmark_case cantilever \
+  -nx 121 -ny 41 -nz 31 -ems_sub_n 5 -ems_ann_dir ../input_5 \
+  -volfrac 0.30 -opt_max_iter 200 -opt_filter_radius 1.5 \
+  -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_write_checkpoint true -opt_checkpoint_interval 50 \
+  -ems_pc_type aux_ann_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
+  -output_prefix result/layer2_ems_ann_cantilever_zdraft
+```
+
+For the torsion beam, keep the same options and change only the benchmark case and output prefix:
+
+```sh
+  -benchmark_case torsion \
+  -output_prefix result/layer2_h8_torsion_zdraft
+```
+
 ## Solve Interface
 
 Format:
@@ -176,6 +288,7 @@ Format:
   -opt_move <real> \
   -opt_ksp_rtol <real> \
   -opt_ksp_max_it <int> \
+  [-control_arm_mask false -benchmark_case <cantilever|torsion>] \
   [-opt_heaviside_projection true -opt_heaviside_eta <real> \
    -opt_heaviside_beta_initial <real> -opt_heaviside_beta_max <real> \
    -opt_heaviside_beta_interval <int>] \
@@ -196,6 +309,7 @@ Important optimization options:
 | `-opt_rho_min` | Lower bound on design density. |
 | `-opt_write_checkpoint` | Write PETSc binary density/mask checkpoints. |
 | `-opt_stop_on_ksp_divergence` | Stop or skip unsafe optimization updates when KSP diverges. |
+| `-benchmark_case` | `cantilever` or `torsion` when `-control_arm_mask false`. |
 
 ### H8 Options
 
@@ -205,6 +319,7 @@ Important optimization options:
 | `-h8_dm_px`, `-h8_dm_py`, `-h8_dm_pz` | positive integers | Manually set the H8 3D process grid; product must equal MPI ranks. |
 | `-h8_load_case` | integer | Select H8 control-arm load case. |
 | `-h8_include_spring_load` | `true|false` | Include spring/bushing load contribution. |
+| `-benchmark_case` | `cantilever`, `torsion` | Select the no-mask rectangular benchmark load. |
 | `-h8_aux_rebuild_interval` | integer | Rebuild auxiliary matrix every N iterations. |
 | `-h8_reuse_initial_guess` | `true|false` | Reuse previous displacement as KSP initial guess. |
 
@@ -237,6 +352,7 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | `-ems_cache_element_matrices` | `true|false` | Cache EMsFEM element matrices; optimization requires `true`. |
 | `-ems_cache_gib_limit` | real | Per-rank cache limit in GiB; `0` means unlimited. |
 | `-control_arm_bc` | `true|false` | Use control-arm boundary conditions instead of simple test BC. |
+| `-benchmark_case` | `cantilever`, `torsion` | Select the no-mask rectangular benchmark load when `-control_arm_bc false`. |
 | `-load_case` | integer | `0` means weighted multi-case load set in the production scripts. |
 | `-include_spring_load` | `true|false` | Include spring/bushing load contribution. |
 | `-ems_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre`, `aux_ann_gamg`, `aux_ann_hypre` | Select the EMsFEM ANN preconditioner. Production default is `aux_ann_gamg`; HYPRE comparison uses `aux_ann_hypre`. |
@@ -421,6 +537,7 @@ mpirun -np <进程数> ./bin/control_arm_cpp \
 | `-nx`, `-ny`, `-nz` | 节点网格尺寸，总自由度为 `3*nx*ny*nz`。 | `80 40 24` |
 | `-domain_height` | 物理高度，单位米。 | `0.08` |
 | `-control_arm_mask` | 是否使用控制臂专用实体/空域 mask。 | `true` |
+| `-benchmark_case` | `-control_arm_mask false` 时的矩形域 benchmark 载荷：`cantilever` 或 `torsion`。 | `cantilever` |
 | `-void_density` | 空域或非设计域密度。 | `0.02` |
 | `-young_modulus` | 弹性模量。 | `2.1e11` |
 | `-penal` | SIMP 惩罚因子。 | `3.0` |
@@ -487,6 +604,117 @@ mpirun -np 4 ./bin/control_arm_cpp \
   -output_prefix result/density_80_40_24
 ```
 
+## 论文验证与经典 benchmark 算例
+
+### 第一层：拔模约束验证
+
+使用 `-mode density` 和 `-control_arm_mask false` 可以生成规则矩形设计域的密度流水线结果。输出 VTK 中包含 `rho_initial`、`rho_filtered` 和 `rho_projected`，在 ParaView 中可以直接做三列对比。
+
+无拔模约束：
+
+```sh
+mpirun -np 4 ./bin/control_arm_cpp \
+  -mode density \
+  -control_arm_mask false \
+  -nx 121 -ny 41 -nz 31 \
+  -filter_radius 1.5 \
+  -draft_radius 0 \
+  -draft_dirs +z \
+  -write_density_vtk true \
+  -density_vtk_file result/layer1_nodraft.vtk \
+  -write_density_binary true \
+  -output_prefix result/layer1_nodraft
+```
+
+`+z` 单向拔模、`-z` 单向拔模和 `+z/-z` split draw：
+
+```sh
+mpirun -np 4 ./bin/control_arm_cpp -mode density -control_arm_mask false \
+  -nx 121 -ny 41 -nz 31 -filter_radius 1.5 \
+  -draft_radius 6 -draft_pnorm 8 -draft_beta 8 -draft_eta 0.5 \
+  -draft_dirs +z -draft_combine max \
+  -write_density_vtk true -density_vtk_file result/layer1_plus_z.vtk \
+  -write_density_binary true -output_prefix result/layer1_plus_z
+
+mpirun -np 4 ./bin/control_arm_cpp -mode density -control_arm_mask false \
+  -nx 121 -ny 41 -nz 31 -filter_radius 1.5 \
+  -draft_radius 6 -draft_pnorm 8 -draft_beta 8 -draft_eta 0.5 \
+  -draft_dirs -z -draft_combine max \
+  -write_density_vtk true -density_vtk_file result/layer1_minus_z.vtk \
+  -write_density_binary true -output_prefix result/layer1_minus_z
+
+mpirun -np 4 ./bin/control_arm_cpp -mode density -control_arm_mask false \
+  -nx 121 -ny 41 -nz 31 -filter_radius 1.5 \
+  -draft_radius 6 -draft_pnorm 8 -draft_beta 8 -draft_eta 0.5 \
+  -draft_dirs +z,-z -draft_combine max \
+  -write_density_vtk true -density_vtk_file result/layer1_split_z.vtk \
+  -write_density_binary true -output_prefix result/layer1_split_z
+```
+
+### 第二层：经典矩形域结构 benchmark
+
+设置 `-control_arm_mask false` 后，程序使用无 mask 的规则矩形设计域。benchmark 接口固定左端面；`-benchmark_case cantilever` 对应右端弯曲载荷，`-benchmark_case torsion` 对应右端绕 x 轴扭转载荷。下面命令使用完整模型；如果论文需要严格半模型或四分之一模型，还需要额外增加分量式对称面约束。
+
+H8 无拔模基准：
+
+```sh
+mpirun -np 8 ./bin/control_arm_cpp \
+  -mode optimize \
+  -operator h8_matrix_free \
+  -control_arm_mask false \
+  -benchmark_case cantilever \
+  -nx 121 -ny 41 -nz 31 \
+  -volfrac 0.30 \
+  -opt_max_iter 200 \
+  -opt_filter_radius 1.5 \
+  -opt_z_draft_closure false \
+  -opt_write_checkpoint true \
+  -opt_checkpoint_interval 50 \
+  -h8_pc_type aux_hypre \
+  -ksp_type fgmres \
+  -ksp_gmres_restart 200 \
+  -output_prefix result/layer2_h8_cantilever_nodraft
+```
+
+H8 `+Z` 拔模、H8 `+Z` 拔模加 Heaviside，以及 EMsFEM ANN `+Z` 拔模：
+
+```sh
+mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
+  -control_arm_mask false -benchmark_case cantilever \
+  -nx 121 -ny 41 -nz 31 -volfrac 0.30 -opt_max_iter 200 \
+  -opt_filter_radius 1.5 -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_write_checkpoint true -opt_checkpoint_interval 50 \
+  -h8_pc_type aux_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
+  -output_prefix result/layer2_h8_cantilever_zdraft
+
+mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator h8_matrix_free \
+  -control_arm_mask false -benchmark_case cantilever \
+  -nx 121 -ny 41 -nz 31 -volfrac 0.30 -opt_max_iter 200 \
+  -opt_filter_radius 1.5 -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_heaviside_projection true -opt_heaviside_eta 0.5 \
+  -opt_heaviside_beta_initial 1 -opt_heaviside_beta_max 16 \
+  -opt_heaviside_beta_interval 50 \
+  -opt_write_checkpoint true -opt_checkpoint_interval 50 \
+  -h8_pc_type aux_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
+  -output_prefix result/layer2_h8_cantilever_zdraft_heaviside
+
+mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator emsfem_ann \
+  -control_arm_mask false -control_arm_bc false -benchmark_case cantilever \
+  -nx 121 -ny 41 -nz 31 -ems_sub_n 5 -ems_ann_dir ../input_5 \
+  -volfrac 0.30 -opt_max_iter 200 -opt_filter_radius 1.5 \
+  -opt_z_draft_closure true -opt_z_draft_eta 0.5 \
+  -opt_write_checkpoint true -opt_checkpoint_interval 50 \
+  -ems_pc_type aux_ann_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
+  -output_prefix result/layer2_ems_ann_cantilever_zdraft
+```
+
+扭转梁只需要把同一套命令中的 benchmark 和输出前缀改掉：
+
+```sh
+  -benchmark_case torsion \
+  -output_prefix result/layer2_h8_torsion_zdraft
+```
+
 ## 求解接口
 
 格式：
@@ -534,6 +762,7 @@ mpirun -np 4 ./bin/control_arm_cpp \
   -opt_move <实数> \
   -opt_ksp_rtol <实数> \
   -opt_ksp_max_it <整数> \
+  [-control_arm_mask false -benchmark_case <cantilever|torsion>] \
   [-opt_heaviside_projection true -opt_heaviside_eta <实数> \
    -opt_heaviside_beta_initial <实数> -opt_heaviside_beta_max <实数> \
    -opt_heaviside_beta_interval <整数>] \
@@ -554,6 +783,7 @@ mpirun -np 4 ./bin/control_arm_cpp \
 | `-opt_rho_min` | 设计变量密度下界。 |
 | `-opt_write_checkpoint` | 写 PETSc 二进制密度/mask checkpoint。 |
 | `-opt_stop_on_ksp_divergence` | KSP 发散时停止或跳过不可靠更新。 |
+| `-benchmark_case` | `-control_arm_mask false` 时选择 `cantilever` 或 `torsion`。 |
 
 ### H8 专用参数
 
@@ -563,6 +793,7 @@ mpirun -np 4 ./bin/control_arm_cpp \
 | `-h8_dm_px`, `-h8_dm_py`, `-h8_dm_pz` | 正整数 | 手动指定 H8 三维进程网格，乘积必须等于 MPI 进程数。 |
 | `-h8_load_case` | 整数 | 选择 H8 控制臂载荷工况。 |
 | `-h8_include_spring_load` | `true|false` | 是否包含弹簧/衬套区域载荷。 |
+| `-benchmark_case` | `cantilever`, `torsion` | 选择无 mask 矩形域 benchmark 载荷。 |
 | `-h8_aux_rebuild_interval` | 整数 | 每隔多少步重建辅助矩阵。 |
 | `-h8_reuse_initial_guess` | `true|false` | 是否复用上一轮位移作为 KSP 初值。 |
 
@@ -595,6 +826,7 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | `-ems_cache_element_matrices` | `true|false` | 是否缓存 EMsFEM 单元矩阵；优化模式要求为 `true`。 |
 | `-ems_cache_gib_limit` | 实数 | 每个 rank 的缓存上限，单位 GiB；`0` 表示不限。 |
 | `-control_arm_bc` | `true|false` | 是否使用控制臂专用边界条件。 |
+| `-benchmark_case` | `cantilever`, `torsion` | `-control_arm_bc false` 时选择无 mask 矩形域 benchmark 载荷。 |
 | `-load_case` | 整数 | 在生产脚本中，`0` 表示加权多工况载荷。 |
 | `-include_spring_load` | `true|false` | 是否包含弹簧/衬套区域载荷。 |
 | `-ems_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre`, `aux_ann_gamg`, `aux_ann_hypre` | 选择 EMsFEM ANN 预条件器。生产默认 `aux_ann_gamg`，HYPRE 对照可用 `aux_ann_hypre`。 |

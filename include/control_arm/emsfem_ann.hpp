@@ -26,6 +26,8 @@ struct EmSfemAnnOptions {
   PetscInt load_case = 2;
   // 是否同时包含弹簧/衬套区域载荷。
   PetscBool include_spring_load = PETSC_TRUE;
+  // 无控制臂边界条件时使用的矩形域 benchmark：cantilever 或 torsion。
+  char benchmark_case[32] = "cantilever";
 };
 
 // 创建一次 EMsFEM ANN 线性求解所需的 matrix-free 矩阵、位移向量和载荷向量。

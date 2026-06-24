@@ -1737,6 +1737,10 @@ PetscBool simple_fixed_node(PetscInt i) {
   return i == 0 ? PETSC_TRUE : PETSC_FALSE;
 }
 
+PetscBool benchmark_is_torsion(const char *benchmark_case) {
+  return std::strcmp(benchmark_case, "torsion") == 0 ? PETSC_TRUE : PETSC_FALSE;
+}
+
 // 根据当前几何模式统一判断节点是否固定。
 // 控制臂模式调用 control_arm_fixed_node，简单模式调用 simple_fixed_node。
 // 这样矩阵乘法和载荷装配不需要关心具体几何类型。
@@ -2115,18 +2119,58 @@ PetscErrorCode fill_control_arm_load(DM da,
 // 控制臂生产算例一般不会走这个简单载荷路径。
 PetscErrorCode fill_simple_tip_load(DM da,
                                     const Grid &grid,
+                                    const char *benchmark_case,
                                     PetscReal load,
                                     Vec b) {
   PetscScalar ****bg = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscReal local_torsion_denom = 0.0;
+  PetscReal global_torsion_denom = 0.0;
+  const PetscBool torsion = benchmark_is_torsion(benchmark_case);
+
+  PetscCheck(torsion || std::strcmp(benchmark_case, "cantilever") == 0,
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "-benchmark_case must be cantilever or torsion");
   PetscCall(VecSet(b, 0.0));
-  PetscCall(DMDAVecGetArrayDOF(da, b, &bg));
   PetscCall(DMDAGetCorners(da, &xs, &ys, &zs, &xm, &ym, &zm));
+  if (torsion) {
+    for (PetscInt k = zs; k < zs + zm; ++k) {
+      for (PetscInt j = ys; j < ys + ym; ++j) {
+        for (PetscInt i = xs; i < xs + xm; ++i) {
+          if (i != grid.nx - 1) continue;
+          PetscReal x = 0.0, y = 0.0, z = 0.0;
+          node_xyz(i, j, k, grid, &x, &y, &z);
+          const PetscReal yc = y - 0.5 * domain_width(grid);
+          const PetscReal zc = z - 0.5 * domain_height(grid);
+          local_torsion_denom += yc * yc + zc * zc;
+        }
+      }
+    }
+    PetscCallMPI(MPI_Allreduce(&local_torsion_denom, &global_torsion_denom,
+                               1, MPIU_REAL, MPI_SUM, PETSC_COMM_WORLD));
+    PetscCheck(global_torsion_denom > PETSC_SMALL, PETSC_COMM_WORLD,
+               PETSC_ERR_ARG_WRONG,
+               "Torsion benchmark needs a non-degenerate free-end face");
+  }
+
+  PetscCall(DMDAVecGetArrayDOF(da, b, &bg));
   for (PetscInt k = zs; k < zs + zm; ++k) {
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         if (i == grid.nx - 1) {
-          bg[k][j][i][2] = -load / static_cast<PetscReal>(grid.ny * grid.nz);
+          if (torsion) {
+            PetscReal x = 0.0, y = 0.0, z = 0.0;
+            node_xyz(i, j, k, grid, &x, &y, &z);
+            const PetscReal yc = y - 0.5 * domain_width(grid);
+            const PetscReal zc = z - 0.5 * domain_height(grid);
+            // 右端面切向力形成绕 x 轴的扭矩，用于无 mask 矩形域扭转梁。
+            bg[k][j][i][1] += -load * zc / global_torsion_denom;
+            bg[k][j][i][2] += load * yc / global_torsion_denom;
+          } else {
+            // 经典 3D 悬臂梁：右端面均布 -Z 方向载荷。
+            bg[k][j][i][2] += -load /
+                               static_cast<PetscReal>(grid.ny * grid.nz);
+          }
         }
       }
     }
@@ -3404,6 +3448,7 @@ PetscErrorCode write_ems_summary(const char *output_prefix,
   PetscCall(PetscViewerASCIIPrintf(viewer, "fine_density_cells=%lld\n",
                                    static_cast<long long>(fine_cell_count(grid, ems.sub_n))));
   PetscCall(PetscViewerASCIIPrintf(viewer, "control_arm_bc=%d\n", static_cast<int>(ems.control_arm_bc)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "benchmark_case=%s\n", ems.benchmark_case));
   PetscCall(PetscViewerASCIIPrintf(viewer, "max_iter=%lld\n", static_cast<long long>(opt.max_iter)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "volfrac_target=%.12e\n", static_cast<double>(opt.volfrac)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "young_modulus=%.12e\n",
@@ -3627,7 +3672,8 @@ PetscErrorCode fill_optimizer_load(DM uda,
     case_options.load_case = load_case;
     PetscCall(fill_control_arm_load(uda, grid, case_options, load, b));
   } else {
-    PetscCall(fill_simple_tip_load(uda, grid, load, b));
+    PetscCall(fill_simple_tip_load(uda, grid, ems_options.benchmark_case,
+                                   load, b));
   }
   return 0;
 }
@@ -3718,14 +3764,16 @@ PetscErrorCode create_emsfem_ann_system(const Grid &grid,
   if (ems_options.control_arm_bc) {
     PetscCall(fill_control_arm_load(ctx->da, grid, ems_options, load_scale, *b));
   } else {
-    PetscCall(fill_simple_tip_load(ctx->da, grid, load_scale, *b));
+    PetscCall(fill_simple_tip_load(ctx->da, grid, ems_options.benchmark_case,
+                                   load_scale, *b));
   }
   PetscCall(VecSet(*u, 0.0));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "EMsFEM ANN system ready: sub_n=%lld fixed_nodes=%lld control_arm_bc=%d\n",
+                        "EMsFEM ANN system ready: sub_n=%lld fixed_nodes=%lld control_arm_bc=%d benchmark_case=%s\n",
                         static_cast<long long>(ems_options.sub_n),
                         static_cast<long long>(global_fixed),
-                        static_cast<int>(ems_options.control_arm_bc)));
+                        static_cast<int>(ems_options.control_arm_bc),
+                        ems_options.benchmark_case));
   return 0;
 }
 

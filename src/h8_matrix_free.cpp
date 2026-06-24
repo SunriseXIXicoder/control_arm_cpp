@@ -4,6 +4,8 @@
 
 #include <petscmath.h>
 
+#include <cstring>
+
 namespace control_arm {
 namespace {
 
@@ -252,18 +254,80 @@ PetscErrorCode h8_destroy(Mat A) {
   return 0;
 }
 
+PetscBool benchmark_is_torsion(const char *benchmark_case) {
+  return std::strcmp(benchmark_case, "torsion") == 0 ? PETSC_TRUE : PETSC_FALSE;
+}
+
 PetscErrorCode fill_h8_load(DM da, const Grid &grid, PetscReal load, Vec b) {
   PetscScalar ****bg = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  char benchmark_case[32] = "cantilever";
+  PetscReal local_torsion_denom = 0.0;
+  PetscReal global_torsion_denom = 0.0;
 
   PetscCall(VecSet(b, 0.0));
-  PetscCall(DMDAVecGetArrayDOF(da, b, &bg));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr, "-benchmark_case",
+                                  benchmark_case, sizeof(benchmark_case),
+                                  nullptr));
+  const PetscBool torsion = benchmark_is_torsion(benchmark_case);
+  PetscCheck(torsion || std::strcmp(benchmark_case, "cantilever") == 0,
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "-benchmark_case must be cantilever or torsion");
   PetscCall(DMDAGetCorners(da, &xs, &ys, &zs, &xm, &ym, &zm));
+  if (torsion) {
+    for (PetscInt k = zs; k < zs + zm; ++k) {
+      for (PetscInt j = ys; j < ys + ym; ++j) {
+        for (PetscInt i = xs; i < xs + xm; ++i) {
+          if (i != grid.nx - 1) continue;
+          const PetscReal y =
+              grid.ny > 1 ? static_cast<PetscReal>(j) /
+                                static_cast<PetscReal>(grid.ny - 1) *
+                                domain_width(grid)
+                          : 0.0;
+          const PetscReal z =
+              grid.nz > 1 ? static_cast<PetscReal>(k) /
+                                static_cast<PetscReal>(grid.nz - 1) *
+                                domain_height(grid)
+                          : 0.0;
+          const PetscReal yc = y - 0.5 * domain_width(grid);
+          const PetscReal zc = z - 0.5 * domain_height(grid);
+          local_torsion_denom += yc * yc + zc * zc;
+        }
+      }
+    }
+    PetscCallMPI(MPI_Allreduce(&local_torsion_denom, &global_torsion_denom,
+                               1, MPIU_REAL, MPI_SUM, PETSC_COMM_WORLD));
+    PetscCheck(global_torsion_denom > PETSC_SMALL, PETSC_COMM_WORLD,
+               PETSC_ERR_ARG_WRONG,
+               "Torsion benchmark needs a non-degenerate free-end face");
+  }
+
+  PetscCall(DMDAVecGetArrayDOF(da, b, &bg));
   for (PetscInt k = zs; k < zs + zm; ++k) {
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         if (i == grid.nx - 1) {
-          bg[k][j][i][2] = -load / static_cast<PetscReal>(grid.ny * grid.nz);
+          if (torsion) {
+            const PetscReal y =
+                grid.ny > 1 ? static_cast<PetscReal>(j) /
+                                  static_cast<PetscReal>(grid.ny - 1) *
+                                  domain_width(grid)
+                            : 0.0;
+            const PetscReal z =
+                grid.nz > 1 ? static_cast<PetscReal>(k) /
+                                  static_cast<PetscReal>(grid.nz - 1) *
+                                  domain_height(grid)
+                            : 0.0;
+            const PetscReal yc = y - 0.5 * domain_width(grid);
+            const PetscReal zc = z - 0.5 * domain_height(grid);
+            // 右端面切向力形成绕 x 轴的扭矩，用于无 mask 矩形域扭转梁。
+            bg[k][j][i][1] += -load * zc / global_torsion_denom;
+            bg[k][j][i][2] += load * yc / global_torsion_denom;
+          } else {
+            // 经典 3D 悬臂梁：右端面均布 -Z 方向载荷。
+            bg[k][j][i][2] += -load /
+                               static_cast<PetscReal>(grid.ny * grid.nz);
+          }
         }
       }
     }

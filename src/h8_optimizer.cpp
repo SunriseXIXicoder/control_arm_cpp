@@ -121,8 +121,17 @@ PetscBool h8_is_c_support_node(PetscInt i, PetscInt j, PetscInt k,
 }
 
 PetscBool h8_is_fixed_node(PetscInt i, PetscInt j, PetscInt k,
-                           const Grid &grid) {
+                           const Grid &grid,
+                           const DensityOptions &options) {
+  (void)j;
+  (void)k;
+  // 无控制臂 mask 的 benchmark 使用规则矩形域：左端面全约束，右端面施加载荷。
+  if (!options.use_control_arm_mask) return i == 0 ? PETSC_TRUE : PETSC_FALSE;
   return h8_is_c_support_node(i, j, k, grid);
+}
+
+PetscBool benchmark_is_torsion(const char *benchmark_case) {
+  return std::strcmp(benchmark_case, "torsion") == 0 ? PETSC_TRUE : PETSC_FALSE;
 }
 
 PetscBool h8_is_ab_load_node(PetscInt i, PetscInt j, PetscInt k,
@@ -222,6 +231,7 @@ void h8_cell_center_physical(PetscInt i, PetscInt j, PetscInt k,
 PetscBool h8_cell_is_forced_solid(PetscInt i, PetscInt j, PetscInt k,
                                   const Grid &grid,
                                   const DensityOptions &options) {
+  // 无 mask 矩形域没有控制臂专用硬实体区域，固定端只通过位移边界条件施加。
   if (!options.use_control_arm_mask) return PETSC_FALSE;
 
   const PetscReal DL = domain_length(grid);
@@ -920,7 +930,7 @@ PetscErrorCode h8_opt_mult(Mat A, Vec x, Vec y) {
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         for (PetscInt c = 0; c < 3; ++c) {
-          if (h8_is_fixed_node(i, j, k, g)) {
+          if (h8_is_fixed_node(i, j, k, g, ctx->density_options)) {
             yg[k][j][i][c] = xg[k][j][i][c];
             continue;
           }
@@ -941,7 +951,7 @@ PetscErrorCode h8_opt_mult(Mat A, Vec x, Vec y) {
                 for (PetscInt col_node = 0; col_node < 8; ++col_node) {
                   PetscInt ni = 0, nj = 0, nk = 0;
                   h8_node_coords(ex, ey, ez, col_node, &ni, &nj, &nk);
-                  if (h8_is_fixed_node(ni, nj, nk, g)) continue;
+                  if (h8_is_fixed_node(ni, nj, nk, g, ctx->density_options)) continue;
                   for (PetscInt d = 0; d < 3; ++d) {
                     const PetscInt col = 3 * col_node + d;
                     value += scale * ctx->ke[24 * row + col] * xg[nk][nj][ni][d];
@@ -980,7 +990,7 @@ PetscErrorCode h8_opt_get_diagonal(Mat A, Vec diag_vec) {
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         for (PetscInt c = 0; c < 3; ++c) {
-          if (h8_is_fixed_node(i, j, k, g)) {
+          if (h8_is_fixed_node(i, j, k, g, ctx->density_options)) {
             diag[k][j][i][c] = 1.0;
             continue;
           }
@@ -1096,7 +1106,7 @@ PetscErrorCode h8_block_jacobi_setup(PC pc) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         PetscReal block[9] = {};
         PetscReal inverse[9] = {};
-        if (h8_is_fixed_node(i, j, k, g)) {
+        if (h8_is_fixed_node(i, j, k, g, ctx->density_options)) {
           block[0] = 1.0;
           block[4] = 1.0;
           block[8] = 1.0;
@@ -1282,7 +1292,7 @@ PetscErrorCode assemble_h8_aux_laplacian_matrix(DM uda, DM eda, Vec rho,
           row.k = k;
           row.c = c;
 
-          if (h8_is_fixed_node(i, j, k, grid)) {
+          if (h8_is_fixed_node(i, j, k, grid, density_options)) {
             cols[0] = row;
             vals[0] = 1.0;
             PetscCall(MatSetValuesStencil(P, 1, &row, 1, cols, vals,
@@ -1303,7 +1313,7 @@ PetscErrorCode assemble_h8_aux_laplacian_matrix(DM uda, DM eda, Vec rho,
             const PetscReal kij =
                 weight[q] * edge_stiffness(rho0, rho1, density_options);
             diag += kij;
-            if (!h8_is_fixed_node(ii, jj, kk, grid)) {
+            if (!h8_is_fixed_node(ii, jj, kk, grid, density_options)) {
               cols[ncols].i = ii;
               cols[ncols].j = jj;
               cols[ncols].k = kk;
@@ -1360,7 +1370,7 @@ PetscErrorCode assemble_h8_aux_elasticity_matrix(DM uda, DM eda, Vec rho,
           row.k = k;
           row.c = c;
 
-          if (h8_is_fixed_node(i, j, k, grid)) {
+          if (h8_is_fixed_node(i, j, k, grid, density_options)) {
             cols[0] = row;
             vals[0] = 1.0;
             PetscCall(MatSetValuesStencil(P, 1, &row, 1, cols, vals,
@@ -1385,7 +1395,7 @@ PetscErrorCode assemble_h8_aux_elasticity_matrix(DM uda, DM eda, Vec rho,
                 for (PetscInt col_node = 0; col_node < 8; ++col_node) {
                   PetscInt ni = 0, nj = 0, nk = 0;
                   h8_node_coords(ex, ey, ez, col_node, &ni, &nj, &nk);
-                  if (h8_is_fixed_node(ni, nj, nk, grid)) continue;
+                  if (h8_is_fixed_node(ni, nj, nk, grid, density_options)) continue;
                   for (PetscInt d = 0; d < 3; ++d) {
                     const PetscInt ecol = 3 * col_node + d;
                     cols[ncols].i = ni;
@@ -1865,7 +1875,7 @@ PetscErrorCode add_h8_control_arm_load_case(DM uda, DM eda, Vec mask,
   for (PetscInt k = zs; k < zs + zm; ++k) {
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
-        if (h8_is_fixed_node(i, j, k, grid)) continue;
+        if (h8_is_c_support_node(i, j, k, grid)) continue;
         if (!h8_node_has_active_adjacent_element(mg, grid, i, j, k)) continue;
         PetscReal x = 0.0, y = 0.0, z = 0.0;
         h8_node_physical(i, j, k, grid, &x, &y, &z);
@@ -1903,26 +1913,94 @@ PetscErrorCode add_h8_control_arm_load_case(DM uda, DM eda, Vec mask,
   return 0;
 }
 
+PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
+                                      const OptimizerOptions &optimizer_options,
+                                      Vec b) {
+  PetscScalar ****bg = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscReal local_torsion_denom = 0.0;
+  PetscReal global_torsion_denom = 0.0;
+  const PetscBool torsion = benchmark_is_torsion(optimizer_options.benchmark_case);
+
+  PetscCheck(torsion ||
+                 std::strcmp(optimizer_options.benchmark_case, "cantilever") == 0,
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "-benchmark_case must be cantilever or torsion");
+
+  PetscCall(VecSet(b, 0.0));
+  PetscCall(DMDAGetCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
+  if (torsion) {
+    for (PetscInt k = zs; k < zs + zm; ++k) {
+      for (PetscInt j = ys; j < ys + ym; ++j) {
+        for (PetscInt i = xs; i < xs + xm; ++i) {
+          if (i != grid.nx - 1) continue;
+          PetscReal x = 0.0, y = 0.0, z = 0.0;
+          h8_node_physical(i, j, k, grid, &x, &y, &z);
+          const PetscReal yc = y - 0.5 * domain_width(grid);
+          const PetscReal zc = z - 0.5 * domain_height(grid);
+          local_torsion_denom += yc * yc + zc * zc;
+        }
+      }
+    }
+    PetscCallMPI(MPI_Allreduce(&local_torsion_denom, &global_torsion_denom,
+                               1, MPIU_REAL, MPI_SUM, PETSC_COMM_WORLD));
+    PetscCheck(global_torsion_denom > PETSC_SMALL, PETSC_COMM_WORLD,
+               PETSC_ERR_ARG_WRONG,
+               "Torsion benchmark needs a non-degenerate free-end face");
+  }
+
+  PetscCall(DMDAVecGetArrayDOF(uda, b, &bg));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        if (i != grid.nx - 1) continue;
+        if (torsion) {
+          PetscReal x = 0.0, y = 0.0, z = 0.0;
+          h8_node_physical(i, j, k, grid, &x, &y, &z);
+          const PetscReal yc = y - 0.5 * domain_width(grid);
+          const PetscReal zc = z - 0.5 * domain_height(grid);
+          // 右端面切向力形成绕 x 轴的扭矩，合力近似为零，适合扭转梁 benchmark。
+          bg[k][j][i][1] += -optimizer_options.load * zc / global_torsion_denom;
+          bg[k][j][i][2] += optimizer_options.load * yc / global_torsion_denom;
+        } else {
+          // 经典 3D 悬臂梁：右端面均布 -Z 方向载荷。
+          bg[k][j][i][2] +=
+              -optimizer_options.load /
+              static_cast<PetscReal>(grid.ny * grid.nz);
+        }
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayDOF(uda, b, &bg));
+  return 0;
+}
+
 PetscErrorCode fill_h8_load(DM uda, DM eda, Vec mask, const Grid &grid,
-                            PetscReal load, Vec b) {
+                            const DensityOptions &density_options,
+                            const OptimizerOptions &optimizer_options, Vec b) {
   PetscInt load_case = 0;
   PetscBool include_spring_load = PETSC_TRUE;
+  if (!density_options.use_control_arm_mask) {
+    PetscCall(fill_h8_benchmark_load(uda, grid, optimizer_options, b));
+    return 0;
+  }
+
   PetscCall(h8_get_load_options(&load_case, &include_spring_load));
   PetscCall(VecSet(b, 0.0));
   if (load_case >= 1 && load_case <= 3) {
     PetscCall(add_h8_control_arm_load_case(uda, eda, mask, grid,
-                                           load, load_case, 1.0,
-                                           include_spring_load, b));
+                                           optimizer_options.load, load_case,
+                                           1.0, include_spring_load, b));
   } else {
     for (PetscInt c = 1; c <= 3; ++c) {
-      PetscCall(add_h8_control_arm_load_case(uda, eda, mask, grid, load, c,
+      PetscCall(add_h8_control_arm_load_case(uda, eda, mask, grid,
+                                             optimizer_options.load, c,
                                              h8_control_arm_case_weight(c),
                                              include_spring_load, b));
     }
   }
   return 0;
 }
-
 PetscErrorCode compute_h8_sensitivity(DM uda, DM eda, Vec u, Vec rho, Vec mask,
                                       const Grid &grid,
                                       const DensityOptions &density_options,
@@ -1969,7 +2047,7 @@ PetscErrorCode compute_h8_sensitivity(DM uda, DM eda, Vec u, Vec rho, Vec mask,
           h8_node_coords(ex, ey, ez, node, &ni, &nj, &nk);
           for (PetscInt c = 0; c < 3; ++c) {
             ue[3 * node + c] =
-                h8_is_fixed_node(ni, nj, nk, grid)
+                h8_is_fixed_node(ni, nj, nk, grid, density_options)
                     ? 0.0
                     : PetscRealPart(ug[nk][nj][ni][c]);
           }
@@ -2710,6 +2788,8 @@ PetscErrorCode write_h8_summary(const char *output_prefix, const Grid &grid,
                                    opt.z_draft_closure ? "true" : "false"));
   PetscCall(PetscViewerASCIIPrintf(viewer, "z_draft_eta=%.12e\n",
                                    static_cast<double>(opt.z_draft_eta)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "benchmark_case=%s\n",
+                                   opt.benchmark_case));
   PetscCall(PetscViewerASCIIPrintf(viewer, "h8_load_case=%lld\n",
                                    static_cast<long long>(load_case)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "h8_include_spring_load=%s\n",
@@ -2938,7 +3018,8 @@ PetscErrorCode run_h8_full_vtk_postprocess(const Grid &grid,
 
   PetscCall(DMCreateGlobalVector(uda, &u));
   PetscCall(VecDuplicate(u, &b));
-  PetscCall(fill_h8_load(uda, eda, mask, grid, optimizer_options.load, b));
+  PetscCall(fill_h8_load(uda, eda, mask, grid, density_options,
+                         optimizer_options, b));
   PetscCall(create_h8_shell_matrix(uda, eda, rho, grid, density_options, &A));
   PetscCall(get_h8_pc_type_option(h8_pc_type, sizeof(h8_pc_type),
                                   &use_aux_matrix));
@@ -3066,7 +3147,8 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(VecDuplicate(u, &b));
   PetscCall(DMCreateGlobalVector(eda, &dc_phys));
   PetscCall(VecDuplicate(dc_phys, &dc_design));
-  PetscCall(fill_h8_load(uda, eda, mask, grid, optimizer_options.load, b));
+  PetscCall(fill_h8_load(uda, eda, mask, grid, density_options,
+                         optimizer_options, b));
   PetscCall(VecNorm(b, NORM_2, &rhs_norm));
   PetscCall(create_h8_shell_matrix(uda, eda, rho_phys, grid, density_options, &A));
   PetscCall(get_h8_pc_type_option(h8_pc_type, sizeof(h8_pc_type),
@@ -3113,17 +3195,25 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                         "H8 stop on KSP divergence: %s\n",
                         stop_on_ksp_divergence ? "true" : "false"));
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "H8 hard regions/BC: A/B/C rings and spring mount are locked; C ring is fixed; A/B rings plus spring mount are loaded; z_draft_closure=%s eta=%g\n",
-                        optimizer_options.z_draft_closure ? "true" : "false",
-                        static_cast<double>(optimizer_options.z_draft_eta)));
-  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "H8 load options: load_case=%lld (%s), include_spring_load=%s\n",
-                        static_cast<long long>(h8_load_case),
-                        (h8_load_case >= 1 && h8_load_case <= 3)
-                            ? "single case"
-                            : "AHP weighted combined cases",
-                        h8_include_spring_load ? "true" : "false"));
+  if (density_options.use_control_arm_mask) {
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                          "H8 hard regions/BC: A/B/C rings and spring mount are locked; C ring is fixed; A/B rings plus spring mount are loaded; z_draft_closure=%s eta=%g\n",
+                          optimizer_options.z_draft_closure ? "true" : "false",
+                          static_cast<double>(optimizer_options.z_draft_eta)));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                          "H8 load options: load_case=%lld (%s), include_spring_load=%s\n",
+                          static_cast<long long>(h8_load_case),
+                          (h8_load_case >= 1 && h8_load_case <= 3)
+                              ? "single case"
+                              : "AHP weighted combined cases",
+                          h8_include_spring_load ? "true" : "false"));
+  } else {
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                          "H8 rectangular benchmark: case=%s, left face fixed, right face loaded; z_draft_closure=%s eta=%g\n",
+                          optimizer_options.benchmark_case,
+                          optimizer_options.z_draft_closure ? "true" : "false",
+                          static_cast<double>(optimizer_options.z_draft_eta)));
+  }
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                         "H8 RHS norm ||b||_2=%.6e. History logs both absolute KSP residual and residual/||b||.\n",
                         static_cast<double>(rhs_norm)));
