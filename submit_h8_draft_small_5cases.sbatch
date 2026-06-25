@@ -2,6 +2,7 @@
 # H8 小网格拔模方向验证：5 个 array 任务分别对应 +x、+y、+z/+x、+z/-z、+x/+y/+z。
 # 默认使用无 mask 矩形悬臂梁，适合先看约束是否改变密度形态。
 # 提交方式：sbatch submit_h8_draft_small_5cases.sbatch
+# 单独跑 split draw 时也可用：CASE_ID=3 sbatch submit_h8_draft_small_5cases.sbatch
 # 默认网格为 61x31x31 节点，长:宽:高约为 2:1:1，约 1.76e5 位移自由度；OPT_LOAD=1e5 将柔度放大到约 1e2 量级。
 # 默认跑 500 步，Heaviside beta 每 50 步翻倍到 16；保留完整优化历史，不做候选回滚。
 # 若要保持 2:1:1，建议设置 NX=2*(NZ-1)+1 且 NY=NZ，例如 NX=81 NY=41 NZ=41。
@@ -49,7 +50,7 @@ export OPENBLAS_NUM_THREADS=1
 ulimit -s unlimited || true
 ulimit -l unlimited || true
 
-CASE_ID="${SLURM_ARRAY_TASK_ID:-0}"
+CASE_ID="${CASE_ID:-${SLURM_ARRAY_TASK_ID:-0}}"
 DRAFT_AXES_LIST=("+x" "+y" "+z,+x" "+z,-z" "+x,+y,+z")
 RUN_NAMES=("plus_x" "plus_y" "plus_z_plus_x" "split_z" "plus_x_plus_y_plus_z")
 if [ "${CASE_ID}" -lt 0 ] || [ "${CASE_ID}" -ge "${#DRAFT_AXES_LIST[@]}" ]; then
@@ -96,7 +97,8 @@ PETSC_EXTRA_OPTIONS="${PETSC_EXTRA_OPTIONS:--ksp_gmres_restart 200 -ksp_norm_typ
 CXXSTD="${CXXSTD:-c++11}"
 JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-manual}}"
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
-PREFIX="${OUTPUT_PREFIX:-result/h8_draft_small_${RUN_NAME}_${NX}_${NY}_${NZ}_${JOB_ID}}"
+CASE_DIR="${OUTPUT_DIR:-result/h8_draft_small_${RUN_NAME}_${NX}_${NY}_${NZ}_${JOB_ID}}"
+PREFIX="${OUTPUT_PREFIX:-${CASE_DIR}/${RUN_NAME}}"
 TOTAL_TASKS="${SLURM_NPROCS:-${SLURM_NTASKS:-8}}"
 MPI_LAUNCHER="${MPI_LAUNCHER:-mpirun}"
 MPI_LAUNCHER_ARGS="${MPI_LAUNCHER_ARGS:-}"
@@ -112,13 +114,17 @@ if [ -n "${H8_DM_PX:-}" ] || [ -n "${H8_DM_PY:-}" ] || [ -n "${H8_DM_PZ:-}" ]; t
 fi
 
 cd "$SUBMIT_DIR"
-mkdir -p bin result logs
+mkdir -p bin result logs "${CASE_DIR}"
+if [ "${H8_TEE_CASE_LOG:-true}" = "true" ]; then
+  exec > >(tee "${CASE_DIR}/slurm.out") 2> >(tee "${CASE_DIR}/slurm.err" >&2)
+fi
 echo "Start time: $(date)"
 echo "Submit dir: ${SUBMIT_DIR}"
 echo "Run host: $(hostname)"
 echo "Job id: ${JOB_ID}"
 echo "Array case: ${CASE_ID} ${RUN_NAME}"
 echo "Draft axes: ${DRAFT_AXES}"
+echo "Case dir: ${CASE_DIR}"
 echo "Slurm nodes: ${SLURM_JOB_NODELIST:-unknown}"
 if [ -f scripts/h8_slurm_guard.sh ]; then
   . scripts/h8_slurm_guard.sh

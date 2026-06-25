@@ -261,7 +261,15 @@ The prepared Slurm array script for the five small H8 verification cases is:
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
 
-This script defaults to `61 x 31 x 31` nodes (`60 x 30 x 30` H8 elements, `175863` displacement DOF), giving an approximately `2:1:1` rectangular cantilever (`0.16 m x 0.08 m x 0.08 m` with the default height). It uses `OPT_MAX_ITER=500`, `OPT_LOAD=1e5`, `OPT_HEAVISIDE=true`, `OPT_HEAVISIDE_BETA_INTERVAL=50`, `OPT_MOVE=0.025`, `OPT_CHECKPOINT_INTERVAL=0`, and `H8_PC_TYPE=aux_elastic_hypre`, so intermediate checkpoints are skipped and only the final checkpoint/final VTK are kept. It keeps the full H8 optimization history without candidate rollback and sets `OPT_PROJECTED_VOLUME_CORRECTION=true` to constrain the post-closure physical volume by trial-level OC lambda search.
+To run only the `+z,-z` split-draw case with more MPI ranks:
+
+```sh
+sbatch submit_h8_draft_split_z.sbatch
+```
+
+The split-z script defaults to 32 MPI ranks on one node. For more parallelism, use Slurm overrides such as `sbatch -N 2 --ntasks-per-node=32 submit_h8_draft_split_z.sbatch`.
+
+These scripts default to `61 x 31 x 31` nodes (`60 x 30 x 30` H8 elements, `175863` displacement DOF), giving an approximately `2:1:1` rectangular cantilever (`0.16 m x 0.08 m x 0.08 m` with the default height). They use `OPT_MAX_ITER=500`, `OPT_LOAD=1e5`, `OPT_HEAVISIDE=true`, `OPT_HEAVISIDE_BETA_INTERVAL=50`, `OPT_MOVE=0.025`, `OPT_CHECKPOINT_INTERVAL=0`, and `H8_PC_TYPE=aux_elastic_hypre`, so intermediate checkpoints are skipped and only the final checkpoint/final VTK are kept. Each case writes into its own directory such as `result/h8_draft_small_split_z_61_31_31_<JOB_ID>/`; override with `OUTPUT_DIR=<dir>` or `OUTPUT_PREFIX=<prefix>`. The scripts keep the full H8 optimization history without candidate rollback and set `OPT_PROJECTED_VOLUME_CORRECTION=true` to constrain the post-closure physical volume by trial-level OC lambda search.
 
 For Heaviside continuation, read `heaviside_beta` in the H8 history CSV; a beta stage change is a new projected-density mapping, so interpret compliance curves stage by stage.
 
@@ -469,6 +477,7 @@ sbatch --export=ALL,KEY=value,KEY=value script.sbatch
 | `submit_h8_opt_10m.sbatch` | H8 10M-DOF diagnostic optimization. | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `H8_PC_TYPE`, `PETSC_EXTRA_OPTIONS` |
 | `submit_h8_opt_100m.sbatch` | H8 100M-DOF production optimization. | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `H8_PC_TYPE`, `H8_DM_PX/PY/PZ`, `RUN_LABEL` |
 | `submit_h8_opt_100m_1step.sbatch` | One-step 100M-DOF H8 smoke run. | same as H8 production |
+| `submit_h8_draft_split_z.sbatch` | Small H8 `+z,-z` split-draw verification case. | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `OUTPUT_DIR`, `H8_PC_TYPE`, `PETSC_EXTRA_OPTIONS` |
 | `submit_ems_ann_scale.sbatch` | EMsFEM ANN optimization. | `NELX/NELY/NELZ` or `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
 | `submit_h8_postprocess_100m.sbatch` | Convert H8 checkpoint to downsampled VTK. | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `POST_STRIDE`, `VTK_FILE` |
 | `submit_h8_full_vtk_100m.sbatch` | Write full-resolution H8 `.pvti` and `.vti` pieces. | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `H8_PC_TYPE` |
@@ -762,7 +771,15 @@ H8 拔模方向验证时，只需要修改 `-opt_draft_axes` 和输出前缀：
 sbatch submit_h8_draft_small_5cases.sbatch
 ```
 
-该脚本默认使用 `61 x 31 x 31` 节点网格，即 `60 x 30 x 30` 个 H8 单元、`175863` 个位移自由度，对应约 `2:1:1` 的矩形悬臂梁；默认高度为 `0.08 m` 时，物理尺寸约为 `0.16 m x 0.08 m x 0.08 m`。默认 `OPT_MAX_ITER=500`、`OPT_LOAD=1e5`、`OPT_HEAVISIDE=true`、`OPT_HEAVISIDE_BETA_INTERVAL=50`、`OPT_MOVE=0.025`、`OPT_CHECKPOINT_INTERVAL=0`、`H8_PC_TYPE=aux_elastic_hypre`，不写中间 checkpoint，只保留最终 checkpoint 和最终 VTK。脚本保留完整 H8 优化历史，不做候选回滚；并设置 `OPT_PROJECTED_VOLUME_CORRECTION=true`，通过 trial 级 OC lambda 搜索约束闭包后的物理体积。
+只跑 `+z,-z` split draw 单算例时，用这个脚本：
+
+```sh
+sbatch submit_h8_draft_split_z.sbatch
+```
+
+`submit_h8_draft_split_z.sbatch` 默认单节点 32 个 MPI rank。若要多开，可以用 Slurm 覆盖，例如 `sbatch -N 2 --ntasks-per-node=32 submit_h8_draft_split_z.sbatch`。
+
+这些脚本默认使用 `61 x 31 x 31` 节点网格，即 `60 x 30 x 30` 个 H8 单元、`175863` 个位移自由度，对应约 `2:1:1` 的矩形悬臂梁；默认高度为 `0.08 m` 时，物理尺寸约为 `0.16 m x 0.08 m x 0.08 m`。默认 `OPT_MAX_ITER=500`、`OPT_LOAD=1e5`、`OPT_HEAVISIDE=true`、`OPT_HEAVISIDE_BETA_INTERVAL=50`、`OPT_MOVE=0.025`、`OPT_CHECKPOINT_INTERVAL=0`、`H8_PC_TYPE=aux_elastic_hypre`，不写中间 checkpoint，只保留最终 checkpoint 和最终 VTK。每个算例会写入独立目录，例如 `result/h8_draft_small_split_z_61_31_31_<JOB_ID>/`；可用 `OUTPUT_DIR=<目录>` 或 `OUTPUT_PREFIX=<前缀>` 覆盖。脚本保留完整 H8 优化历史，不做候选回滚；并设置 `OPT_PROJECTED_VOLUME_CORRECTION=true`，通过 trial 级 OC lambda 搜索约束闭包后的物理体积。
 
 使用 Heaviside continuation 时，请结合 H8 history CSV 里的 `heaviside_beta` 字段分阶段解读曲线；beta 阶段切换代表投影密度映射发生了变化。
 
@@ -970,6 +987,7 @@ sbatch --export=ALL,KEY=value,KEY=value script.sbatch
 | `submit_h8_opt_10m.sbatch` | H8 约 10M 自由度诊断优化。 | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `H8_PC_TYPE`, `PETSC_EXTRA_OPTIONS` |
 | `submit_h8_opt_100m.sbatch` | H8 约 100M 自由度生产优化。 | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `H8_PC_TYPE`, `H8_DM_PX/PY/PZ`, `RUN_LABEL` |
 | `submit_h8_opt_100m_1step.sbatch` | H8 100M 一步烟雾测试。 | 同 H8 生产脚本 |
+| `submit_h8_draft_split_z.sbatch` | H8 小网格 `+z,-z` split draw 验证算例。 | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `OUTPUT_DIR`, `H8_PC_TYPE`, `PETSC_EXTRA_OPTIONS` |
 | `submit_ems_ann_scale.sbatch` | EMsFEM ANN 优化。 | `NELX/NELY/NELZ` 或 `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
 | `submit_h8_postprocess_100m.sbatch` | 将 H8 checkpoint 转为降采样 VTK。 | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `POST_STRIDE`, `VTK_FILE` |
 | `submit_h8_full_vtk_100m.sbatch` | 写 H8 全分辨率 `.pvti` 和 `.vti` 分片。 | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `H8_PC_TYPE` |
