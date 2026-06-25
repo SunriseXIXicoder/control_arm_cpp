@@ -998,12 +998,12 @@ PetscErrorCode apply_axis_draft_closure(DM eda, Vec mask, PetscReal eta,
   return 0;
 }
 
-PetscErrorCode apply_h8_draft_closure(DM eda, Vec mask,
-                                      const OptimizerOptions &options,
-                                      Vec rho) {
+PetscErrorCode collect_h8_effective_draft_axes(
+    const OptimizerOptions &options, std::vector<H8DraftDirection> *effective) {
   std::vector<H8DraftDirection> dirs;
   bool processed_axis[3] = {false, false, false};
 
+  effective->clear();
   if (!options.z_draft_closure) return 0;
   PetscCall(parse_h8_draft_axes(options.draft_axes, &dirs));
   if (dirs.empty()) return 0;
@@ -1027,9 +1027,23 @@ PetscErrorCode apply_h8_draft_closure(DM eda, Vec mask,
       effective_sign = has_plus ? 1 : -1;
     }
 
-    PetscCall(apply_axis_draft_closure(eda, mask, options.z_draft_eta, axis,
-                                       effective_sign, rho));
+    H8DraftDirection effective_dir;
+    effective_dir.axis = axis;
+    effective_dir.sign = effective_sign;
+    effective->push_back(effective_dir);
     processed_axis[axis] = true;
+  }
+  return 0;
+}
+
+PetscErrorCode apply_h8_draft_closure(DM eda, Vec mask,
+                                      const OptimizerOptions &options,
+                                      Vec rho) {
+  std::vector<H8DraftDirection> dirs;
+  PetscCall(collect_h8_effective_draft_axes(options, &dirs));
+  for (const H8DraftDirection &dir : dirs) {
+    PetscCall(apply_axis_draft_closure(eda, mask, options.z_draft_eta,
+                                       dir.axis, dir.sign, rho));
   }
   return 0;
 }
@@ -2337,7 +2351,11 @@ PetscReal trial_rho(PetscReal rho, PetscReal dc, PetscReal dv, PetscReal mask,
                     PetscReal lambda, const OptimizerOptions &opt) {
   if (h8_mask_is_fixed_solid(mask)) return 1.0;
   if (!h8_mask_is_design(mask)) return 0.0;
-  if (dv <= 0.0) return opt.rho_min;
+  if (dv <= 0.0) {
+    // 闭包伴随后，部分被其它峰值覆盖的单元可能对闭包后体积导数为 0；
+    // 这类退化点仍必须遵守 move limit，不能一步跳到 rho_min。
+    return PetscMax(opt.rho_min, rho - opt.move);
+  }
   const PetscReal safe_lambda = PetscMax(lambda, 1.0e-300);
   const PetscReal ratio = PetscMax(1.0e-16, -dc / (safe_lambda * dv));
   PetscReal value = rho * PetscSqrtReal(ratio);
@@ -2456,10 +2474,11 @@ PetscErrorCode h8_write_trial_design(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
 
 PetscErrorCode h8_projected_trial_volume(DM eda, Vec rho, Vec mask, Vec dc,
                                          Vec dv, Vec filter_denom,
-                                         PetscReal lambda,
+                                         PetscReal lambda, PetscReal beta,
                                          const DensityOptions &density_options,
                                          const OptimizerOptions &opt,
                                          Vec trial_design,
+                                         Vec trial_filtered,
                                          Vec trial_phys,
                                          PetscReal *volume) {
   PetscCall(h8_write_trial_design(eda, rho, mask, dc, dv, lambda,
@@ -2467,30 +2486,33 @@ PetscErrorCode h8_projected_trial_volume(DM eda, Vec rho, Vec mask, Vec dc,
                                   nullptr));
   PetscCall(apply_density_filter(eda, trial_design, mask, filter_denom,
                                  opt.filter_radius,
-                                 density_options.void_density, trial_phys));
+                                 density_options.void_density,
+                                 trial_filtered));
+  PetscCall(apply_h8_heaviside_projection(
+      eda, trial_filtered, mask, opt, beta, density_options.void_density,
+      trial_phys));
   PetscCall(apply_h8_draft_closure(eda, mask, opt, trial_phys));
   PetscCall(compute_masked_volume_fraction(eda, trial_phys, mask, volume));
   return 0;
 }
 
-PETSC_UNUSED PetscErrorCode
-oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
-                           Vec filter_denom,
-                           const DensityOptions &density_options,
-                           const OptimizerOptions &opt,
-                           PetscReal *max_change) {
+PetscErrorCode oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc,
+                                          Vec dv, Vec filter_denom,
+                                          PetscReal beta,
+                                          const DensityOptions &density_options,
+                                          const OptimizerOptions &opt,
+                                          PetscReal *max_change) {
   Vec trial_design = nullptr;
+  Vec trial_filtered = nullptr;
   Vec trial_phys = nullptr;
   const PetscReal target = opt.volfrac;
   PetscReal l1 = 1.0e-300;
   PetscReal l2 = 1.0e-24;
   PetscReal best_lambda = l1;
   PetscReal best_error = PETSC_MAX_REAL;
-  PetscBool have_feasible = PETSC_FALSE;
-  PetscReal best_feasible_lambda = l1;
-  PetscReal best_feasible_underuse = PETSC_MAX_REAL;
 
   PetscCall(VecDuplicate(rho, &trial_design));
+  PetscCall(VecDuplicate(rho, &trial_filtered));
   PetscCall(VecDuplicate(rho, &trial_phys));
 
   auto consider = [&](PetscReal lambda, PetscReal volume) {
@@ -2499,33 +2521,28 @@ oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
       best_error = error;
       best_lambda = lambda;
     }
-    if (volume <= target) {
-      const PetscReal underuse = target - volume;
-      if (!have_feasible || underuse < best_feasible_underuse) {
-        have_feasible = PETSC_TRUE;
-        best_feasible_underuse = underuse;
-        best_feasible_lambda = lambda;
-      }
-    }
   };
 
   PetscReal v1 = 0.0;
   PetscReal v2 = 0.0;
   PetscCall(h8_projected_trial_volume(eda, rho, mask, dc, dv, filter_denom,
-                                      l1, density_options, opt, trial_design,
-                                      trial_phys, &v1));
+                                      l1, beta, density_options, opt,
+                                      trial_design, trial_filtered, trial_phys,
+                                      &v1));
   consider(l1, v1);
   PetscCall(h8_projected_trial_volume(eda, rho, mask, dc, dv, filter_denom,
-                                      l2, density_options, opt, trial_design,
-                                      trial_phys, &v2));
+                                      l2, beta, density_options, opt,
+                                      trial_design, trial_filtered, trial_phys,
+                                      &v2));
   consider(l2, v2);
   while (v2 > target && l2 < 1.0e100) {
     l1 = l2;
     v1 = v2;
     l2 *= 10.0;
     PetscCall(h8_projected_trial_volume(eda, rho, mask, dc, dv, filter_denom,
-                                        l2, density_options, opt,
-                                        trial_design, trial_phys, &v2));
+                                        l2, beta, density_options, opt,
+                                        trial_design, trial_filtered,
+                                        trial_phys, &v2));
     consider(l2, v2);
   }
 
@@ -2534,9 +2551,9 @@ oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
       const PetscReal lambda = 0.5 * (l1 + l2);
       PetscReal volume = 0.0;
       PetscCall(h8_projected_trial_volume(eda, rho, mask, dc, dv,
-                                          filter_denom, lambda,
-                                          density_options, opt,
-                                          trial_design, trial_phys, &volume));
+                                          filter_denom, lambda, beta,
+                                          density_options, opt, trial_design,
+                                          trial_filtered, trial_phys, &volume));
       consider(lambda, volume);
       if (volume > target) {
         l1 = lambda;
@@ -2546,19 +2563,15 @@ oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
     }
   }
 
-  const PetscReal final_lambda =
-      have_feasible ? best_feasible_lambda : best_lambda;
-  if (!have_feasible) {
-    PetscCall(PetscPrintf(
-        PETSC_COMM_WORLD,
-        "Warning: projected-volume OC update found no feasible post-closure volume; using closest trial.\n"));
-  }
-  // 用闭包后的物理体积筛选 lambda；最终只写回设计变量，下一轮再重新滤波和闭包。
+  const PetscReal final_lambda = best_lambda;
+  // 拔模闭包可能让 trial 体积呈现离散跳变；选离目标最近的 trial，
+  // 允许体积在目标附近轻微上下摆动，避免单侧欠用体积造成反复震荡。
   PetscCall(h8_write_trial_design(eda, rho, mask, dc, dv, final_lambda,
                                   density_options, opt, trial_design,
                                   max_change));
   PetscCall(VecCopy(trial_design, rho));
   PetscCall(VecDestroy(&trial_phys));
+  PetscCall(VecDestroy(&trial_filtered));
   PetscCall(VecDestroy(&trial_design));
   return 0;
 }
@@ -3625,7 +3638,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                           output_prefix));
   PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, hist_path, &hist));
   PetscCall(PetscViewerASCIIPrintf(hist,
-                                   "iter,compliance,volume,raw_design_volume,effective_raw_volfrac,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_reason,ksp_reason_name,ksp_residual,rhs_norm,ksp_relative_residual,filter_s,linear_solve_s,sensitivity_s,update_s,checkpoint_s,iter_total_s\n"));
+                                   "iter,compliance,volume,raw_design_volume,volume_target_for_update,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_reason,ksp_reason_name,ksp_residual,rhs_norm,ksp_relative_residual,filter_s,linear_solve_s,sensitivity_s,update_s,checkpoint_s,iter_total_s\n"));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                         "Optimize mode: h8_matrix_free nx=%lld ny=%lld nz=%lld size=%.4gm x %.4gm x %.4gm max_iter=%lld volfrac=%g filter_radius=%g\n",
                         static_cast<long long>(grid.nx),
@@ -3817,15 +3830,20 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscCall(compute_masked_volume_fraction(eda, rho_design, mask,
                                              &raw_design_volume));
     projected_volume_gap = volume - raw_design_volume;
-    if (optimizer_options.projected_volume_correction) {
-      effective_raw_volfrac = optimizer_options.volfrac - projected_volume_gap;
-      effective_raw_volfrac =
-          PetscMax(optimizer_options.rho_min, PetscMin(1.0, effective_raw_volfrac));
-    }
     OptimizerOptions step_options = optimizer_options;
-    step_options.volfrac = effective_raw_volfrac;
-    PetscCall(oc_update(eda, rho_design, mask, dc_design, dv_design,
-                        density_options, step_options, &change));
+    if (optimizer_options.projected_volume_correction) {
+      // 直接用“滤波 -> Heaviside -> 拔模闭包”后的物理体积选择 OC
+      // lambda，避免把闭包体积差线性折算成 raw 目标后产生来回跳变。
+      effective_raw_volfrac = optimizer_options.volfrac;
+      step_options.volfrac = optimizer_options.volfrac;
+      PetscCall(oc_update_projected_volume(
+          eda, rho_design, mask, dc_design, dv_design, filter_denom,
+          current_beta, density_options, step_options, &change));
+    } else {
+      step_options.volfrac = effective_raw_volfrac;
+      PetscCall(oc_update(eda, rho_design, mask, dc_design, dv_design,
+                          density_options, step_options, &change));
+    }
     PetscCall(elapsed_max(stage_start, &update_time));
 
     PetscCall(PetscTime(&stage_start));
@@ -3872,7 +3890,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscCall(write_objective_volume_history(output_prefix, objective_history,
                                              optimizer_options.volfrac));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                          "it=%lld compliance=%.6e volume=%.6f raw_volume=%.6f raw_target=%.6f projected_gap=%.3e beta=%.3g change=%.3e ksp_it=%lld ksp_reason=%d(%s) residual=%.3e rel_res=%.3e time[s]: filter=%.3g linear_solve=%.3g sens=%.3g update=%.3g checkpoint=%.3g total=%.3g\n",
+                          "it=%lld compliance=%.6e volume=%.6f raw_volume=%.6f volume_target=%.6f projected_gap=%.3e beta=%.3g change=%.3e ksp_it=%lld ksp_reason=%d(%s) residual=%.3e rel_res=%.3e time[s]: filter=%.3g linear_solve=%.3g sens=%.3g update=%.3g checkpoint=%.3g total=%.3g\n",
                           static_cast<long long>(iter),
                           static_cast<double>(compliance),
                           static_cast<double>(volume),

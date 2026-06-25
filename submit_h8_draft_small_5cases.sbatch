@@ -2,9 +2,9 @@
 # H8 小网格拔模方向验证：5 个 array 任务分别对应 +x、+y、+z/+x、+z/-z、+x/+y/+z。
 # 默认使用无 mask 矩形悬臂梁，适合先看约束是否改变密度形态。
 # 提交方式：sbatch submit_h8_draft_small_5cases.sbatch
-# 默认网格为 81x31x21 节点，约 1.58e5 位移自由度；OPT_LOAD=1e5 将柔度放大到约 1e2 量级。
+# 默认网格为 61x31x31 节点，长:宽:高约为 2:1:1，约 1.76e5 位移自由度；OPT_LOAD=1e5 将柔度放大到约 1e2 量级。
 # 默认跑 500 步，Heaviside beta 每 50 步翻倍到 16；保留完整优化历史，不做候选回滚。
-# 常用覆盖示例：NX=121 NY=41 NZ=31 OPT_MAX_ITER=500 sbatch submit_h8_draft_small_5cases.sbatch
+# 若要保持 2:1:1，建议设置 NX=2*(NZ-1)+1 且 NY=NZ，例如 NX=81 NY=41 NZ=41。
 #SBATCH -J h8_draft5
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=8
@@ -59,9 +59,9 @@ fi
 DRAFT_AXES="${DRAFT_AXES_LIST[$CASE_ID]}"
 RUN_NAME="${RUN_NAMES[$CASE_ID]}"
 
-NX="${NX:-81}"
+NX="${NX:-61}"
 NY="${NY:-31}"
-NZ="${NZ:-21}"
+NZ="${NZ:-31}"
 DOMAIN_HEIGHT="${DOMAIN_HEIGHT:-0.08}"
 BENCHMARK_CASE="${BENCHMARK_CASE:-cantilever}"
 VOLFRAC="${VOLFRAC:-0.30}"
@@ -75,7 +75,7 @@ OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
 OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"
 OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
 OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-50}"
-# H8 小算例使用平滑的闭包后体积修正：修正下一步 raw 体积分数，不做 trial 级闭包后二分。
+# H8 小算例用闭包后的物理体积做 trial 级 OC lambda 搜索，不改动体积敏度本身。
 OPT_PROJECTED_VOLUME_CORRECTION="${OPT_PROJECTED_VOLUME_CORRECTION:-true}"
 YOUNG_MODULUS="${YOUNG_MODULUS:-2.1e11}"
 PENAL="${PENAL:-3.0}"
@@ -88,7 +88,7 @@ KSP_TYPE="${KSP_TYPE:-fgmres}"
 # 0 表示不写中间 checkpoint；代码仍会在最终步写 final checkpoint。
 OPT_CHECKPOINT_INTERVAL="${OPT_CHECKPOINT_INTERVAL:-0}"
 OPT_WRITE_FINAL_VTK="${OPT_WRITE_FINAL_VTK:-true}"
-H8_PC_TYPE="${H8_PC_TYPE:-aux_hypre}"
+H8_PC_TYPE="${H8_PC_TYPE:-aux_elastic_hypre}"
 H8_AUX_REBUILD_INTERVAL="${H8_AUX_REBUILD_INTERVAL:-1}"
 H8_REUSE_INITIAL_GUESS="${H8_REUSE_INITIAL_GUESS:-true}"
 OPT_STOP_ON_KSP_DIVERGENCE="${OPT_STOP_ON_KSP_DIVERGENCE:-true}"
