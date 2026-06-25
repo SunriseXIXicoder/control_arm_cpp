@@ -13,6 +13,7 @@ import argparse
 from array import array
 import math
 import os
+import re
 import struct
 import sys
 from pathlib import Path
@@ -99,6 +100,7 @@ def coarse_position(point_index: int, sampled_points: int, coarse_nodes: int) ->
 
 def write_displacement_vectors(
     out,
+    name: str,
     displacement_path: Path,
     nx: int,
     ny: int,
@@ -112,8 +114,7 @@ def write_displacement_vectors(
     def value(i: int, j: int, k: int, c: int) -> float:
         return u[3 * (i + nx * (j + ny * k)) + c]
 
-    out.write(f"POINT_DATA {(ncx + 1) * (ncy + 1) * (ncz + 1)}\n")
-    out.write("VECTORS displacement double\n")
+    out.write(f"VECTORS {name} double\n")
     for pk in range(ncz + 1):
         ck, tz = coarse_position(pk, ncz + 1, nz)
         wz = (1.0 - tz, tz)
@@ -131,6 +132,15 @@ def write_displacement_vectors(
                             for c in (0, 1, 2):
                                 disp[c] += w * value(ci + dx, cj + dy, ck + dz, c)
                 out.write(f"{disp[0]:.12e} {disp[1]:.12e} {disp[2]:.12e}\n")
+
+
+def displacement_field_name(path: Path, index: int) -> str:
+    match = re.search(r"_u_case_(\d+)", path.name)
+    if match:
+        return f"displacement_case_{match.group(1)}"
+    if index == 0:
+        return "displacement"
+    return f"displacement_{index + 1}"
 
 
 def write_scalar(
@@ -176,10 +186,142 @@ def write_scalar(
                 mask_file.close()
 
 
-def write_vtk(
+def vtk_line(out: BinaryIO, text: str) -> None:
+    out.write((text + "\n").encode("ascii"))
+
+
+def read_row_np(f: BinaryIO, data_offset: int, fnx: int, fny: int, j: int, k: int):
+    import numpy as np
+
+    idx = (k * fny + j) * fnx
+    f.seek(data_offset + idx * 8)
+    raw = f.read(fnx * 8)
+    if len(raw) != fnx * 8:
+        raise EOFError("unexpected end of PETSc Vec while reading a fine-density row")
+    return np.frombuffer(raw, dtype=">f8")
+
+
+def coarse_position_arrays(sampled_points: int, coarse_nodes: int):
+    import numpy as np
+
+    if coarse_nodes <= 1 or sampled_points <= 1:
+        return np.zeros(sampled_points, dtype=np.intp), np.zeros(sampled_points)
+    pos = (coarse_nodes - 1) * np.arange(sampled_points, dtype=np.float64) / (sampled_points - 1)
+    base = np.floor(pos).astype(np.intp)
+    base = np.minimum(base, coarse_nodes - 2)
+    return base, pos - base
+
+
+def read_displacement_array_np(path: Path, nx: int, ny: int, nz: int):
+    import numpy as np
+
+    expected_entries = nx * ny * nz * 3
+    _, offset = check_vec(path, expected_entries)
+    with path.open("rb") as f:
+        f.seek(offset)
+        data = np.fromfile(f, dtype=">f8", count=expected_entries)
+    if data.size != expected_entries:
+        raise EOFError(
+            f"unexpected end of PETSc Vec while reading {path}: "
+            f"got {data.size} entries, expected {expected_entries}"
+        )
+    return data.astype(np.float64).reshape((nz, ny, nx, 3))
+
+
+def write_displacement_vectors_binary(
+    out: BinaryIO,
+    name: str,
+    displacement_path: Path,
+    nx: int,
+    ny: int,
+    nz: int,
+    ncx: int,
+    ncy: int,
+    ncz: int,
+) -> None:
+    import numpy as np
+
+    vtk_line(out, f"VECTORS {name} double")
+    u = read_displacement_array_np(displacement_path, nx, ny, nz)
+    x0, tx = coarse_position_arrays(ncx + 1, nx)
+    y0, ty = coarse_position_arrays(ncy + 1, ny)
+    z0, tz = coarse_position_arrays(ncz + 1, nz)
+    x1 = np.minimum(x0 + 1, nx - 1)
+    wx0 = (1.0 - tx)[:, None]
+    wx1 = tx[:, None]
+
+    for pk in range(ncz + 1):
+        z_base = int(z0[pk])
+        wz0 = 1.0 - float(tz[pk])
+        wz1 = float(tz[pk])
+        for pj in range(ncy + 1):
+            y_base = int(y0[pj])
+            wy0 = 1.0 - float(ty[pj])
+            wy1 = float(ty[pj])
+            row = (
+                u[z_base, y_base, x0, :] * (wz0 * wy0) * wx0
+                + u[z_base, y_base, x1, :] * (wz0 * wy0) * wx1
+                + u[z_base, y_base + 1, x0, :] * (wz0 * wy1) * wx0
+                + u[z_base, y_base + 1, x1, :] * (wz0 * wy1) * wx1
+                + u[z_base + 1, y_base, x0, :] * (wz1 * wy0) * wx0
+                + u[z_base + 1, y_base, x1, :] * (wz1 * wy0) * wx1
+                + u[z_base + 1, y_base + 1, x0, :] * (wz1 * wy1) * wx0
+                + u[z_base + 1, y_base + 1, x1, :] * (wz1 * wy1) * wx1
+            )
+            out.write(row.astype(">f8", copy=False).tobytes())
+    out.write(b"\n")
+
+
+def write_scalar_binary(
+    out: BinaryIO,
+    name: str,
+    rho_path: Path,
+    rho_offset: int,
+    mask_path: Path | None,
+    mask_offset: int | None,
+    fnx: int,
+    fny: int,
+    xs: list[int],
+    ys: list[int],
+    zs: list[int],
+    mode: str,
+) -> None:
+    import numpy as np
+
+    vtk_line(out, f"SCALARS {name} double 1")
+    vtk_line(out, "LOOKUP_TABLE default")
+    x_index = np.asarray(xs, dtype=np.intp)
+    with rho_path.open("rb") as rho_file:
+        mask_file = mask_path.open("rb") if mask_path is not None else None
+        try:
+            for k in zs:
+                for j in ys:
+                    rho_row = read_row_np(rho_file, rho_offset, fnx, fny, j, k)[x_index]
+                    mask_row = (
+                        read_row_np(mask_file, mask_offset, fnx, fny, j, k)[x_index]
+                        if mask_file is not None and mask_offset is not None
+                        else None
+                    )
+                    if mode == "rho":
+                        values = np.maximum(rho_row, 0.0)
+                    elif mode == "rho_plot":
+                        mask_values = 1.0 if mask_row is None else np.maximum(mask_row, 0.0)
+                        values = np.where(mask_values > 0.5, np.maximum(rho_row, 0.0), 0.0)
+                    elif mode == "mask":
+                        values = np.ones_like(rho_row) if mask_row is None else np.maximum(mask_row, 0.0)
+                    else:
+                        raise ValueError(f"unknown scalar mode {mode}")
+                    out.write(values.astype(">f8", copy=False).tobytes())
+        finally:
+            if mask_file is not None:
+                mask_file.close()
+    out.write(b"\n")
+
+
+def write_vtk_binary(
     rho_path: Path,
     mask_path: Path | None,
-    displacement_path: Path | None,
+    displacement_paths: list[Path],
     out_path: Path,
     nx: int,
     ny: int,
@@ -213,6 +355,104 @@ def write_vtk(
     width = height * (ny - 1) / max(1, nz - 1)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    with out_path.open("wb") as out:
+        vtk_line(out, "# vtk DataFile Version 3.0")
+        vtk_line(out, "EMsFEM ANN fine-density checkpoint")
+        vtk_line(out, "BINARY")
+        vtk_line(out, "DATASET STRUCTURED_POINTS")
+        vtk_line(out, f"DIMENSIONS {ncx + 1} {ncy + 1} {ncz + 1}")
+        vtk_line(out, "ORIGIN 0 0 0")
+        vtk_line(out, f"SPACING {length / ncx:.17g} {width / ncy:.17g} {height / ncz:.17g}")
+
+        if displacement_paths:
+            vtk_line(out, f"POINT_DATA {(ncx + 1) * (ncy + 1) * (ncz + 1)}")
+            for index, displacement_path in enumerate(displacement_paths):
+                write_displacement_vectors_binary(
+                    out,
+                    displacement_field_name(displacement_path, index),
+                    displacement_path,
+                    nx,
+                    ny,
+                    nz,
+                    ncx,
+                    ncy,
+                    ncz,
+                )
+
+        vtk_line(out, f"CELL_DATA {sampled_cells}")
+        write_scalar_binary(
+            out, "rho", rho_path, rho_offset, mask_path, mask_offset,
+            fnx, fny, xs, ys, zs, "rho"
+        )
+        write_scalar_binary(
+            out, "rho_plot", rho_path, rho_offset, mask_path, mask_offset,
+            fnx, fny, xs, ys, zs, "rho_plot"
+        )
+        write_scalar_binary(
+            out, "design_mask", rho_path, rho_offset, mask_path, mask_offset,
+            fnx, fny, xs, ys, zs, "mask"
+        )
+
+    print(
+        f"Wrote {out_path} ({sampled_cells} sampled cells from {fine_cells} fine cells, "
+        f"stride={stride}, binary=True)"
+    )
+
+
+def write_vtk(
+    rho_path: Path,
+    mask_path: Path | None,
+    displacement_paths: list[Path],
+    out_path: Path,
+    nx: int,
+    ny: int,
+    nz: int,
+    sub_n: int,
+    height: float,
+    stride: int,
+    max_cells: int,
+    binary: bool = False,
+) -> None:
+    if binary:
+        write_vtk_binary(
+            rho_path,
+            mask_path,
+            displacement_paths,
+            out_path,
+            nx,
+            ny,
+            nz,
+            sub_n,
+            height,
+            stride,
+            max_cells,
+        )
+        return
+
+    fnx = (nx - 1) * sub_n
+    fny = (ny - 1) * sub_n
+    fnz = (nz - 1) * sub_n
+    fine_cells = fnx * fny * fnz
+    _, rho_offset = check_vec(rho_path, fine_cells)
+    mask_offset = None
+    if mask_path is not None:
+        _, mask_offset = check_vec(mask_path, fine_cells)
+
+    xs = sampled_indices(fnx, stride)
+    ys = sampled_indices(fny, stride)
+    zs = sampled_indices(fnz, stride)
+    ncx, ncy, ncz = len(xs), len(ys), len(zs)
+    sampled_cells = ncx * ncy * ncz
+    if max_cells > 0 and sampled_cells > max_cells:
+        raise ValueError(
+            f"downsampled VTK would contain {sampled_cells} cells, above "
+            f"--max-cells={max_cells}; increase --stride or set --max-cells 0"
+        )
+
+    length = height * (nx - 1) / max(1, nz - 1)
+    width = height * (ny - 1) / max(1, nz - 1)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
     with out_path.open("w", encoding="utf-8", newline="\n") as out:
         out.write("# vtk DataFile Version 3.0\n")
         out.write("EMsFEM ANN fine-density checkpoint downsample\n")
@@ -222,8 +462,20 @@ def write_vtk(
         out.write("ORIGIN 0 0 0\n")
         out.write(f"SPACING {length / ncx:.17g} {width / ncy:.17g} {height / ncz:.17g}\n")
 
-        if displacement_path is not None:
-            write_displacement_vectors(out, displacement_path, nx, ny, nz, ncx, ncy, ncz)
+        if displacement_paths:
+            out.write(f"POINT_DATA {(ncx + 1) * (ncy + 1) * (ncz + 1)}\n")
+            for index, displacement_path in enumerate(displacement_paths):
+                write_displacement_vectors(
+                    out,
+                    displacement_field_name(displacement_path, index),
+                    displacement_path,
+                    nx,
+                    ny,
+                    nz,
+                    ncx,
+                    ncy,
+                    ncz,
+                )
 
         out.write(f"CELL_DATA {sampled_cells}\n")
 
@@ -255,7 +507,9 @@ def main() -> None:
     parser.add_argument(
         "--displacement",
         type=Path,
-        help="optional coarse-node EMsFEM ANN *_final_u*.petscbin checkpoint",
+        action="append",
+        default=[],
+        help="optional coarse-node EMsFEM ANN *_final_u*.petscbin checkpoint; repeat for multiple load cases",
     )
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--nx", required=True, type=int)
@@ -274,6 +528,11 @@ def main() -> None:
         default=5_000_000,
         type=int,
         help="guardrail for sampled VTK cells; use 0 to disable",
+    )
+    parser.add_argument(
+        "--binary",
+        action="store_true",
+        help="write legacy binary VTK instead of ASCII; recommended for full fine grids",
     )
     args = parser.parse_args()
 
@@ -296,6 +555,7 @@ def main() -> None:
         args.height,
         args.stride,
         args.max_cells,
+        args.binary,
     )
 
 
