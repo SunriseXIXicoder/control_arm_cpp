@@ -73,7 +73,7 @@ NX="${NX:-$((NELX + 1))}"
 NY="${NY:-$((NELY + 1))}"
 NZ="${NZ:-$((NELZ + 1))}"
 
-BENCHMARK_CASE="${BENCHMARK_CASE:-cant}"
+BENCHMARK_CASE="${BENCHMARK_CASE:-tip_center}"
 DOMAIN_HEIGHT="${DOMAIN_HEIGHT:-0.08}"
 VOLFRAC="${VOLFRAC:-0.20}"
 OPT_MAX_ITER="${OPT_MAX_ITER:-500}"
@@ -130,7 +130,7 @@ H8_DM_ARGS="-h8_dm_px ${H8_DM_PX} -h8_dm_py ${H8_DM_PY} -h8_dm_pz ${H8_DM_PZ}"
 
 cd "${SUBMIT_DIR}"
 mkdir -p bin result logs
-CASE_DIR="${OUTPUT_DIR:-result/h8_cant6_${NELX}_${NELY}_${NELZ}_${RUN_NAME}_${JOB_ID}}"
+CASE_DIR="${OUTPUT_DIR:-result/h8_${BENCHMARK_CASE}_6axis_${NELX}_${NELY}_${NELZ}_${RUN_NAME}_${JOB_ID}}"
 PREFIX="${OUTPUT_PREFIX:-${CASE_DIR}/${RUN_NAME}}"
 mkdir -p "${CASE_DIR}"
 

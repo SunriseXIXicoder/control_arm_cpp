@@ -203,10 +203,20 @@ PetscBool benchmark_is_bottom_point_cantilever(const char *benchmark_case) {
              : PETSC_FALSE;
 }
 
+PetscBool benchmark_is_tip_center_cantilever(const char *benchmark_case) {
+  return (std::strcmp(benchmark_case, "tip_center") == 0 ||
+          std::strcmp(benchmark_case, "center_point") == 0 ||
+          std::strcmp(benchmark_case, "face_center") == 0 ||
+          std::strcmp(benchmark_case, "right_center") == 0)
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
 PetscBool benchmark_is_cantilever(const char *benchmark_case) {
   return (std::strcmp(benchmark_case, "cantilever") == 0 ||
           std::strcmp(benchmark_case, "cant") == 0 ||
-          benchmark_is_bottom_point_cantilever(benchmark_case))
+          benchmark_is_bottom_point_cantilever(benchmark_case) ||
+          benchmark_is_tip_center_cantilever(benchmark_case))
              ? PETSC_TRUE
              : PETSC_FALSE;
 }
@@ -337,8 +347,21 @@ PetscBool h8_cell_is_forced_solid(PetscInt i, PetscInt j, PetscInt k,
     if (benchmark_is_tri(opt.benchmark_case)) {
       return (i == 0 && j == 0 && k == ez - 1) ? PETSC_TRUE : PETSC_FALSE;
     }
+    if (benchmark_is_tip_center_cantilever(opt.benchmark_case)) {
+      const PetscInt mid_j = ey / 2;
+      const PetscInt lower_j = PetscMax(static_cast<PetscInt>(0), mid_j - 1);
+      const PetscInt upper_j = PetscMin(ey - 1, mid_j);
+      const PetscInt mid_k = ez / 2;
+      const PetscInt lower_k = PetscMax(static_cast<PetscInt>(0), mid_k - 1);
+      const PetscInt upper_k = PetscMin(ez - 1, mid_k);
+      return (i == ex - 1 && (j == lower_j || j == upper_j) &&
+              (k == lower_k || k == upper_k))
+                 ? PETSC_TRUE
+                 : PETSC_FALSE;
+    }
     if (benchmark_is_cantilever(opt.benchmark_case) &&
-        !benchmark_is_bottom_point_cantilever(opt.benchmark_case)) {
+        !benchmark_is_bottom_point_cantilever(opt.benchmark_case) &&
+        !benchmark_is_tip_center_cantilever(opt.benchmark_case)) {
       const PetscInt mid_node_k = ez / 2;
       const PetscInt lower_k =
           PetscMax(static_cast<PetscInt>(0), mid_node_k - 1);
@@ -3566,16 +3589,22 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
   const PetscBool tri = benchmark_is_tri(optimizer_options.benchmark_case);
   const PetscBool bottom_point =
       benchmark_is_bottom_point_cantilever(optimizer_options.benchmark_case);
+  const PetscBool tip_center =
+      benchmark_is_tip_center_cantilever(optimizer_options.benchmark_case);
   const PetscInt load_j0 = PetscMax(static_cast<PetscInt>(0), (grid.ny - 1) / 2);
   const PetscInt load_j1 = PetscMax(static_cast<PetscInt>(0), grid.ny / 2);
   const PetscInt cantilever_load_nodes = (load_j0 == load_j1) ? 1 : 2;
+  const PetscInt load_k0 = PetscMax(static_cast<PetscInt>(0), (grid.nz - 1) / 2);
+  const PetscInt load_k1 = PetscMax(static_cast<PetscInt>(0), grid.nz / 2);
+  const PetscInt tip_center_load_nodes =
+      ((load_j0 == load_j1) ? 1 : 2) * ((load_k0 == load_k1) ? 1 : 2);
   const PetscInt matlab_load_k =
       PetscMax(static_cast<PetscInt>(0), (grid.nz - 1) / 2);
 
   PetscCheck(torsion || bridge || mbb || tri ||
                  benchmark_is_cantilever(optimizer_options.benchmark_case),
              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-             "-benchmark_case must be cantilever, cant, bottom_point, bridge, mbb, tri, or torsion");
+             "-benchmark_case must be cantilever, cant, bottom_point, tip_center, bridge, mbb, tri, or torsion");
 
   PetscCall(VecSet(b, 0.0));
   PetscCall(DMDAGetCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
@@ -3634,6 +3663,14 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
           bg[k][j][i][2] +=
               -optimizer_options.load /
               static_cast<PetscReal>(cantilever_load_nodes);
+        } else if (tip_center) {
+          if (i != grid.nx - 1) continue;
+          // Concentrated -Z load at the center node(s) of the right-end face.
+          if ((j != load_j0 && j != load_j1) ||
+              (k != load_k0 && k != load_k1)) continue;
+          bg[k][j][i][2] +=
+              -optimizer_options.load /
+              static_cast<PetscReal>(tip_center_load_nodes);
         } else {
           if (i != grid.nx - 1) continue;
           // MATLAB initiMesh('cant'): -Z load on the right-end mid-height line.
@@ -5179,6 +5216,24 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
       PetscCall(PetscPrintf(
           PETSC_COMM_WORLD,
           "H8 rectangular benchmark: case=tri, fixed nodes match MATLAB [1,nely+1,(nely+1)*(nelx+1)], z-top y-high x-left corner loaded in -x/-y; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.z_draft_closure ? "true" : "false",
+          optimizer_options.draft_axes,
+          static_cast<double>(optimizer_options.z_draft_eta)));
+    } else if (benchmark_is_tip_center_cantilever(
+                   optimizer_options.benchmark_case)) {
+      PetscCall(PetscPrintf(
+          PETSC_COMM_WORLD,
+          "H8 rectangular benchmark: case=%s, left face fixed, right-end face center point loaded in -Z; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.benchmark_case,
+          optimizer_options.z_draft_closure ? "true" : "false",
+          optimizer_options.draft_axes,
+          static_cast<double>(optimizer_options.z_draft_eta)));
+    } else if (benchmark_is_bottom_point_cantilever(
+                   optimizer_options.benchmark_case)) {
+      PetscCall(PetscPrintf(
+          PETSC_COMM_WORLD,
+          "H8 rectangular benchmark: case=%s, left face fixed, right-end bottom-center point loaded in -Z; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.benchmark_case,
           optimizer_options.z_draft_closure ? "true" : "false",
           optimizer_options.draft_axes,
           static_cast<double>(optimizer_options.z_draft_eta)));
