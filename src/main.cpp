@@ -543,6 +543,8 @@ int main(int argc, char **argv) {
   PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_heaviside_projection",
                                 &optimizer_options.heaviside_projection,
                                 nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_use_mma",
+                                &optimizer_options.use_mma, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_heaviside_eta",
                                 &optimizer_options.heaviside_eta, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr,
@@ -563,6 +565,8 @@ int main(int argc, char **argv) {
                                 &optimizer_options.z_draft_closure, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_draft_eta",
                                 &optimizer_options.z_draft_eta, nullptr));
+  PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_draft_beta",
+                                &optimizer_options.draft_beta, nullptr));
   PetscBool has_opt_draft_axis = PETSC_FALSE;
   PetscBool has_opt_draft_axes = PETSC_FALSE;
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-opt_draft_axis",
@@ -599,6 +603,9 @@ int main(int argc, char **argv) {
                                   optimizer_options.benchmark_case,
                                   sizeof(optimizer_options.benchmark_case),
                                   nullptr));
+  PetscCall(PetscStrncpy(density_options.benchmark_case,
+                         optimizer_options.benchmark_case,
+                         sizeof(density_options.benchmark_case)));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_filter_radius",
                                 &optimizer_options.filter_radius, nullptr));
   PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_write_checkpoint",

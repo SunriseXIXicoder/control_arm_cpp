@@ -5,6 +5,7 @@
 #include <petscdmda.h>
 #include <petscviewer.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -35,6 +36,40 @@ struct H8BlockJacobiContext {
   Grid grid;
   DensityOptions density_options;
   PetscReal ke[24 * 24]{};
+};
+
+struct H8MatlabMMAState {
+  PetscInt n = 0;
+  PetscReal c_scale = 0.0;
+  std::vector<PetscReal> xold1;
+  std::vector<PetscReal> xold2;
+  std::vector<PetscReal> L;
+  std::vector<PetscReal> U;
+};
+
+struct H8VectorStats {
+  PetscReal min = 0.0;
+  PetscReal max = 0.0;
+  PetscReal sum = 0.0;
+  PetscReal l1 = 0.0;
+};
+
+struct H8MatlabMMADiagnostics {
+  PetscReal f0val = 0.0;
+  PetscReal fval = 0.0;
+  PetscReal c_scale = 0.0;
+  PetscReal move = 0.0;
+  PetscReal beta1 = 0.0;
+  PetscReal beta2 = 0.0;
+  PetscReal x_change = 0.0;
+  H8VectorStats x;
+  H8VectorStats xmma;
+  H8VectorStats df0dx;
+  H8VectorStats dfdx;
+  std::vector<PetscReal> x_values;
+  std::vector<PetscReal> xmma_values;
+  std::vector<PetscReal> df0dx_values;
+  std::vector<PetscReal> dfdx_values;
 };
 
 struct ElementGrid {
@@ -122,17 +157,67 @@ PetscBool h8_is_c_support_node(PetscInt i, PetscInt j, PetscInt k,
 }
 
 PetscBool h8_is_fixed_node(PetscInt i, PetscInt j, PetscInt k,
-                           const Grid &grid,
-                           const DensityOptions &options) {
-  (void)j;
-  (void)k;
-  // 无控制臂 mask 的 benchmark 使用规则矩形域：左端面全约束，右端面施加载荷。
-  if (!options.use_control_arm_mask) return i == 0 ? PETSC_TRUE : PETSC_FALSE;
+                            const Grid &grid,
+                            const DensityOptions &options) {
+  if (!options.use_control_arm_mask) {
+    if (std::strcmp(options.benchmark_case, "bridge") == 0) {
+      return (k == 0 && (i == 0 || i == grid.nx - 1)) ? PETSC_TRUE
+                                                        : PETSC_FALSE;
+    }
+    if (std::strcmp(options.benchmark_case, "tri") == 0) {
+      const bool left_lower_corner = (i == 0 && j == 0 && k == 0);
+      const bool left_upper_corner =
+          (i == 0 && j == grid.ny - 1 && k == 0);
+      const bool right_upper_corner =
+          (i == grid.nx - 1 && j == grid.ny - 1 && k == 0);
+      return (left_lower_corner || left_upper_corner || right_upper_corner)
+                  ? PETSC_TRUE
+                  : PETSC_FALSE;
+    }
+    // MATLAB cant/mbb clamp the whole left end face.
+    return i == 0 ? PETSC_TRUE : PETSC_FALSE;
+  }
   return h8_is_c_support_node(i, j, k, grid);
 }
 
 PetscBool benchmark_is_torsion(const char *benchmark_case) {
   return std::strcmp(benchmark_case, "torsion") == 0 ? PETSC_TRUE : PETSC_FALSE;
+}
+
+PetscBool benchmark_is_bridge(const char *benchmark_case) {
+  return std::strcmp(benchmark_case, "bridge") == 0 ? PETSC_TRUE : PETSC_FALSE;
+}
+
+PetscBool benchmark_is_mbb(const char *benchmark_case) {
+  return std::strcmp(benchmark_case, "mbb") == 0 ? PETSC_TRUE : PETSC_FALSE;
+}
+
+PetscBool benchmark_is_tri(const char *benchmark_case) {
+  return std::strcmp(benchmark_case, "tri") == 0 ? PETSC_TRUE : PETSC_FALSE;
+}
+
+PetscBool benchmark_is_bottom_point_cantilever(const char *benchmark_case) {
+  return (std::strcmp(benchmark_case, "bottom_point") == 0 ||
+          std::strcmp(benchmark_case, "bottom_center") == 0)
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscBool benchmark_is_cantilever(const char *benchmark_case) {
+  return (std::strcmp(benchmark_case, "cantilever") == 0 ||
+          std::strcmp(benchmark_case, "cant") == 0 ||
+          benchmark_is_bottom_point_cantilever(benchmark_case))
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscBool benchmark_has_matlab_load_elements(const char *benchmark_case) {
+  return (benchmark_is_cantilever(benchmark_case) ||
+          benchmark_is_bridge(benchmark_case) ||
+          benchmark_is_mbb(benchmark_case) ||
+          benchmark_is_tri(benchmark_case))
+             ? PETSC_TRUE
+             : PETSC_FALSE;
 }
 
 PetscBool h8_is_ab_load_node(PetscInt i, PetscInt j, PetscInt k,
@@ -212,6 +297,11 @@ bool h8_mask_is_fixed_solid(PetscReal value) { return value >= 1.5; }
 
 bool h8_mask_is_active(PetscReal value) { return value > 0.5; }
 
+bool h8_mask_counts_in_volume(PetscReal value, PetscBool include_fixed_solid) {
+  return h8_mask_is_design(value) ||
+         (include_fixed_solid && h8_mask_is_fixed_solid(value));
+}
+
 void h8_cell_center_physical(PetscInt i, PetscInt j, PetscInt k,
                              const Grid &grid, PetscReal *x, PetscReal *y,
                              PetscReal *z) {
@@ -230,11 +320,34 @@ void h8_cell_center_physical(PetscInt i, PetscInt j, PetscInt k,
 }
 
 PetscBool h8_cell_is_forced_solid(PetscInt i, PetscInt j, PetscInt k,
-                                  const Grid &grid,
-                                  const DensityOptions &options) {
-  // 无 mask 矩形域没有控制臂专用硬实体区域，固定端只通过位移边界条件施加。
-  if (!options.use_control_arm_mask) return PETSC_FALSE;
-
+                                   const Grid &grid,
+                                   const DensityOptions &options,
+                                   const OptimizerOptions &opt) {
+  if (!options.use_control_arm_mask) {
+    const PetscInt ex = grid.nx - 1;
+    const PetscInt ey = grid.ny - 1;
+    const PetscInt ez = grid.nz - 1;
+    if (ex <= 0 || ey <= 0 || ez <= 0) return PETSC_FALSE;
+    if (benchmark_is_bridge(opt.benchmark_case)) {
+      return k == ez - 1 ? PETSC_TRUE : PETSC_FALSE;
+    }
+    if (benchmark_is_mbb(opt.benchmark_case)) {
+      return (i == ex - 1 && k == 0) ? PETSC_TRUE : PETSC_FALSE;
+    }
+    if (benchmark_is_tri(opt.benchmark_case)) {
+      return (i == 0 && j == 0 && k == ez - 1) ? PETSC_TRUE : PETSC_FALSE;
+    }
+    if (benchmark_is_cantilever(opt.benchmark_case) &&
+        !benchmark_is_bottom_point_cantilever(opt.benchmark_case)) {
+      const PetscInt mid_node_k = ez / 2;
+      const PetscInt lower_k =
+          PetscMax(static_cast<PetscInt>(0), mid_node_k - 1);
+      const PetscInt upper_k = PetscMin(ez - 1, mid_node_k);
+      return (i == ex - 1 && (k == lower_k || k == upper_k)) ? PETSC_TRUE
+                                                             : PETSC_FALSE;
+    }
+    return PETSC_FALSE;
+  }
   const PetscReal DL = domain_length(grid);
   const PetscReal DW = domain_width(grid);
   const PetscReal DH = domain_height(grid);
@@ -288,10 +401,119 @@ PetscReal simp_derivative(PetscReal rho, const DensityOptions &opts) {
   return (1.0 - opts.emin) * opts.penal * PetscPowReal(rho, opts.penal - 1.0);
 }
 
+void compute_matlab_lk_h8(PetscReal nu, PetscReal *ke) {
+  PetscReal matlab_ke[24 * 24]{};
+  const PetscReal A[2][14] = {
+      {32.0, 6.0, -8.0, 6.0, -6.0, 4.0, 3.0, -6.0, -10.0, 3.0,
+       -3.0, -3.0, -4.0, -8.0},
+      {-48.0, 0.0, 0.0, -24.0, 24.0, 0.0, 0.0, 0.0, 12.0, -12.0,
+       0.0, 12.0, 12.0, 12.0}};
+  PetscReal k[14] = {};
+  for (PetscInt q = 0; q < 14; ++q) {
+    k[q] = (A[0][q] + nu * A[1][q]) / 144.0;
+  }
+
+  const PetscReal K1[6][6] = {
+      {k[0], k[1], k[1], k[2], k[4], k[4]},
+      {k[1], k[0], k[1], k[3], k[5], k[6]},
+      {k[1], k[1], k[0], k[3], k[6], k[5]},
+      {k[2], k[3], k[3], k[0], k[7], k[7]},
+      {k[4], k[5], k[6], k[7], k[0], k[1]},
+      {k[4], k[6], k[5], k[7], k[1], k[0]}};
+  const PetscReal K2[6][6] = {
+      {k[8], k[7], k[11], k[5], k[3], k[6]},
+      {k[7], k[8], k[11], k[4], k[2], k[4]},
+      {k[9], k[9], k[12], k[6], k[3], k[5]},
+      {k[5], k[4], k[10], k[8], k[1], k[9]},
+      {k[3], k[2], k[4], k[1], k[8], k[11]},
+      {k[10], k[3], k[5], k[11], k[9], k[12]}};
+  const PetscReal K3[6][6] = {
+      {k[5], k[6], k[3], k[8], k[11], k[7]},
+      {k[6], k[5], k[3], k[9], k[12], k[9]},
+      {k[4], k[4], k[2], k[7], k[11], k[8]},
+      {k[8], k[9], k[1], k[5], k[10], k[4]},
+      {k[11], k[12], k[9], k[10], k[5], k[3]},
+      {k[1], k[11], k[8], k[3], k[4], k[2]}};
+  const PetscReal K4[6][6] = {
+      {k[13], k[10], k[10], k[12], k[9], k[9]},
+      {k[10], k[13], k[10], k[11], k[8], k[7]},
+      {k[10], k[10], k[13], k[11], k[7], k[8]},
+      {k[12], k[11], k[11], k[13], k[6], k[6]},
+      {k[9], k[8], k[7], k[6], k[13], k[10]},
+      {k[9], k[7], k[8], k[6], k[10], k[13]}};
+  const PetscReal K5[6][6] = {
+      {k[0], k[1], k[7], k[2], k[4], k[3]},
+      {k[1], k[0], k[7], k[3], k[5], k[10]},
+      {k[7], k[7], k[0], k[4], k[10], k[5]},
+      {k[2], k[3], k[4], k[0], k[7], k[1]},
+      {k[4], k[5], k[10], k[7], k[0], k[7]},
+      {k[3], k[10], k[5], k[1], k[7], k[0]}};
+  const PetscReal K6[6][6] = {
+      {k[13], k[10], k[6], k[12], k[9], k[11]},
+      {k[10], k[13], k[6], k[11], k[8], k[1]},
+      {k[6], k[6], k[13], k[9], k[1], k[8]},
+      {k[12], k[11], k[9], k[13], k[6], k[10]},
+      {k[9], k[8], k[1], k[6], k[13], k[6]},
+      {k[11], k[1], k[8], k[10], k[6], k[13]}};
+  const PetscReal factor = 1.0 / ((nu + 1.0) * (1.0 - 2.0 * nu));
+  for (PetscInt q = 0; q < 24 * 24; ++q) matlab_ke[q] = 0.0;
+
+  auto set_block = [&](PetscInt br, PetscInt bc, const PetscReal M[6][6],
+                       PetscBool transpose) {
+    for (PetscInt r = 0; r < 6; ++r) {
+      for (PetscInt c = 0; c < 6; ++c) {
+        const PetscInt row = br * 6 + r;
+        const PetscInt col = bc * 6 + c;
+        matlab_ke[24 * row + col] =
+            factor * (transpose ? M[c][r] : M[r][c]);
+      }
+    }
+  };
+
+  set_block(0, 0, K1, PETSC_FALSE);
+  set_block(0, 1, K2, PETSC_FALSE);
+  set_block(0, 2, K3, PETSC_FALSE);
+  set_block(0, 3, K4, PETSC_FALSE);
+  set_block(1, 0, K2, PETSC_TRUE);
+  set_block(1, 1, K5, PETSC_FALSE);
+  set_block(1, 2, K6, PETSC_FALSE);
+  set_block(1, 3, K3, PETSC_TRUE);
+  set_block(2, 0, K3, PETSC_TRUE);
+  set_block(2, 1, K6, PETSC_FALSE);
+  set_block(2, 2, K5, PETSC_TRUE);
+  set_block(2, 3, K2, PETSC_TRUE);
+  set_block(3, 0, K4, PETSC_FALSE);
+  set_block(3, 1, K3, PETSC_FALSE);
+  set_block(3, 2, K2, PETSC_FALSE);
+  set_block(3, 3, K1, PETSC_TRUE);
+
+  // MATLAB initiMesh uses a y-reversed local node order for lk_H8.
+  // Reorder once into the C++ kernels' local node convention.
+  const PetscInt cpp_to_matlab_node[8] = {3, 2, 1, 0, 7, 6, 5, 4};
+  PetscInt cpp_to_matlab_dof[24]{};
+  for (PetscInt node = 0; node < 8; ++node) {
+    for (PetscInt d = 0; d < 3; ++d) {
+      cpp_to_matlab_dof[3 * node + d] = 3 * cpp_to_matlab_node[node] + d;
+    }
+  }
+  for (PetscInt r = 0; r < 24; ++r) {
+    for (PetscInt c = 0; c < 24; ++c) {
+      ke[24 * r + c] =
+          matlab_ke[24 * cpp_to_matlab_dof[r] + cpp_to_matlab_dof[c]];
+    }
+  }
+}
+
 void compute_h8_element_stiffness(const Grid &grid,
                                   const DensityOptions &options,
                                   PetscReal *ke) {
   const PetscReal nu = 0.30;
+  if (!options.use_control_arm_mask &&
+      benchmark_has_matlab_load_elements(options.benchmark_case)) {
+    (void)grid;
+    compute_matlab_lk_h8(nu, ke);
+    return;
+  }
   const PetscReal E = options.young_modulus;
   const PetscReal lambda = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
   const PetscReal mu = E / (2.0 * (1.0 + nu));
@@ -495,8 +717,9 @@ PetscErrorCode choose_h8_process_grid(const Grid &grid,
   return 0;
 }
 
-PetscErrorCode compute_masked_volume_fraction(DM eda, Vec rho, Vec mask,
-                                              PetscReal *volume_fraction) {
+PetscErrorCode compute_masked_volume_fraction_with_fixed(
+    DM eda, Vec rho, Vec mask, PetscBool include_fixed_solid,
+    PetscReal *volume_fraction) {
   PetscScalar ***r = nullptr;
   PetscScalar ***m = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
@@ -512,7 +735,7 @@ PetscErrorCode compute_masked_volume_fraction(DM eda, Vec rho, Vec mask,
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         const PetscReal mask_value = PetscRealPart(m[k][j][i]);
-        if (h8_mask_is_design(mask_value)) {
+        if (h8_mask_counts_in_volume(mask_value, include_fixed_solid)) {
           local_mask_sum += 1.0;
           local_rho_sum += PetscRealPart(r[k][j][i]);
         }
@@ -526,6 +749,13 @@ PetscErrorCode compute_masked_volume_fraction(DM eda, Vec rho, Vec mask,
   PetscCallMPI(MPI_Allreduce(&local_mask_sum, &global_mask_sum, 1, MPIU_REAL,
                              MPI_SUM, PETSC_COMM_WORLD));
   *volume_fraction = global_mask_sum > 0.0 ? global_rho_sum / global_mask_sum : 0.0;
+  return 0;
+}
+
+PetscErrorCode compute_masked_volume_fraction(DM eda, Vec rho, Vec mask,
+                                              PetscReal *volume_fraction) {
+  PetscCall(compute_masked_volume_fraction_with_fixed(
+      eda, rho, mask, PETSC_FALSE, volume_fraction));
   return 0;
 }
 
@@ -738,6 +968,34 @@ PetscReal h8_heaviside_beta_for_iter(const OptimizerOptions &opt,
     for (PetscInt s = 0; s < stage; ++s) beta *= 2.0;
   }
   return PetscMin(beta, opt.heaviside_beta_max);
+}
+
+PetscReal h8_matlab_outer_beta_for_iter(const OptimizerOptions &opt,
+                                        PetscInt iter) {
+  const PetscReal beta0 =
+      opt.heaviside_projection ? opt.heaviside_beta_initial : 2.0;
+  const PetscReal beta_max =
+      opt.heaviside_projection ? opt.heaviside_beta_max : 10.0;
+  return PetscMin(PetscMax(1.0e-12, beta0) +
+                      0.1 * static_cast<PetscReal>(PetscMax(iter, 0)),
+                  PetscMax(PetscMax(1.0e-12, beta0), beta_max));
+}
+
+PetscReal h8_matlab_inner_beta_for_iter(const OptimizerOptions &opt,
+                                        PetscInt iter) {
+  return PetscMin(PetscMax(1.0e-12, opt.draft_beta) +
+                      0.1 * static_cast<PetscReal>(PetscMax(iter, 0)),
+                  PetscMax(PetscMax(1.0e-12, opt.draft_beta), 20.0));
+}
+
+OptimizerOptions h8_projection_options_for_iter(const OptimizerOptions &opt,
+                                                PetscBool matlab_z_projection,
+                                                PetscInt iter) {
+  OptimizerOptions step = opt;
+  if (matlab_z_projection) {
+    step.draft_beta = h8_matlab_inner_beta_for_iter(opt, iter);
+  }
+  return step;
 }
 
 PetscReal h8_smooth_heaviside_value(PetscReal x, PetscReal beta,
@@ -1048,6 +1306,966 @@ PetscErrorCode apply_h8_draft_closure(DM eda, Vec mask,
   return 0;
 }
 
+PetscErrorCode h8_uses_matlab_z_projection(const OptimizerOptions &options,
+                                           PetscBool *use_projection) {
+  std::vector<H8DraftDirection> dirs;
+  *use_projection = PETSC_FALSE;
+  if (!options.z_draft_closure) return 0;
+  PetscCall(parse_h8_draft_axes(options.draft_axes, &dirs));
+  for (const H8DraftDirection &dir : dirs) {
+    if (dir.axis == 2) {
+      *use_projection = PETSC_TRUE;
+      return 0;
+    }
+  }
+  return 0;
+}
+
+PetscReal h8_matlab_cell_coordinate(PetscInt coord, PetscInt count) {
+  if (count <= 0) return 0.5;
+  const PetscReal raw =
+      (static_cast<PetscReal>(coord) + 0.5) / static_cast<PetscReal>(count);
+  return 0.05 + 0.90 * raw;
+}
+
+PetscReal h8_matlab_cut_value(PetscReal x, PetscReal eta, PetscReal beta) {
+  if (beta <= 1.0e-12) return x >= eta ? 1.0 : 0.0;
+  eta = PetscMax(0.0, PetscMin(1.0, eta));
+  const PetscReal den =
+      PetscTanhReal(beta * eta) + PetscTanhReal(beta * (1.0 - eta));
+  if (PetscAbsReal(den) <= PETSC_SMALL) return x >= eta ? 1.0 : 0.0;
+  return (PetscTanhReal(beta * eta) +
+          PetscTanhReal(beta * (x - eta))) /
+         den;
+}
+
+PetscReal h8_matlab_cut_deta(PetscReal x, PetscReal eta, PetscReal beta) {
+  if (beta <= 1.0e-12) return 0.0;
+  eta = PetscMax(0.0, PetscMin(1.0, eta));
+  const PetscReal te = PetscTanhReal(beta * eta);
+  const PetscReal tx = PetscTanhReal(beta * (x - eta));
+  const PetscReal t1 = PetscTanhReal(beta * (1.0 - eta));
+  const PetscReal u = te + tx;
+  const PetscReal v = te + t1;
+  if (PetscAbsReal(v) <= PETSC_SMALL) return 0.0;
+  const PetscReal se = 1.0 - te * te;
+  const PetscReal sx = 1.0 - tx * tx;
+  const PetscReal s1 = 1.0 - t1 * t1;
+  const PetscReal u_prime = beta * se - beta * sx;
+  const PetscReal v_prime = beta * se - beta * s1;
+  return (v * u_prime - u * v_prime) / (v * v);
+}
+
+PetscReal h8_matlab_fixed_xy_factor(PetscInt i, PetscInt j, PetscInt ex,
+                                    PetscInt ey, PetscReal beta) {
+  const PetscReal xf = h8_matlab_cell_coordinate(i, ex);
+  const PetscReal yf = h8_matlab_cell_coordinate(j, ey);
+  const PetscReal xt1 = h8_matlab_cut_value(xf, 0.0, beta);
+  const PetscReal xt2 = 1.0 - h8_matlab_cut_value(xf, 1.0, beta);
+  const PetscReal yt1 = h8_matlab_cut_value(yf, 0.0, beta);
+  const PetscReal yt2 = 1.0 - h8_matlab_cut_value(yf, 1.0, beta);
+  return xt1 * xt2 * yt1 * yt2;
+}
+
+PetscInt h8_matlab_z_var_id(PetscInt i, PetscInt j, PetscInt ey) {
+  return i * ey + j;
+}
+
+PetscReal h8_outer_projection_value(PetscReal rho1,
+                                    const OptimizerOptions &opt,
+                                    PetscReal beta) {
+  return h8_smooth_heaviside_value(rho1, PetscMax(1.0e-12, beta),
+                                   opt.z_draft_eta);
+}
+
+PetscReal h8_outer_projection_derivative(PetscReal rho1,
+                                         const OptimizerOptions &opt,
+                                         PetscReal beta) {
+  return h8_smooth_heaviside_derivative(rho1, PetscMax(1.0e-12, beta),
+                                        opt.z_draft_eta);
+}
+
+PetscErrorCode gather_h8_z_surface_variables(
+    DM eda, Vec rho_design, Vec mask, const OptimizerOptions &opt,
+    std::vector<PetscReal> *bottom, std::vector<PetscReal> *top) {
+  (void)opt;
+  PetscScalar ***r = nullptr, ***m = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt ex = 0, ey = 0, ez = 0;
+  PetscMPIInt reduce_count = 0;
+
+  PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  const PetscInt column_count = ex * ey;
+  PetscCall(PetscMPIIntCast(column_count, &reduce_count));
+  std::vector<PetscReal> local_bottom(static_cast<std::size_t>(column_count),
+                                      0.0);
+  std::vector<PetscReal> local_top(static_cast<std::size_t>(column_count), 0.0);
+  bottom->assign(static_cast<std::size_t>(column_count), 0.0);
+  top->assign(static_cast<std::size_t>(column_count), 0.0);
+
+  PetscCall(DMDAVecGetArrayRead(eda, rho_design, &r));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    if (k != 0 && k != ez - 1) continue;
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscReal mask_value = PetscRealPart(m[k][j][i]);
+        if (!h8_mask_is_design(mask_value) &&
+            !h8_mask_is_fixed_solid(mask_value)) {
+          continue;
+        }
+        const PetscInt id = h8_matlab_z_var_id(i, j, ey);
+        const PetscReal value = PetscMax(
+            0.0, PetscMin(1.0, PetscRealPart(r[k][j][i])));
+        if (k == 0) {
+          local_bottom[static_cast<std::size_t>(id)] = value;
+        } else {
+          local_top[static_cast<std::size_t>(id)] = value;
+        }
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayRead(eda, rho_design, &r));
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  PetscCallMPI(MPI_Allreduce(local_bottom.data(), bottom->data(), reduce_count,
+                             MPIU_REAL, MPI_MAX, PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(local_top.data(), top->data(), reduce_count,
+                             MPIU_REAL, MPI_MAX, PETSC_COMM_WORLD));
+  return 0;
+}
+
+PetscErrorCode apply_h8_matlab_z_projection(
+    DM eda, Vec rho_design, Vec mask, const OptimizerOptions &opt,
+    const DensityOptions &density_options, PetscReal outer_beta,
+    Vec rho_phys) {
+  PetscScalar ***m = nullptr, ***out = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt ex = 0, ey = 0, ez = 0;
+  const PetscReal beta = PetscMax(1.0e-12, opt.draft_beta);
+  std::vector<PetscReal> bottom;
+  std::vector<PetscReal> top;
+
+  PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  PetscCall(gather_h8_z_surface_variables(eda, rho_design, mask, opt,
+                                          &bottom, &top));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecGetArray(eda, rho_phys, &out));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    const PetscReal zf = h8_matlab_cell_coordinate(k, ez);
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscReal mask_value = PetscRealPart(m[k][j][i]);
+        if (h8_mask_is_fixed_solid(mask_value)) {
+          out[k][j][i] = 1.0;
+          continue;
+        }
+        if (!h8_mask_is_design(mask_value)) {
+          out[k][j][i] = density_options.void_density;
+          continue;
+        }
+        const PetscInt id = h8_matlab_z_var_id(i, j, ey);
+        const PetscReal eta_lower =
+            1.0 - bottom[static_cast<std::size_t>(id)];
+        const PetscReal eta_upper = top[static_cast<std::size_t>(id)];
+        const PetscReal zt1 = h8_matlab_cut_value(zf, eta_lower, beta);
+        const PetscReal zt2 =
+            1.0 - h8_matlab_cut_value(zf, eta_upper, beta);
+        const PetscReal xy_factor =
+            h8_matlab_fixed_xy_factor(i, j, ex, ey, beta);
+        const PetscReal rho1 = xy_factor * zt1 * zt2;
+        out[k][j][i] = h8_outer_projection_value(rho1, opt, outer_beta);
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecRestoreArray(eda, rho_phys, &out));
+  return 0;
+}
+
+PetscErrorCode build_h8_physical_density(
+    DM eda, Vec rho_design, Vec mask, Vec filter_denom,
+    const DensityOptions &density_options, const OptimizerOptions &opt,
+    PetscReal beta, Vec rho_filtered, Vec rho_phys) {
+  PetscBool matlab_z_projection = PETSC_FALSE;
+  PetscCall(h8_uses_matlab_z_projection(opt, &matlab_z_projection));
+  if (matlab_z_projection) {
+    PetscCall(apply_h8_matlab_z_projection(
+        eda, rho_design, mask, opt, density_options, beta, rho_phys));
+    return 0;
+  }
+  PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
+                                 opt.filter_radius,
+                                 density_options.void_density, rho_filtered));
+  PetscCall(apply_h8_heaviside_projection(
+      eda, rho_filtered, mask, opt, beta, density_options.void_density,
+      rho_phys));
+  PetscCall(apply_h8_draft_closure(eda, mask, opt, rho_phys));
+  return 0;
+}
+
+PetscErrorCode create_h8_z_surface_update_mask(DM eda, Vec mask,
+                                               Vec update_mask) {
+  PetscScalar ***m = nullptr, ***u = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt ez = 0;
+  PetscCall(DMDAGetInfo(eda, nullptr, nullptr, nullptr, &ez, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                        nullptr));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecGetArray(eda, update_mask, &u));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscReal mask_value = PetscRealPart(m[k][j][i]);
+        u[k][j][i] =
+            ((h8_mask_is_design(mask_value) ||
+              h8_mask_is_fixed_solid(mask_value)) &&
+             (k == 0 || k == ez - 1))
+                ? 1.0
+                : 0.0;
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecRestoreArray(eda, update_mask, &u));
+  return 0;
+}
+
+void filter_h8_z_surface_array(const std::vector<PetscReal> &input,
+                               PetscInt ex, PetscInt ey, PetscReal radius,
+                               std::vector<PetscReal> *output) {
+  output->assign(input.size(), 0.0);
+  if (radius <= 0.0) {
+    *output = input;
+    return;
+  }
+
+  const PetscInt rr =
+      PetscMax(0, static_cast<PetscInt>(PetscCeilReal(radius)));
+  for (PetscInt i = 0; i < ex; ++i) {
+    for (PetscInt j = 0; j < ey; ++j) {
+      PetscReal sum = 0.0;
+      PetscReal denom = 0.0;
+      for (PetscInt dx = -rr; dx <= rr; ++dx) {
+        const PetscInt ii = i + dx;
+        if (ii < 0 || ii >= ex) continue;
+        for (PetscInt dy = -rr; dy <= rr; ++dy) {
+          const PetscInt jj = j + dy;
+          if (jj < 0 || jj >= ey) continue;
+          const PetscReal w = cone_weight(dx, dy, 0, radius);
+          if (w <= 0.0) continue;
+          const std::size_t sid =
+              static_cast<std::size_t>(h8_matlab_z_var_id(ii, jj, ey));
+          sum += w * input[sid];
+          denom += w;
+        }
+      }
+      const std::size_t out_id =
+          static_cast<std::size_t>(h8_matlab_z_var_id(i, j, ey));
+      (*output)[out_id] = denom > 0.0 ? sum / denom : input[out_id];
+    }
+  }
+}
+
+PetscErrorCode apply_h8_matlab_z_surface_sensitivity(
+    DM eda, Vec dc_phys, Vec mask, Vec rho_design,
+    const DensityOptions &density_options, const OptimizerOptions &opt,
+    PetscReal outer_beta, Vec dc_design, Vec dv_design) {
+  (void)density_options;
+  PetscScalar ***dc = nullptr, ***m = nullptr;
+  PetscScalar ***dc_out = nullptr, ***dv_out = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt ex = 0, ey = 0, ez = 0;
+  PetscMPIInt reduce_count = 0;
+  const PetscReal beta = PetscMax(1.0e-12, opt.draft_beta);
+  std::vector<PetscReal> bottom;
+  std::vector<PetscReal> top;
+
+  PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  const PetscInt column_count = ex * ey;
+  PetscCall(PetscMPIIntCast(column_count, &reduce_count));
+  std::vector<PetscReal> local_dc_bottom(static_cast<std::size_t>(column_count),
+                                         0.0);
+  std::vector<PetscReal> local_dc_top(static_cast<std::size_t>(column_count),
+                                      0.0);
+  std::vector<PetscReal> local_dv_bottom(static_cast<std::size_t>(column_count),
+                                         0.0);
+  std::vector<PetscReal> local_dv_top(static_cast<std::size_t>(column_count),
+                                      0.0);
+  std::vector<PetscReal> global_dc_bottom(static_cast<std::size_t>(column_count),
+                                          0.0);
+  std::vector<PetscReal> global_dc_top(static_cast<std::size_t>(column_count),
+                                       0.0);
+  std::vector<PetscReal> global_dv_bottom(static_cast<std::size_t>(column_count),
+                                          0.0);
+  std::vector<PetscReal> global_dv_top(static_cast<std::size_t>(column_count),
+                                       0.0);
+  std::vector<PetscReal> filtered_dc_bottom;
+  std::vector<PetscReal> filtered_dc_top;
+  std::vector<PetscReal> filtered_dv_bottom;
+  std::vector<PetscReal> filtered_dv_top;
+
+  PetscCall(gather_h8_z_surface_variables(eda, rho_design, mask, opt,
+                                          &bottom, &top));
+  PetscCall(DMDAVecGetArrayRead(eda, dc_phys, &dc));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    const PetscReal zf = h8_matlab_cell_coordinate(k, ez);
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        if (!h8_mask_is_design(PetscRealPart(m[k][j][i]))) continue;
+        const PetscInt id = h8_matlab_z_var_id(i, j, ey);
+        const std::size_t sid = static_cast<std::size_t>(id);
+        const PetscReal eta_lower = 1.0 - bottom[sid];
+        const PetscReal eta_upper = top[sid];
+        const PetscReal zt1 = h8_matlab_cut_value(zf, eta_lower, beta);
+        const PetscReal zt2 =
+            1.0 - h8_matlab_cut_value(zf, eta_upper, beta);
+        const PetscReal xy_factor =
+            h8_matlab_fixed_xy_factor(i, j, ex, ey, beta);
+        const PetscReal rho1 = xy_factor * zt1 * zt2;
+        const PetscReal outer =
+            h8_outer_projection_derivative(rho1, opt, outer_beta);
+        const PetscReal dzt1_db =
+            -h8_matlab_cut_deta(zf, eta_lower, beta);
+        const PetscReal dzt2_dt =
+            -h8_matlab_cut_deta(zf, eta_upper, beta);
+        const PetscReal deriv_bottom = outer * xy_factor * dzt1_db * zt2;
+        const PetscReal deriv_top = outer * xy_factor * zt1 * dzt2_dt;
+        local_dc_bottom[sid] += PetscRealPart(dc[k][j][i]) * deriv_bottom;
+        local_dc_top[sid] += PetscRealPart(dc[k][j][i]) * deriv_top;
+        local_dv_bottom[sid] += deriv_bottom;
+        local_dv_top[sid] += deriv_top;
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayRead(eda, dc_phys, &dc));
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+
+  PetscCallMPI(MPI_Allreduce(local_dc_bottom.data(), global_dc_bottom.data(),
+                             reduce_count, MPIU_REAL, MPI_SUM,
+                             PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(local_dc_top.data(), global_dc_top.data(),
+                             reduce_count, MPIU_REAL, MPI_SUM,
+                             PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(local_dv_bottom.data(), global_dv_bottom.data(),
+                             reduce_count, MPIU_REAL, MPI_SUM,
+                             PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(local_dv_top.data(), global_dv_top.data(),
+                             reduce_count, MPIU_REAL, MPI_SUM,
+                             PETSC_COMM_WORLD));
+
+  filter_h8_z_surface_array(global_dc_bottom, ex, ey, opt.filter_radius,
+                            &filtered_dc_bottom);
+  filter_h8_z_surface_array(global_dc_top, ex, ey, opt.filter_radius,
+                            &filtered_dc_top);
+  filter_h8_z_surface_array(global_dv_bottom, ex, ey, opt.filter_radius,
+                            &filtered_dv_bottom);
+  filter_h8_z_surface_array(global_dv_top, ex, ey, opt.filter_radius,
+                            &filtered_dv_top);
+
+  PetscCall(VecSet(dc_design, 0.0));
+  PetscCall(VecSet(dv_design, 0.0));
+  PetscCall(DMDAVecGetArray(eda, dc_design, &dc_out));
+  PetscCall(DMDAVecGetArray(eda, dv_design, &dv_out));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    if (k != 0 && k != ez - 1) continue;
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscInt id = h8_matlab_z_var_id(i, j, ey);
+        const std::size_t sid = static_cast<std::size_t>(id);
+        if (k == 0) {
+          dc_out[k][j][i] = filtered_dc_bottom[sid];
+          dv_out[k][j][i] = PetscMax(0.0, filtered_dv_bottom[sid]);
+        } else {
+          dc_out[k][j][i] = filtered_dc_top[sid];
+          dv_out[k][j][i] = PetscMax(0.0, filtered_dv_top[sid]);
+        }
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArray(eda, dc_design, &dc_out));
+  PetscCall(DMDAVecRestoreArray(eda, dv_design, &dv_out));
+  return 0;
+}
+
+PetscReal h8_clamp(PetscReal value, PetscReal lo, PetscReal hi) {
+  return PetscMax(lo, PetscMin(hi, value));
+}
+
+H8VectorStats h8_vector_stats(const std::vector<PetscReal> &values) {
+  H8VectorStats stats;
+  if (values.empty()) return stats;
+  stats.min = values.front();
+  stats.max = values.front();
+  for (const PetscReal value : values) {
+    stats.min = PetscMin(stats.min, value);
+    stats.max = PetscMax(stats.max, value);
+    stats.sum += value;
+    stats.l1 += PetscAbsReal(value);
+  }
+  return stats;
+}
+
+void round_h8_mma_sensitivity_like_matlab(std::vector<PetscReal> *values) {
+  PetscReal max_abs = 0.0;
+  for (const PetscReal value : *values) {
+    max_abs = PetscMax(max_abs, PetscAbsReal(value));
+  }
+  if (max_abs <= 0.0) return;
+  const PetscReal digits =
+      5.0 - std::floor(std::log10(static_cast<double>(max_abs)));
+  const PetscReal scale = std::pow(10.0, static_cast<double>(digits));
+  if (!(scale > 0.0) || !std::isfinite(static_cast<double>(scale))) return;
+  for (PetscReal &value : *values) {
+    value = std::round(static_cast<double>(value * scale)) / scale;
+  }
+}
+
+PetscErrorCode write_h8_matlab_z_mma_variables(
+    DM eda, Vec mask, const OptimizerOptions &opt,
+    const std::vector<PetscReal> &x, Vec rho_design,
+    PetscReal *max_change) {
+  PetscScalar ***r = nullptr, ***m = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt ex = 0, ey = 0, ez = 0;
+  PetscReal local_change = 0.0;
+
+  PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  const PetscInt column_count = ex * ey;
+  const PetscInt x_face_count = ey * ez;
+  const PetscInt y_face_count = ex * ez;
+  const PetscInt z_offset = 2 * x_face_count + 2 * y_face_count;
+  const PetscInt full_count = z_offset + 2 * column_count;
+  const PetscBool full_mma =
+      x.size() == static_cast<std::size_t>(full_count) ? PETSC_TRUE
+                                                       : PETSC_FALSE;
+  PetscCheck(full_mma || x.size() == static_cast<std::size_t>(2 * column_count),
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_SIZ,
+             "MATLAB z MMA variable vector has the wrong length");
+  PetscCall(DMDAVecGetArray(eda, rho_design, &r));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    if (k != 0 && k != ez - 1) continue;
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscReal mask_value = PetscRealPart(m[k][j][i]);
+        const PetscReal old_value = PetscRealPart(r[k][j][i]);
+        PetscReal new_value = old_value;
+        if (h8_mask_is_design(mask_value) ||
+            h8_mask_is_fixed_solid(mask_value)) {
+          const PetscInt id = h8_matlab_z_var_id(i, j, ey);
+          if (k == 0) {
+            const PetscInt var_id = full_mma ? z_offset + id : id;
+            new_value = 1.0 - x[static_cast<std::size_t>(var_id)];
+          } else {
+            const PetscInt var_id =
+                full_mma ? z_offset + column_count + id : column_count + id;
+            new_value =
+                x[static_cast<std::size_t>(var_id)];
+          }
+          new_value = h8_clamp(new_value, 0.0, 1.0);
+        }
+        r[k][j][i] = new_value;
+        local_change =
+            PetscMax(local_change, PetscAbsReal(new_value - old_value));
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArray(eda, rho_design, &r));
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  PetscCallMPI(MPI_Allreduce(&local_change, max_change, 1, MPIU_REAL, MPI_MAX,
+                             PETSC_COMM_WORLD));
+  (void)opt;
+  return 0;
+}
+
+void filter_h8_mma_face_block(const std::vector<PetscReal> &input,
+                              PetscInt offset, PetscInt n1, PetscInt n2,
+                              PetscReal radius,
+                              std::vector<PetscReal> *output) {
+  if (radius <= 0.0) {
+    for (PetscInt a = 0; a < n1; ++a) {
+      for (PetscInt b = 0; b < n2; ++b) {
+        const std::size_t id = static_cast<std::size_t>(offset + a * n2 + b);
+        (*output)[id] = input[id];
+      }
+    }
+    return;
+  }
+  const PetscInt rr =
+      PetscMax(0, static_cast<PetscInt>(PetscCeilReal(radius) - 1));
+  for (PetscInt a = 0; a < n1; ++a) {
+    for (PetscInt b = 0; b < n2; ++b) {
+      PetscReal sum = 0.0;
+      PetscReal denom = 0.0;
+      for (PetscInt da = -rr; da <= rr; ++da) {
+        const PetscInt aa = a + da;
+        if (aa < 0 || aa >= n1) continue;
+        for (PetscInt db = -rr; db <= rr; ++db) {
+          const PetscInt bb = b + db;
+          if (bb < 0 || bb >= n2) continue;
+          const PetscReal w =
+              PetscMax(0.0, radius - PetscSqrtReal(da * da + db * db));
+          if (w <= 0.0) continue;
+          const std::size_t src =
+              static_cast<std::size_t>(offset + aa * n2 + bb);
+          sum += w * input[src];
+          denom += w;
+        }
+      }
+      const std::size_t dst = static_cast<std::size_t>(offset + a * n2 + b);
+      (*output)[dst] = denom > 0.0 ? sum / denom : input[dst];
+    }
+  }
+}
+
+void filter_h8_matlab_full_mma_sensitivity(
+    const std::vector<PetscReal> &input, PetscInt ex, PetscInt ey, PetscInt ez,
+    PetscReal radius, std::vector<PetscReal> *output) {
+  const PetscInt x_face_count = ey * ez;
+  const PetscInt y_face_count = ex * ez;
+  const PetscInt z_face_count = ex * ey;
+  output->assign(input.size(), 0.0);
+  filter_h8_mma_face_block(input, 0, ey, ez, radius, output);
+  filter_h8_mma_face_block(input, x_face_count, ey, ez, radius, output);
+  filter_h8_mma_face_block(input, 2 * x_face_count, ex, ez, radius, output);
+  filter_h8_mma_face_block(input, 2 * x_face_count + y_face_count, ex, ez,
+                           radius, output);
+  filter_h8_mma_face_block(input, 2 * x_face_count + 2 * y_face_count, ex, ey,
+                           radius, output);
+  filter_h8_mma_face_block(input,
+                           2 * x_face_count + 2 * y_face_count + z_face_count,
+                           ex, ey, radius, output);
+}
+
+PetscErrorCode collect_h8_matlab_full_mma_data(
+    DM eda, Vec rho_design, Vec mask, Vec dc_phys,
+    const DensityOptions &density_options, const OptimizerOptions &opt,
+    PetscReal outer_beta, std::vector<PetscReal> *x,
+    std::vector<PetscReal> *df0dx, std::vector<PetscReal> *dfdx) {
+  (void)density_options;
+  PetscScalar ***dc = nullptr, ***m = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt ex = 0, ey = 0, ez = 0;
+  PetscMPIInt reduce_count = 0;
+  std::vector<PetscReal> bottom;
+  std::vector<PetscReal> top;
+
+  PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  const PetscInt x_face_count = ey * ez;
+  const PetscInt y_face_count = ex * ez;
+  const PetscInt z_face_count = ex * ey;
+  const PetscInt y_offset = 2 * x_face_count;
+  const PetscInt z_offset = y_offset + 2 * y_face_count;
+  const PetscInt n = z_offset + 2 * z_face_count;
+  const PetscReal inv_total =
+      1.0 / static_cast<PetscReal>(PetscMax(1, ex * ey * ez));
+  const PetscReal beta = PetscMax(1.0e-12, opt.draft_beta);
+  PetscCall(PetscMPIIntCast(n, &reduce_count));
+  PetscCall(gather_h8_z_surface_variables(eda, rho_design, mask, opt,
+                                          &bottom, &top));
+
+  x->assign(static_cast<std::size_t>(n), 0.0);
+  std::vector<PetscReal> local_df0dx(static_cast<std::size_t>(n), 0.0);
+  std::vector<PetscReal> local_dfdx(static_cast<std::size_t>(n), 0.0);
+  std::vector<PetscReal> global_df0dx(static_cast<std::size_t>(n), 0.0);
+  std::vector<PetscReal> global_dfdx(static_cast<std::size_t>(n), 0.0);
+
+  for (PetscInt j = 0; j < ey; ++j) {
+    for (PetscInt k = 0; k < ez; ++k) {
+      const PetscInt id = j * ez + k;
+      (*x)[static_cast<std::size_t>(id)] = 0.0;
+      (*x)[static_cast<std::size_t>(x_face_count + id)] = 1.0;
+    }
+  }
+  for (PetscInt i = 0; i < ex; ++i) {
+    for (PetscInt k = 0; k < ez; ++k) {
+      const PetscInt id = i * ez + k;
+      (*x)[static_cast<std::size_t>(y_offset + id)] = 0.0;
+      (*x)[static_cast<std::size_t>(y_offset + y_face_count + id)] = 1.0;
+    }
+  }
+  for (PetscInt i = 0; i < ex; ++i) {
+    for (PetscInt j = 0; j < ey; ++j) {
+      const PetscInt id = h8_matlab_z_var_id(i, j, ey);
+      const std::size_t sid = static_cast<std::size_t>(id);
+      (*x)[static_cast<std::size_t>(z_offset + id)] = 1.0 - bottom[sid];
+      (*x)[static_cast<std::size_t>(z_offset + z_face_count + id)] = top[sid];
+    }
+  }
+
+  PetscCall(DMDAVecGetArrayRead(eda, dc_phys, &dc));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    const PetscReal zf = h8_matlab_cell_coordinate(k, ez);
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      const PetscReal yf = h8_matlab_cell_coordinate(j, ey);
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        if (!h8_mask_is_design(PetscRealPart(m[k][j][i]))) continue;
+        const PetscReal xf = h8_matlab_cell_coordinate(i, ex);
+        const PetscInt zid = h8_matlab_z_var_id(i, j, ey);
+        const std::size_t zsid = static_cast<std::size_t>(zid);
+        const PetscReal eta1_z = 1.0 - bottom[zsid];
+        const PetscReal eta2_z = top[zsid];
+        const PetscReal xt1 = h8_matlab_cut_value(xf, 0.0, beta);
+        const PetscReal xt2 = 1.0 - h8_matlab_cut_value(xf, 1.0, beta);
+        const PetscReal yt1 = h8_matlab_cut_value(yf, 0.0, beta);
+        const PetscReal yt2 = 1.0 - h8_matlab_cut_value(yf, 1.0, beta);
+        const PetscReal zt1 = h8_matlab_cut_value(zf, eta1_z, beta);
+        const PetscReal zt2 = 1.0 - h8_matlab_cut_value(zf, eta2_z, beta);
+        const PetscReal rho1 = xt1 * xt2 * yt1 * yt2 * zt1 * zt2;
+        const PetscReal outer =
+            h8_outer_projection_derivative(rho1, opt, outer_beta);
+        const PetscReal dc_value = PetscRealPart(dc[k][j][i]);
+        const PetscInt x_var = j * ez + k;
+        const PetscInt y_var = i * ez + k;
+        const PetscReal d_xt1 = h8_matlab_cut_deta(xf, 0.0, beta);
+        const PetscReal d_xt2 = -h8_matlab_cut_deta(xf, 1.0, beta);
+        const PetscReal d_yt1 = h8_matlab_cut_deta(yf, 0.0, beta);
+        const PetscReal d_yt2 = -h8_matlab_cut_deta(yf, 1.0, beta);
+        const PetscReal d_zt1 = h8_matlab_cut_deta(zf, eta1_z, beta);
+        const PetscReal d_zt2 = -h8_matlab_cut_deta(zf, eta2_z, beta);
+        const PetscReal derivs[6] = {
+            outer * d_xt1 * xt2 * yt1 * yt2 * zt1 * zt2,
+            outer * d_xt2 * xt1 * yt1 * yt2 * zt1 * zt2,
+            outer * d_yt1 * xt1 * xt2 * yt2 * zt1 * zt2,
+            outer * d_yt2 * xt1 * xt2 * yt1 * zt1 * zt2,
+            outer * d_zt1 * xt1 * xt2 * yt1 * yt2 * zt2,
+            outer * d_zt2 * xt1 * xt2 * yt1 * yt2 * zt1};
+        const PetscInt ids[6] = {
+            x_var,
+            x_face_count + x_var,
+            y_offset + y_var,
+            y_offset + y_face_count + y_var,
+            z_offset + zid,
+            z_offset + z_face_count + zid};
+        for (PetscInt q = 0; q < 6; ++q) {
+          const std::size_t sid = static_cast<std::size_t>(ids[q]);
+          local_df0dx[sid] += dc_value * derivs[q];
+          local_dfdx[sid] += inv_total * derivs[q];
+        }
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayRead(eda, dc_phys, &dc));
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  PetscCallMPI(MPI_Allreduce(local_df0dx.data(), global_df0dx.data(),
+                             reduce_count, MPIU_REAL, MPI_SUM,
+                             PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(local_dfdx.data(), global_dfdx.data(),
+                             reduce_count, MPIU_REAL, MPI_SUM,
+                             PETSC_COMM_WORLD));
+  filter_h8_matlab_full_mma_sensitivity(global_df0dx, ex, ey, ez,
+                                        opt.filter_radius, df0dx);
+  filter_h8_matlab_full_mma_sensitivity(global_dfdx, ex, ey, ez,
+                                        opt.filter_radius, dfdx);
+  return 0;
+}
+
+void h8_mma_xyz_scalar(const std::vector<PetscReal> &L,
+                       const std::vector<PetscReal> &U,
+                       const std::vector<PetscReal> &alpha,
+                       const std::vector<PetscReal> &beta,
+                       const std::vector<PetscReal> &p0,
+                       const std::vector<PetscReal> &q0,
+                       const std::vector<PetscReal> &pij,
+                       const std::vector<PetscReal> &qij,
+                       PetscReal lam_in, std::vector<PetscReal> *x,
+                       PetscReal *y, PetscReal *z) {
+  const PetscReal lam = PetscMax(0.0, lam_in);
+  const PetscInt n = static_cast<PetscInt>(L.size());
+  x->assign(static_cast<std::size_t>(n), 0.0);
+  *y = PetscMax(0.0, lam - 100.0);
+  *z = 0.0;
+  for (PetscInt j = 0; j < n; ++j) {
+    const std::size_t sid = static_cast<std::size_t>(j);
+    const PetscReal pjlam = PetscMax(0.0, p0[sid] + pij[sid] * lam);
+    const PetscReal qjlam = PetscMax(0.0, q0[sid] + qij[sid] * lam);
+    const PetscReal sp = std::sqrt(static_cast<double>(pjlam));
+    const PetscReal sq = std::sqrt(static_cast<double>(qjlam));
+    const PetscReal denom = sp + sq;
+    PetscReal value =
+        denom > 0.0 ? (sp * L[sid] + sq * U[sid]) / denom
+                    : 0.5 * (alpha[sid] + beta[sid]);
+    (*x)[sid] = h8_clamp(value, alpha[sid], beta[sid]);
+  }
+}
+
+PetscReal h8_mma_constraint_value(const std::vector<PetscReal> &L,
+                                  const std::vector<PetscReal> &U,
+                                  const std::vector<PetscReal> &pij,
+                                  const std::vector<PetscReal> &qij,
+                                  const std::vector<PetscReal> &x) {
+  PetscReal gx = 0.0;
+  const PetscInt n = static_cast<PetscInt>(x.size());
+  for (PetscInt j = 0; j < n; ++j) {
+    const std::size_t sid = static_cast<std::size_t>(j);
+    const PetscReal ux = PetscMax(1.0e-30, U[sid] - x[sid]);
+    const PetscReal xl = PetscMax(1.0e-30, x[sid] - L[sid]);
+    gx += pij[sid] / ux + qij[sid] / xl;
+  }
+  return gx;
+}
+
+PetscReal h8_mma_dual_hessian_scalar(
+    const std::vector<PetscReal> &L, const std::vector<PetscReal> &U,
+    const std::vector<PetscReal> &alpha,
+    const std::vector<PetscReal> &beta,
+    const std::vector<PetscReal> &p0, const std::vector<PetscReal> &q0,
+    const std::vector<PetscReal> &pij, const std::vector<PetscReal> &qij,
+    const std::vector<PetscReal> &x, PetscReal lam, PetscReal mu) {
+  PetscReal hess = 0.0;
+  const PetscInt n = static_cast<PetscInt>(x.size());
+  for (PetscInt j = 0; j < n; ++j) {
+    const std::size_t sid = static_cast<std::size_t>(j);
+    const PetscReal ux = PetscMax(1.0e-30, U[sid] - x[sid]);
+    const PetscReal xl = PetscMax(1.0e-30, x[sid] - L[sid]);
+    const PetscReal ux2 = ux * ux;
+    const PetscReal xl2 = xl * xl;
+    const PetscReal pjlam = PetscMax(0.0, p0[sid] + pij[sid] * lam);
+    const PetscReal qjlam = PetscMax(0.0, q0[sid] + qij[sid] * lam);
+    const PetscReal pq = pij[sid] / ux2 - qij[sid] / xl2;
+    const PetscReal df2 =
+        2.0 * pjlam / (ux2 * ux) + 2.0 * qjlam / (xl2 * xl);
+    const PetscReal sp = std::sqrt(static_cast<double>(pjlam));
+    const PetscReal sq = std::sqrt(static_cast<double>(qjlam));
+    const PetscReal denom = sp + sq;
+    const PetscReal xp =
+        denom > 0.0 ? (sp * L[sid] + sq * U[sid]) / denom
+                    : 0.5 * (alpha[sid] + beta[sid]);
+    PetscReal df2_inv = df2 > 0.0 ? -1.0 / df2 : 0.0;
+    if (xp < alpha[sid] || xp > beta[sid]) df2_inv = 0.0;
+    hess += pq * df2_inv * pq;
+  }
+  if (lam > 100.0) hess -= 1.0;
+  hess -= mu / PetscMax(1.0e-30, lam);
+  PetscReal hess_corr = 1.0e-4 * hess;
+  if (-hess_corr < 1.0e-7) hess_corr = -1.0e-7;
+  hess += hess_corr;
+  if (PetscAbsReal(hess) < 1.0e-30) hess = -1.0e-30;
+  return hess;
+}
+
+void h8_mma_solve_scalar(
+    const std::vector<PetscReal> &L, const std::vector<PetscReal> &U,
+    const std::vector<PetscReal> &alpha,
+    const std::vector<PetscReal> &beta,
+    const std::vector<PetscReal> &p0, const std::vector<PetscReal> &q0,
+    const std::vector<PetscReal> &pij, const std::vector<PetscReal> &qij,
+    PetscReal b, std::vector<PetscReal> *x_out) {
+  const PetscInt n = static_cast<PetscInt>(L.size());
+  const PetscReal tol =
+      1.0e-9 * std::sqrt(static_cast<double>(PetscMax(1, n + 1)));
+  PetscReal lam = 50.0;
+  PetscReal mu = 1.0;
+  PetscReal y = 0.0;
+  PetscReal z = 0.0;
+  PetscReal epsi = 1.0;
+  PetscReal nrI = 1.0;
+  std::vector<PetscReal> x;
+
+  while (epsi > tol) {
+    PetscInt loop = 0;
+    while (nrI > 0.9 * epsi && loop < 100) {
+      ++loop;
+      h8_mma_xyz_scalar(L, U, alpha, beta, p0, q0, pij, qij, lam, &x, &y, &z);
+      const PetscReal gx = h8_mma_constraint_value(L, U, pij, qij, x);
+      const PetscReal grad =
+          -1.0 * (gx - b - y) - epsi / PetscMax(1.0e-30, lam);
+      const PetscReal hess =
+          h8_mma_dual_hessian_scalar(L, U, alpha, beta, p0, q0, pij, qij, x,
+                                     lam, mu);
+      const PetscReal s1 = grad / hess;
+      const PetscReal s2 =
+          -mu + epsi / PetscMax(1.0e-30, lam) -
+          s1 * mu / PetscMax(1.0e-30, lam);
+      PetscReal theta = 1.005;
+      if (theta < -1.01 * s1 / PetscMax(1.0e-30, lam)) {
+        theta = -1.01 * s1 / PetscMax(1.0e-30, lam);
+      }
+      if (theta < -1.01 * s2 / PetscMax(1.0e-30, mu)) {
+        theta = -1.01 * s2 / PetscMax(1.0e-30, mu);
+      }
+      const PetscReal step = 1.0 / theta;
+      lam = PetscMax(1.0e-30, lam + step * s1);
+      mu = PetscMax(1.0e-30, mu + step * s2);
+      h8_mma_xyz_scalar(L, U, alpha, beta, p0, q0, pij, qij, lam, &x, &y, &z);
+      const PetscReal gx_new = h8_mma_constraint_value(L, U, pij, qij, x);
+      const PetscReal res1 = -b - y + gx_new + mu;
+      const PetscReal res2 = mu * lam - epsi;
+      nrI = PetscMax(PetscAbsReal(res1), PetscAbsReal(res2));
+    }
+    epsi *= 0.1;
+  }
+  if (x.empty()) {
+    h8_mma_xyz_scalar(L, U, alpha, beta, p0, q0, pij, qij, lam, &x, &y, &z);
+  }
+  *x_out = std::move(x);
+}
+
+void h8_matlab_mma_gensub(PetscInt iter, const std::vector<PetscReal> &x,
+                          const std::vector<PetscReal> &dfdx,
+                          PetscReal gx,
+                          const std::vector<PetscReal> &dgdx,
+                          PetscReal move, H8MatlabMMAState *state,
+                          std::vector<PetscReal> *xmma) {
+  const PetscInt n = static_cast<PetscInt>(x.size());
+  if (state->n != n) {
+    state->n = n;
+    state->xold1.assign(static_cast<std::size_t>(n), 0.0);
+    state->xold2.assign(static_cast<std::size_t>(n), 0.0);
+    state->L.assign(static_cast<std::size_t>(n), 0.0);
+    state->U.assign(static_cast<std::size_t>(n), 0.0);
+  }
+  std::vector<PetscReal> xmin(static_cast<std::size_t>(n), 0.0);
+  std::vector<PetscReal> xmax(static_cast<std::size_t>(n), 1.0);
+  std::vector<PetscReal> alpha(static_cast<std::size_t>(n), 0.0);
+  std::vector<PetscReal> beta(static_cast<std::size_t>(n), 1.0);
+  std::vector<PetscReal> p0(static_cast<std::size_t>(n), 0.0);
+  std::vector<PetscReal> q0(static_cast<std::size_t>(n), 0.0);
+  std::vector<PetscReal> pij(static_cast<std::size_t>(n), 0.0);
+  std::vector<PetscReal> qij(static_cast<std::size_t>(n), 0.0);
+
+  for (PetscInt j = 0; j < n; ++j) {
+    const std::size_t sid = static_cast<std::size_t>(j);
+    xmin[sid] = PetscMax(0.0, x[sid] - move);
+    xmax[sid] = PetscMin(1.0, x[sid] + move);
+  }
+
+  if (iter < 3) {
+    for (PetscInt j = 0; j < n; ++j) {
+      const std::size_t sid = static_cast<std::size_t>(j);
+      const PetscReal width = xmax[sid] - xmin[sid];
+      state->L[sid] = x[sid] - 0.5 * width;
+      state->U[sid] = x[sid] + 0.5 * width;
+    }
+  } else {
+    for (PetscInt j = 0; j < n; ++j) {
+      const std::size_t sid = static_cast<std::size_t>(j);
+      PetscReal gamma = 1.0;
+      const PetscReal help =
+          (x[sid] - state->xold1[sid]) *
+          (state->xold1[sid] - state->xold2[sid]);
+      if (help < 0.0) gamma = 0.7;
+      else if (help > 0.0) gamma = 1.2;
+      state->L[sid] = x[sid] - gamma * (state->xold1[sid] - state->L[sid]);
+      state->U[sid] = x[sid] + gamma * (state->U[sid] - state->xold1[sid]);
+      const PetscReal xmi = PetscMax(1.0e-5, xmax[sid] - xmin[sid]);
+      state->L[sid] = PetscMax(state->L[sid], x[sid] - 10.0 * xmi);
+      state->L[sid] = PetscMin(state->L[sid], x[sid] - 0.01 * xmi);
+      state->U[sid] = PetscMax(state->U[sid], x[sid] + 0.01 * xmi);
+      state->U[sid] = PetscMin(state->U[sid], x[sid] + 10.0 * xmi);
+    }
+  }
+
+  PetscReal b = -gx;
+  for (PetscInt j = 0; j < n; ++j) {
+    const std::size_t sid = static_cast<std::size_t>(j);
+    alpha[sid] = PetscMax(xmin[sid], 0.9 * state->L[sid] + 0.1 * x[sid]);
+    beta[sid] = PetscMin(xmax[sid], 0.9 * state->U[sid] + 0.1 * x[sid]);
+    const PetscReal ux = PetscMax(1.0e-30, state->U[sid] - x[sid]);
+    const PetscReal xl = PetscMax(1.0e-30, x[sid] - state->L[sid]);
+    const PetscReal inv_width =
+        1.0 / PetscMax(1.0e-30, state->U[sid] - state->L[sid]);
+    const PetscReal dfdxp = PetscMax(0.0, dfdx[sid]);
+    const PetscReal dfdxm = PetscMax(0.0, -dfdx[sid]);
+    const PetscReal dgdxp = PetscMax(0.0, dgdx[sid]);
+    const PetscReal dgdxm = PetscMax(0.0, -dgdx[sid]);
+    p0[sid] = ux * ux *
+              (dfdxp + 0.001 * PetscAbsReal(dfdx[sid]) +
+               1.0e-6 * inv_width);
+    q0[sid] = xl * xl *
+              (dfdxm + 0.001 * PetscAbsReal(dfdx[sid]) +
+               1.0e-6 * inv_width);
+    pij[sid] = ux * ux *
+               (dgdxp + 0.001 * PetscAbsReal(dgdx[sid]) +
+                1.0e-6 * inv_width);
+    qij[sid] = xl * xl *
+               (dgdxm + 0.001 * PetscAbsReal(dgdx[sid]) +
+                1.0e-6 * inv_width);
+    b += pij[sid] / ux + qij[sid] / xl;
+  }
+
+  h8_mma_solve_scalar(state->L, state->U, alpha, beta, p0, q0, pij, qij, b,
+                      xmma);
+  state->xold2 = state->xold1;
+  state->xold1 = x;
+}
+
+PetscReal h8_matlab_mma_move_for_iter(const OptimizerOptions &opt,
+                                      PetscInt iter) {
+  PetscReal move = PetscMax(0.01 - 0.0001 * static_cast<PetscReal>(iter),
+                            0.001);
+  if (opt.move > 0.0 && opt.move < 0.05) move = PetscMin(move, opt.move);
+  return move;
+}
+
+PetscErrorCode h8_mma_update_matlab_z(
+    DM eda, Vec rho_design, Vec mask, Vec dc_phys,
+    const DensityOptions &density_options, const OptimizerOptions &opt,
+    PetscReal outer_beta, PetscInt iter, PetscReal compliance,
+    PetscReal volume, H8MatlabMMAState *mma_state,
+    H8MatlabMMADiagnostics *diag, PetscReal *max_change) {
+  std::vector<PetscReal> x;
+  std::vector<PetscReal> df0dx;
+  std::vector<PetscReal> dfdx;
+  std::vector<PetscReal> xmma;
+  PetscCall(collect_h8_matlab_full_mma_data(
+      eda, rho_design, mask, dc_phys, density_options, opt, outer_beta, &x,
+      &df0dx, &dfdx));
+
+  if (mma_state->c_scale <= 0.0) {
+    mma_state->c_scale = compliance != 0.0 ? 1.0 / compliance : 1.0;
+  }
+  for (PetscReal &value : df0dx) value *= mma_state->c_scale;
+  round_h8_mma_sensitivity_like_matlab(&df0dx);
+  round_h8_mma_sensitivity_like_matlab(&dfdx);
+
+  const PetscReal fval = volume - PetscMax(0.9 * volume, opt.volfrac);
+  const PetscReal move = h8_matlab_mma_move_for_iter(opt, iter);
+  h8_matlab_mma_gensub(iter, x, df0dx, fval, dfdx, move, mma_state, &xmma);
+  if (diag != nullptr) {
+    diag->f0val = compliance * mma_state->c_scale;
+    diag->fval = fval;
+    diag->c_scale = mma_state->c_scale;
+    diag->move = move;
+    diag->beta1 = opt.draft_beta;
+    diag->beta2 = outer_beta;
+    diag->x = h8_vector_stats(x);
+    diag->xmma = h8_vector_stats(xmma);
+    diag->df0dx = h8_vector_stats(df0dx);
+    diag->dfdx = h8_vector_stats(dfdx);
+    diag->x_values = x;
+    diag->xmma_values = xmma;
+    diag->df0dx_values = df0dx;
+    diag->dfdx_values = dfdx;
+    diag->x_change = 0.0;
+    const PetscInt n =
+        static_cast<PetscInt>(PetscMin(x.size(), xmma.size()));
+    for (PetscInt q = 0; q < n; ++q) {
+      const std::size_t sid = static_cast<std::size_t>(q);
+      diag->x_change =
+          PetscMax(diag->x_change, PetscAbsReal(xmma[sid] - x[sid]));
+    }
+  }
+  PetscCall(write_h8_matlab_z_mma_variables(eda, mask, opt, xmma, rho_design,
+                                            max_change));
+  return 0;
+}
+
 PetscErrorCode apply_sensitivity_filter_adjoint(DM eda, Vec dc_phys, Vec mask,
                                                 Vec denom, PetscReal radius,
                                                 Vec dc_design) {
@@ -1144,6 +2362,12 @@ PetscErrorCode create_element_mask_and_density(DM eda, const Grid &grid,
   PetscScalar ***m = nullptr;
   PetscScalar ***r = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt ez = 0;
+  PetscBool matlab_z_projection = PETSC_FALSE;
+  PetscCall(h8_uses_matlab_z_projection(opt, &matlab_z_projection));
+  PetscCall(DMDAGetInfo(eda, nullptr, nullptr, nullptr, &ez, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                        nullptr));
   PetscCall(DMCreateGlobalVector(eda, mask));
   PetscCall(VecDuplicate(*mask, rho));
   PetscCall(DMDAVecGetArray(eda, *mask, &m));
@@ -1153,7 +2377,7 @@ PetscErrorCode create_element_mask_and_density(DM eda, const Grid &grid,
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         const PetscBool forced_solid =
-            h8_cell_is_forced_solid(i, j, k, grid, density_options);
+            h8_cell_is_forced_solid(i, j, k, grid, density_options, opt);
         const PetscBool design =
             cell_density(i, j, k, grid, density_options) >=
                     density_options.mask_threshold
@@ -1164,7 +2388,10 @@ PetscErrorCode create_element_mask_and_density(DM eda, const Grid &grid,
           r[k][j][i] = 1.0;
         } else if (design) {
           m[k][j][i] = 1.0;
-          r[k][j][i] = opt.volfrac;
+          r[k][j][i] =
+              matlab_z_projection
+                  ? ((k == 0 || k == ez - 1) ? 1.0 : opt.rho_min)
+                  : opt.volfrac;
         } else {
           m[k][j][i] = 0.0;
           r[k][j][i] = density_options.void_density;
@@ -1721,14 +2948,16 @@ PetscBool h8_pc_type_uses_aux_matrix(const char *h8_pc_type) {
   return (std::strcmp(h8_pc_type, "aux_gamg") == 0 ||
           std::strcmp(h8_pc_type, "aux_hypre") == 0 ||
           std::strcmp(h8_pc_type, "aux_elastic_gamg") == 0 ||
-          std::strcmp(h8_pc_type, "aux_elastic_hypre") == 0)
+          std::strcmp(h8_pc_type, "aux_elastic_hypre") == 0 ||
+          std::strcmp(h8_pc_type, "aux_elastic_lu") == 0)
              ? PETSC_TRUE
              : PETSC_FALSE;
 }
 
 PetscBool h8_pc_type_uses_elastic_aux_matrix(const char *h8_pc_type) {
   return (std::strcmp(h8_pc_type, "aux_elastic_gamg") == 0 ||
-          std::strcmp(h8_pc_type, "aux_elastic_hypre") == 0)
+          std::strcmp(h8_pc_type, "aux_elastic_hypre") == 0 ||
+          std::strcmp(h8_pc_type, "aux_elastic_lu") == 0)
              ? PETSC_TRUE
              : PETSC_FALSE;
 }
@@ -1855,9 +3084,18 @@ PetscErrorCode configure_h8_ksp(KSP ksp, Mat A, Mat P, DM uda, DM eda, Vec rho,
     PetscCall(PCSetFromOptions(pc));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "H8 preconditioner: assembled H8 elasticity auxiliary matrix with PETSc/HYPRE\n"));
+  } else if (std::strcmp(h8_pc_type, "aux_elastic_lu") == 0) {
+    PetscCheck(P != nullptr, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+               "aux_elastic_lu needs an assembled auxiliary matrix");
+    PC pc = nullptr;
+    PetscCall(KSPGetPC(ksp, &pc));
+    PetscCall(PCSetType(pc, PCLU));
+    PetscCall(PCSetFromOptions(pc));
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                          "H8 preconditioner: assembled H8 elasticity auxiliary matrix with PETSc LU (small diagnostics)\n"));
   } else {
     PetscCheck(PETSC_FALSE, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-               "-h8_pc_type must be block_jacobi, jacobi, petsc, aux_gamg, aux_hypre, aux_elastic_gamg, or aux_elastic_hypre");
+               "-h8_pc_type must be block_jacobi, jacobi, petsc, aux_gamg, aux_hypre, aux_elastic_gamg, aux_elastic_hypre, or aux_elastic_lu");
   }
   return 0;
 }
@@ -2190,11 +3428,21 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
   PetscReal local_torsion_denom = 0.0;
   PetscReal global_torsion_denom = 0.0;
   const PetscBool torsion = benchmark_is_torsion(optimizer_options.benchmark_case);
+  const PetscBool bridge = benchmark_is_bridge(optimizer_options.benchmark_case);
+  const PetscBool mbb = benchmark_is_mbb(optimizer_options.benchmark_case);
+  const PetscBool tri = benchmark_is_tri(optimizer_options.benchmark_case);
+  const PetscBool bottom_point =
+      benchmark_is_bottom_point_cantilever(optimizer_options.benchmark_case);
+  const PetscInt load_j0 = PetscMax(static_cast<PetscInt>(0), (grid.ny - 1) / 2);
+  const PetscInt load_j1 = PetscMax(static_cast<PetscInt>(0), grid.ny / 2);
+  const PetscInt cantilever_load_nodes = (load_j0 == load_j1) ? 1 : 2;
+  const PetscInt matlab_load_k =
+      PetscMax(static_cast<PetscInt>(0), (grid.nz - 1) / 2);
 
-  PetscCheck(torsion ||
-                 std::strcmp(optimizer_options.benchmark_case, "cantilever") == 0,
+  PetscCheck(torsion || bridge || mbb || tri ||
+                 benchmark_is_cantilever(optimizer_options.benchmark_case),
              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-             "-benchmark_case must be cantilever or torsion");
+             "-benchmark_case must be cantilever, cant, bottom_point, bridge, mbb, tri, or torsion");
 
   PetscCall(VecSet(b, 0.0));
   PetscCall(DMDAGetCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
@@ -2222,8 +3470,22 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
   for (PetscInt k = zs; k < zs + zm; ++k) {
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
-        if (i != grid.nx - 1) continue;
-        if (torsion) {
+        if (bridge) {
+          // MATLAB initiMesh('bridge'): -Z load on every top-surface node.
+          if (k != grid.nz - 1) continue;
+          bg[k][j][i][2] += -optimizer_options.load;
+        } else if (mbb) {
+          // MATLAB initiMesh('mbb'): -Z load on the right-end bottom line.
+          if (i != grid.nx - 1 || k != 0) continue;
+          bg[k][j][i][2] += -optimizer_options.load;
+        } else if (tri) {
+          // MATLAB initiMesh('tri'): -X and -Y load at the z-top,
+          // y-high, x-left corner.
+          if (i != 0 || j != grid.ny - 1 || k != grid.nz - 1) continue;
+          bg[k][j][i][0] += -optimizer_options.load;
+          bg[k][j][i][1] += -optimizer_options.load;
+        } else if (torsion) {
+          if (i != grid.nx - 1) continue;
           PetscReal x = 0.0, y = 0.0, z = 0.0;
           h8_node_physical(i, j, k, grid, &x, &y, &z);
           const PetscReal yc = y - 0.5 * domain_width(grid);
@@ -2231,11 +3493,19 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
           // 右端面切向力形成绕 x 轴的扭矩，合力近似为零，适合扭转梁 benchmark。
           bg[k][j][i][1] += -optimizer_options.load * zc / global_torsion_denom;
           bg[k][j][i][2] += optimizer_options.load * yc / global_torsion_denom;
-        } else {
-          // 经典 3D 悬臂梁：右端面均布 -Z 方向载荷。
+        } else if (bottom_point) {
+          if (i != grid.nx - 1) continue;
+          // Concentrated -Z load at the right-end bottom-center node(s).
+          if (k != 0 || (j != load_j0 && j != load_j1)) continue;
+          // Split the total force across the one or two centerline nodes.
           bg[k][j][i][2] +=
               -optimizer_options.load /
-              static_cast<PetscReal>(grid.ny * grid.nz);
+              static_cast<PetscReal>(cantilever_load_nodes);
+        } else {
+          if (i != grid.nx - 1) continue;
+          // MATLAB initiMesh('cant'): -Z load on the right-end mid-height line.
+          if (k != matlab_load_k) continue;
+          bg[k][j][i][2] += -optimizer_options.load;
         }
       }
     }
@@ -2273,7 +3543,9 @@ PetscErrorCode fill_h8_load(DM uda, DM eda, Vec mask, const Grid &grid,
 PetscErrorCode compute_h8_sensitivity(DM uda, DM eda, Vec u, Vec rho, Vec mask,
                                       const Grid &grid,
                                       const DensityOptions &density_options,
-                                      const PetscReal *ke, Vec dc,
+                                      const PetscReal *ke,
+                                      PetscBool include_fixed_solid_volume,
+                                      Vec dc,
                                       PetscReal *volume_fraction) {
   (void)grid;
   Vec local_u = nullptr;
@@ -2302,7 +3574,8 @@ PetscErrorCode compute_h8_sensitivity(DM uda, DM eda, Vec u, Vec rho, Vec mask,
         PetscReal ue[24] = {};
         PetscReal energy = 0.0;
 
-        if (h8_mask_is_design(mask_value)) {
+        if (h8_mask_counts_in_volume(mask_value,
+                                     include_fixed_solid_volume)) {
           local_mask_sum += 1.0;
           local_rho_sum += rho_value;
         }
@@ -2430,6 +3703,7 @@ PetscErrorCode h8_write_trial_design(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
                                      const OptimizerOptions &opt,
                                      Vec trial,
                                      PetscReal *max_change) {
+  (void)density_options;
   PetscScalar ***r = nullptr, ***m = nullptr, ***d = nullptr, ***v = nullptr;
   PetscScalar ***t = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
@@ -2445,7 +3719,7 @@ PetscErrorCode h8_write_trial_design(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         const PetscReal old_value = PetscRealPart(r[k][j][i]);
-        PetscReal new_value = density_options.void_density;
+        PetscReal new_value = old_value;
         const PetscReal mask_value = PetscRealPart(m[k][j][i]);
         if (h8_mask_is_fixed_solid(mask_value)) {
           new_value = 1.0;
@@ -2472,35 +3746,35 @@ PetscErrorCode h8_write_trial_design(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
   return 0;
 }
 
-PetscErrorCode h8_projected_trial_volume(DM eda, Vec rho, Vec mask, Vec dc,
-                                         Vec dv, Vec filter_denom,
+PetscErrorCode h8_projected_trial_volume(DM eda, Vec rho, Vec phys_mask,
+                                         Vec update_mask, Vec dc, Vec dv,
+                                         Vec filter_denom,
                                          PetscReal lambda, PetscReal beta,
                                          const DensityOptions &density_options,
                                          const OptimizerOptions &opt,
+                                         PetscBool include_fixed_solid_volume,
                                          Vec trial_design,
                                          Vec trial_filtered,
                                          Vec trial_phys,
                                          PetscReal *volume) {
-  PetscCall(h8_write_trial_design(eda, rho, mask, dc, dv, lambda,
+  PetscCall(h8_write_trial_design(eda, rho, update_mask, dc, dv, lambda,
                                   density_options, opt, trial_design,
                                   nullptr));
-  PetscCall(apply_density_filter(eda, trial_design, mask, filter_denom,
-                                 opt.filter_radius,
-                                 density_options.void_density,
-                                 trial_filtered));
-  PetscCall(apply_h8_heaviside_projection(
-      eda, trial_filtered, mask, opt, beta, density_options.void_density,
-      trial_phys));
-  PetscCall(apply_h8_draft_closure(eda, mask, opt, trial_phys));
-  PetscCall(compute_masked_volume_fraction(eda, trial_phys, mask, volume));
+  PetscCall(build_h8_physical_density(eda, trial_design, phys_mask,
+                                      filter_denom, density_options, opt,
+                                      beta, trial_filtered, trial_phys));
+  PetscCall(compute_masked_volume_fraction_with_fixed(
+      eda, trial_phys, phys_mask, include_fixed_solid_volume, volume));
   return 0;
 }
 
-PetscErrorCode oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc,
-                                          Vec dv, Vec filter_denom,
+PetscErrorCode oc_update_projected_volume(DM eda, Vec rho, Vec phys_mask,
+                                          Vec update_mask, Vec dc, Vec dv,
+                                          Vec filter_denom,
                                           PetscReal beta,
                                           const DensityOptions &density_options,
                                           const OptimizerOptions &opt,
+                                          PetscBool include_fixed_solid_volume,
                                           PetscReal *max_change) {
   Vec trial_design = nullptr;
   Vec trial_filtered = nullptr;
@@ -2525,13 +3799,15 @@ PetscErrorCode oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc,
 
   PetscReal v1 = 0.0;
   PetscReal v2 = 0.0;
-  PetscCall(h8_projected_trial_volume(eda, rho, mask, dc, dv, filter_denom,
-                                      l1, beta, density_options, opt,
+  PetscCall(h8_projected_trial_volume(eda, rho, phys_mask, update_mask, dc, dv,
+                                      filter_denom, l1, beta, density_options,
+                                      opt, include_fixed_solid_volume,
                                       trial_design, trial_filtered, trial_phys,
                                       &v1));
   consider(l1, v1);
-  PetscCall(h8_projected_trial_volume(eda, rho, mask, dc, dv, filter_denom,
-                                      l2, beta, density_options, opt,
+  PetscCall(h8_projected_trial_volume(eda, rho, phys_mask, update_mask, dc, dv,
+                                      filter_denom, l2, beta, density_options,
+                                      opt, include_fixed_solid_volume,
                                       trial_design, trial_filtered, trial_phys,
                                       &v2));
   consider(l2, v2);
@@ -2539,10 +3815,10 @@ PetscErrorCode oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc,
     l1 = l2;
     v1 = v2;
     l2 *= 10.0;
-    PetscCall(h8_projected_trial_volume(eda, rho, mask, dc, dv, filter_denom,
-                                        l2, beta, density_options, opt,
-                                        trial_design, trial_filtered,
-                                        trial_phys, &v2));
+    PetscCall(h8_projected_trial_volume(
+        eda, rho, phys_mask, update_mask, dc, dv, filter_denom, l2, beta,
+        density_options, opt, include_fixed_solid_volume, trial_design,
+        trial_filtered, trial_phys, &v2));
     consider(l2, v2);
   }
 
@@ -2550,10 +3826,10 @@ PetscErrorCode oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc,
     for (PetscInt it = 0; it < 40; ++it) {
       const PetscReal lambda = 0.5 * (l1 + l2);
       PetscReal volume = 0.0;
-      PetscCall(h8_projected_trial_volume(eda, rho, mask, dc, dv,
-                                          filter_denom, lambda, beta,
-                                          density_options, opt, trial_design,
-                                          trial_filtered, trial_phys, &volume));
+      PetscCall(h8_projected_trial_volume(
+          eda, rho, phys_mask, update_mask, dc, dv, filter_denom, lambda, beta,
+          density_options, opt, include_fixed_solid_volume, trial_design,
+          trial_filtered, trial_phys, &volume));
       consider(lambda, volume);
       if (volume > target) {
         l1 = lambda;
@@ -2566,7 +3842,7 @@ PetscErrorCode oc_update_projected_volume(DM eda, Vec rho, Vec mask, Vec dc,
   const PetscReal final_lambda = best_lambda;
   // 拔模闭包可能让 trial 体积呈现离散跳变；选离目标最近的 trial，
   // 允许体积在目标附近轻微上下摆动，避免单侧欠用体积造成反复震荡。
-  PetscCall(h8_write_trial_design(eda, rho, mask, dc, dv, final_lambda,
+  PetscCall(h8_write_trial_design(eda, rho, update_mask, dc, dv, final_lambda,
                                   density_options, opt, trial_design,
                                   max_change));
   PetscCall(VecCopy(trial_design, rho));
@@ -2580,6 +3856,7 @@ PetscErrorCode oc_update(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
                          const DensityOptions &density_options,
                          const OptimizerOptions &opt,
                          PetscReal *max_change) {
+  (void)density_options;
   PetscReal l1 = 1.0e-300, l2 = 1.0e-300;
   PetscReal design_weight_sum = 0.0;
   PetscCall(h8_design_weight_sum(eda, mask, dv, &design_weight_sum));
@@ -2627,7 +3904,7 @@ PetscErrorCode oc_update(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
       for (PetscInt j = ys; j < ys + ym; ++j) {
         for (PetscInt i = xs; i < xs + xm; ++i) {
           const PetscReal old_value = PetscRealPart(r[k][j][i]);
-          PetscReal new_value = density_options.void_density;
+          PetscReal new_value = old_value;
           const PetscReal mask_value = PetscRealPart(m[k][j][i]);
           if (h8_mask_is_fixed_solid(mask_value)) {
             new_value = 1.0;
@@ -3234,10 +4511,14 @@ PetscErrorCode write_h8_summary(const char *output_prefix, const Grid &grid,
                                    opt.draft_axes));
   PetscCall(PetscViewerASCIIPrintf(viewer, "draft_eta=%.12e\n",
                                    static_cast<double>(opt.z_draft_eta)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "draft_beta=%.12e\n",
+                                   static_cast<double>(opt.draft_beta)));
   PetscCall(PetscViewerASCIIPrintf(viewer,
                                    "projected_volume_correction=%s\n",
                                    opt.projected_volume_correction ? "true"
                                                                    : "false"));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "use_mma=%s\n",
+                                   opt.use_mma ? "true" : "false"));
   PetscCall(PetscViewerASCIIPrintf(viewer, "z_draft_closure=%s\n",
                                    opt.z_draft_closure ? "true" : "false"));
   PetscCall(PetscViewerASCIIPrintf(viewer, "z_draft_eta=%.12e\n",
@@ -3403,14 +4684,18 @@ PetscErrorCode run_h8_initial_vtk(const Grid &grid,
   PetscCall(compute_filter_denominator(eda, mask,
                                        optimizer_options.filter_radius,
                                        filter_denom));
-  PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
-                                 optimizer_options.filter_radius,
-                                 density_options.void_density, rho_filtered));
-  PetscCall(apply_h8_heaviside_projection(
-      eda, rho_filtered, mask, optimizer_options,
-      h8_heaviside_beta_for_iter(optimizer_options, 1),
-      density_options.void_density, rho_phys));
-  PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
+  PetscBool matlab_z_projection = PETSC_FALSE;
+  PetscCall(h8_uses_matlab_z_projection(optimizer_options,
+                                        &matlab_z_projection));
+  const OptimizerOptions projection_options =
+      h8_projection_options_for_iter(optimizer_options, matlab_z_projection, 1);
+  const PetscReal projection_beta =
+      matlab_z_projection
+          ? h8_matlab_outer_beta_for_iter(optimizer_options, 1)
+          : h8_heaviside_beta_for_iter(optimizer_options, 1);
+  PetscCall(build_h8_physical_density(
+      eda, rho_design, mask, filter_denom, density_options, projection_options,
+      projection_beta, rho_filtered, rho_phys));
   PetscCall(write_downsampled_h8_density_vtk(eda, vtk_file, grid, rho_phys,
                                              mask, stride, max_samples));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
@@ -3545,7 +4830,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   const char *final_vtk_file) {
   DM uda = nullptr, eda = nullptr;
   Vec rho_design = nullptr, rho_filtered = nullptr, rho_phys = nullptr;
-  Vec mask = nullptr;
+  Vec mask = nullptr, update_mask = nullptr;
   Vec u = nullptr, b = nullptr;
   Vec dc_phys = nullptr, dc_filtered = nullptr, dc_design = nullptr;
   Vec dv_design = nullptr;
@@ -3554,7 +4839,11 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   Mat P = nullptr;
   KSP ksp = nullptr;
   PetscViewer hist = nullptr;
+  PetscViewer mma_trace = nullptr;
+  PetscViewer mma_vector_trace = nullptr;
   char hist_path[PETSC_MAX_PATH_LEN];
+  char mma_trace_path[PETSC_MAX_PATH_LEN];
+  char mma_vector_trace_path[PETSC_MAX_PATH_LEN];
   char h8_pc_type[64];
   std::vector<ObjectiveVolumePoint> objective_history;
   PetscReal ke[24 * 24]{};
@@ -3567,6 +4856,9 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscBool stopped_on_ksp_divergence = PETSC_FALSE;
   PetscBool use_aux_matrix = PETSC_FALSE;
   PetscBool use_elastic_aux_matrix = PETSC_FALSE;
+  PetscBool matlab_z_projection = PETSC_FALSE;
+  PetscBool write_mma_vectors = PETSC_FALSE;
+  H8MatlabMMAState matlab_mma_state;
   PetscInt aux_rebuild_interval = 1;
   PetscInt h8_load_case = 0;
   PetscBool h8_include_spring_load = PETSC_TRUE;
@@ -3579,30 +4871,50 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                 &stop_on_ksp_divergence, nullptr));
   PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-h8_aux_rebuild_interval",
                                &aux_rebuild_interval, nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_write_mma_vectors",
+                                &write_mma_vectors, nullptr));
   PetscCall(h8_get_load_options(&h8_load_case, &h8_include_spring_load));
+  PetscCall(h8_uses_matlab_z_projection(optimizer_options,
+                                        &matlab_z_projection));
+  const PetscBool include_fixed_solid_volume =
+      (!density_options.use_control_arm_mask &&
+       benchmark_has_matlab_load_elements(optimizer_options.benchmark_case))
+          ? PETSC_TRUE
+          : PETSC_FALSE;
   aux_rebuild_interval = PetscMax(1, aux_rebuild_interval);
   PetscCall(PetscTime(&total_start));
   compute_h8_element_stiffness(grid, density_options, ke);
   PetscCall(create_h8_dms(grid, filter_stencil, &uda, &eda));
   PetscCall(create_element_mask_and_density(eda, grid, density_options,
                                             optimizer_options, &mask, &rho_design));
+  PetscCall(VecDuplicate(mask, &update_mask));
+  if (matlab_z_projection) {
+    PetscCall(create_h8_z_surface_update_mask(eda, mask, update_mask));
+  } else {
+    PetscCall(VecCopy(mask, update_mask));
+  }
   PetscCall(VecDuplicate(rho_design, &rho_filtered));
   PetscCall(VecDuplicate(rho_design, &rho_phys));
   PetscCall(VecDuplicate(rho_design, &filter_denom));
-  PetscReal current_beta = h8_heaviside_beta_for_iter(optimizer_options, 1);
+  PetscReal current_beta =
+      matlab_z_projection
+          ? h8_matlab_outer_beta_for_iter(optimizer_options, 1)
+          : h8_heaviside_beta_for_iter(optimizer_options, 1);
+  OptimizerOptions projection_options =
+      h8_projection_options_for_iter(optimizer_options, matlab_z_projection, 1);
   PetscCall(compute_filter_denominator(eda, mask, optimizer_options.filter_radius,
                                        filter_denom));
-  PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
-                                 optimizer_options.filter_radius,
-                                 density_options.void_density, rho_filtered));
-  PetscCall(apply_h8_heaviside_projection(
-      eda, rho_filtered, mask, optimizer_options, current_beta,
-      density_options.void_density, rho_phys));
-  PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
+  PetscCall(build_h8_physical_density(eda, rho_design, mask, filter_denom,
+                                      density_options, projection_options,
+                                      current_beta, rho_filtered, rho_phys));
   PetscCall(VecDuplicate(rho_design, &dv_design));
-  PetscCall(apply_sensitivity_filter_adjoint(eda, mask, mask, filter_denom,
-                                             optimizer_options.filter_radius,
-                                             dv_design));
+  if (matlab_z_projection) {
+    PetscCall(VecSet(dv_design, 0.0));
+  } else {
+    PetscCall(apply_sensitivity_filter_adjoint(eda, mask, mask, filter_denom,
+                                               optimizer_options.filter_radius,
+                                               dv_design));
+  }
   PetscCall(DMCreateGlobalVector(uda, &u));
   PetscCall(VecDuplicate(u, &b));
   PetscCall(DMCreateGlobalVector(eda, &dc_phys));
@@ -3639,6 +4951,24 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, hist_path, &hist));
   PetscCall(PetscViewerASCIIPrintf(hist,
                                    "iter,compliance,volume,raw_design_volume,volume_target_for_update,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_reason,ksp_reason_name,ksp_residual,rhs_norm,ksp_relative_residual,filter_s,linear_solve_s,sensitivity_s,update_s,checkpoint_s,iter_total_s\n"));
+  if (optimizer_options.use_mma && matlab_z_projection) {
+    PetscCall(PetscSNPrintf(mma_trace_path, sizeof(mma_trace_path),
+                            "%s_mma_trace.csv", output_prefix));
+    PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, mma_trace_path,
+                                   &mma_trace));
+    PetscCall(PetscViewerASCIIPrintf(
+        mma_trace,
+        "iter,f0val,fval,volume,beta1,beta2,move,c_scale,x_change,x_min,x_max,x_sum,x_l1,xmma_min,xmma_max,xmma_sum,xmma_l1,df0dx_min,df0dx_max,df0dx_sum,df0dx_l1,dfdx_min,dfdx_max,dfdx_sum,dfdx_l1\n"));
+    if (write_mma_vectors) {
+      PetscCall(PetscSNPrintf(mma_vector_trace_path,
+                              sizeof(mma_vector_trace_path),
+                              "%s_mma_vectors.csv", output_prefix));
+      PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, mma_vector_trace_path,
+                                     &mma_vector_trace));
+      PetscCall(PetscViewerASCIIPrintf(
+          mma_vector_trace, "iter,var,x,xmma,df0dx,dfdx\n"));
+    }
+  }
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                         "Optimize mode: h8_matrix_free nx=%lld ny=%lld nz=%lld size=%.4gm x %.4gm x %.4gm max_iter=%lld volfrac=%g filter_radius=%g\n",
                         static_cast<long long>(grid.nx),
@@ -3666,6 +4996,14 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                             optimizer_options.heaviside_beta_max),
                         static_cast<long long>(
                             optimizer_options.heaviside_beta_interval)));
+  PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                        "H8 optimizer update: %s%s\n",
+                        (optimizer_options.use_mma && matlab_z_projection)
+                            ? "MATLAB-style MMA"
+                            : "OC",
+                        (optimizer_options.use_mma && !matlab_z_projection)
+                            ? " (-opt_use_mma ignored outside MATLAB z projection)"
+                            : ""));
   if (density_options.use_control_arm_mask) {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "H8 hard regions/BC: A/B/C rings and spring mount are locked; C ring is fixed; A/B rings plus spring mount are loaded; draft_closure=%s axes=%s eta=%g\n",
@@ -3680,12 +5018,36 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                               : "AHP weighted combined cases",
                           h8_include_spring_load ? "true" : "false"));
   } else {
-    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                          "H8 rectangular benchmark: case=%s, left face fixed, right face loaded; draft_closure=%s axes=%s eta=%g\n",
-                          optimizer_options.benchmark_case,
-                          optimizer_options.z_draft_closure ? "true" : "false",
-                          optimizer_options.draft_axes,
-                          static_cast<double>(optimizer_options.z_draft_eta)));
+    if (benchmark_is_bridge(optimizer_options.benchmark_case)) {
+      PetscCall(PetscPrintf(
+          PETSC_COMM_WORLD,
+          "H8 rectangular benchmark: case=bridge, bottom left/right support lines fixed, top face loaded; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.z_draft_closure ? "true" : "false",
+          optimizer_options.draft_axes,
+          static_cast<double>(optimizer_options.z_draft_eta)));
+    } else if (benchmark_is_mbb(optimizer_options.benchmark_case)) {
+      PetscCall(PetscPrintf(
+          PETSC_COMM_WORLD,
+          "H8 rectangular benchmark: case=mbb, left face fixed, right-bottom line loaded; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.z_draft_closure ? "true" : "false",
+          optimizer_options.draft_axes,
+          static_cast<double>(optimizer_options.z_draft_eta)));
+    } else if (benchmark_is_tri(optimizer_options.benchmark_case)) {
+      PetscCall(PetscPrintf(
+          PETSC_COMM_WORLD,
+          "H8 rectangular benchmark: case=tri, fixed nodes match MATLAB [1,nely+1,(nely+1)*(nelx+1)], z-top y-high x-left corner loaded in -x/-y; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.z_draft_closure ? "true" : "false",
+          optimizer_options.draft_axes,
+          static_cast<double>(optimizer_options.z_draft_eta)));
+    } else {
+      PetscCall(PetscPrintf(
+          PETSC_COMM_WORLD,
+          "H8 rectangular benchmark: case=%s, left face fixed, right face loaded; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.benchmark_case,
+          optimizer_options.z_draft_closure ? "true" : "false",
+          optimizer_options.draft_axes,
+          static_cast<double>(optimizer_options.z_draft_eta)));
+    }
   }
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                         "H8 RHS norm ||b||_2=%.6e. History logs both absolute KSP residual and residual/||b||.\n",
@@ -3713,15 +5075,17 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     char memory_stage[128];
 
     PetscCall(PetscTime(&iter_start));
-    current_beta = h8_heaviside_beta_for_iter(optimizer_options, iter);
+    current_beta =
+        matlab_z_projection
+            ? h8_matlab_outer_beta_for_iter(optimizer_options, iter)
+            : h8_heaviside_beta_for_iter(optimizer_options, iter);
+    projection_options =
+        h8_projection_options_for_iter(optimizer_options,
+                                       matlab_z_projection, iter);
     PetscCall(PetscTime(&stage_start));
-    PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
-                                   optimizer_options.filter_radius,
-                                   density_options.void_density, rho_filtered));
-    PetscCall(apply_h8_heaviside_projection(
-        eda, rho_filtered, mask, optimizer_options, current_beta,
-        density_options.void_density, rho_phys));
-    PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
+    PetscCall(build_h8_physical_density(eda, rho_design, mask, filter_denom,
+                                        density_options, projection_options,
+                                        current_beta, rho_filtered, rho_phys));
     PetscCall(elapsed_max(stage_start, &filter_time));
 
     PetscCall(PetscTime(&stage_start));
@@ -3764,8 +5128,9 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
 
     if (ksp_failed) {
       change = 0.0;
-      PetscCall(compute_masked_volume_fraction(eda, rho_phys, mask, &volume));
-      PetscCall(compute_masked_volume_fraction(eda, rho_design, mask,
+      PetscCall(compute_masked_volume_fraction_with_fixed(
+          eda, rho_phys, mask, include_fixed_solid_volume, &volume));
+      PetscCall(compute_masked_volume_fraction(eda, rho_design, update_mask,
                                                &raw_design_volume));
       projected_volume_gap = volume - raw_design_volume;
       PetscCall(elapsed_max(iter_start, &iter_time));
@@ -3817,47 +5182,110 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
 
     PetscCall(PetscTime(&stage_start));
     PetscCall(compute_h8_sensitivity(uda, eda, u, rho_phys, mask, grid,
-                                     density_options, ke, dc_phys, &volume));
-    PetscCall(apply_h8_heaviside_sensitivity(
-        eda, dc_phys, rho_filtered, mask, optimizer_options, current_beta,
-        dc_filtered));
-    PetscCall(apply_sensitivity_filter_adjoint(
-        eda, dc_filtered, mask, filter_denom, optimizer_options.filter_radius,
-        dc_design));
+                                     density_options, ke,
+                                     include_fixed_solid_volume, dc_phys,
+                                     &volume));
+    if (matlab_z_projection) {
+      PetscCall(apply_h8_matlab_z_surface_sensitivity(
+          eda, dc_phys, mask, rho_design, density_options, projection_options,
+          current_beta, dc_design, dv_design));
+    } else {
+      PetscCall(apply_h8_heaviside_sensitivity(
+          eda, dc_phys, rho_filtered, mask, optimizer_options, current_beta,
+          dc_filtered));
+      PetscCall(apply_sensitivity_filter_adjoint(
+          eda, dc_filtered, mask, filter_denom, optimizer_options.filter_radius,
+          dc_design));
+    }
     PetscCall(elapsed_max(stage_start, &sensitivity_time));
 
     PetscCall(PetscTime(&stage_start));
-    PetscCall(compute_masked_volume_fraction(eda, rho_design, mask,
+    PetscCall(compute_masked_volume_fraction(eda, rho_design, update_mask,
                                              &raw_design_volume));
     projected_volume_gap = volume - raw_design_volume;
-    OptimizerOptions step_options = optimizer_options;
-    if (optimizer_options.projected_volume_correction) {
+    OptimizerOptions step_options = projection_options;
+    H8MatlabMMADiagnostics mma_diag;
+    if (optimizer_options.projected_volume_correction || matlab_z_projection) {
       // 直接用“滤波 -> Heaviside -> 拔模闭包”后的物理体积选择 OC
       // lambda，避免把闭包体积差线性折算成 raw 目标后产生来回跳变。
-      effective_raw_volfrac = optimizer_options.volfrac;
-      step_options.volfrac = optimizer_options.volfrac;
-      PetscCall(oc_update_projected_volume(
-          eda, rho_design, mask, dc_design, dv_design, filter_denom,
-          current_beta, density_options, step_options, &change));
+      // Match the MATLAB schedule: target = max(0.9 * current physical
+      // volume, final volfrac), so the early iterations do not collapse.
+      effective_raw_volfrac =
+          PetscMax(optimizer_options.volfrac, 0.9 * volume);
+      step_options.volfrac = effective_raw_volfrac;
+      if (optimizer_options.use_mma && matlab_z_projection) {
+        PetscCall(h8_mma_update_matlab_z(
+            eda, rho_design, mask, dc_phys, density_options, step_options,
+            current_beta, iter, compliance, volume, &matlab_mma_state,
+            &mma_diag, &change));
+      } else {
+        PetscCall(oc_update_projected_volume(
+            eda, rho_design, mask, update_mask, dc_design, dv_design,
+            filter_denom, current_beta, density_options, step_options,
+            include_fixed_solid_volume, &change));
+      }
     } else {
       step_options.volfrac = effective_raw_volfrac;
       PetscCall(oc_update(eda, rho_design, mask, dc_design, dv_design,
                           density_options, step_options, &change));
     }
     PetscCall(elapsed_max(stage_start, &update_time));
+    if (mma_trace != nullptr) {
+      PetscCall(PetscViewerASCIIPrintf(
+          mma_trace,
+          "%lld,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
+          static_cast<long long>(iter),
+          static_cast<double>(mma_diag.f0val),
+          static_cast<double>(mma_diag.fval),
+          static_cast<double>(volume),
+          static_cast<double>(mma_diag.beta1),
+          static_cast<double>(mma_diag.beta2),
+          static_cast<double>(mma_diag.move),
+          static_cast<double>(mma_diag.c_scale),
+          static_cast<double>(mma_diag.x_change),
+          static_cast<double>(mma_diag.x.min),
+          static_cast<double>(mma_diag.x.max),
+          static_cast<double>(mma_diag.x.sum),
+          static_cast<double>(mma_diag.x.l1),
+          static_cast<double>(mma_diag.xmma.min),
+          static_cast<double>(mma_diag.xmma.max),
+          static_cast<double>(mma_diag.xmma.sum),
+          static_cast<double>(mma_diag.xmma.l1),
+          static_cast<double>(mma_diag.df0dx.min),
+          static_cast<double>(mma_diag.df0dx.max),
+          static_cast<double>(mma_diag.df0dx.sum),
+          static_cast<double>(mma_diag.df0dx.l1),
+          static_cast<double>(mma_diag.dfdx.min),
+          static_cast<double>(mma_diag.dfdx.max),
+          static_cast<double>(mma_diag.dfdx.sum),
+          static_cast<double>(mma_diag.dfdx.l1)));
+      PetscCall(PetscViewerFlush(mma_trace));
+    }
+    if (mma_vector_trace != nullptr) {
+      const std::size_t nvars = std::min(
+          std::min(mma_diag.x_values.size(), mma_diag.xmma_values.size()),
+          std::min(mma_diag.df0dx_values.size(), mma_diag.dfdx_values.size()));
+      for (std::size_t q = 0; q < nvars; ++q) {
+        PetscCall(PetscViewerASCIIPrintf(
+            mma_vector_trace,
+            "%lld,%lld,%.16e,%.16e,%.16e,%.16e\n",
+            static_cast<long long>(iter), static_cast<long long>(q + 1),
+            static_cast<double>(mma_diag.x_values[q]),
+            static_cast<double>(mma_diag.xmma_values[q]),
+            static_cast<double>(mma_diag.df0dx_values[q]),
+            static_cast<double>(mma_diag.dfdx_values[q])));
+      }
+      PetscCall(PetscViewerFlush(mma_vector_trace));
+    }
 
     PetscCall(PetscTime(&stage_start));
     if (optimizer_options.write_checkpoint &&
         optimizer_options.checkpoint_interval > 0 &&
         iter % optimizer_options.checkpoint_interval == 0) {
-      PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
-                                     optimizer_options.filter_radius,
-                                     density_options.void_density,
-                                     rho_filtered));
-      PetscCall(apply_h8_heaviside_projection(
-          eda, rho_filtered, mask, optimizer_options, current_beta,
-          density_options.void_density, rho_phys));
-      PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
+      PetscCall(build_h8_physical_density(eda, rho_design, mask, filter_denom,
+                                          density_options, projection_options,
+                                          current_beta, rho_filtered,
+                                          rho_phys));
       PetscCall(write_h8_checkpoint(optimizer_options, iter, PETSC_FALSE,
                                     rho_design, rho_phys, mask));
     }
@@ -3911,6 +5339,8 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                           static_cast<double>(checkpoint_time),
                           static_cast<double>(iter_time)));
   }
+  PetscCall(PetscViewerDestroy(&mma_vector_trace));
+  PetscCall(PetscViewerDestroy(&mma_trace));
   PetscCall(PetscViewerDestroy(&hist));
 
   if (!stopped_on_ksp_divergence) {
@@ -3920,15 +5350,18 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscReal rnorm = 0.0;
     PetscReal rel_rnorm = 0.0;
     current_beta =
-        h8_heaviside_beta_for_iter(optimizer_options, PetscMax(1, final_iter));
-    PetscCall(apply_density_filter(eda, rho_design, mask, filter_denom,
-                                   optimizer_options.filter_radius,
-                                   density_options.void_density,
-                                   rho_filtered));
-    PetscCall(apply_h8_heaviside_projection(
-        eda, rho_filtered, mask, optimizer_options, current_beta,
-        density_options.void_density, rho_phys));
-    PetscCall(apply_h8_draft_closure(eda, mask, optimizer_options, rho_phys));
+        matlab_z_projection
+            ? h8_matlab_outer_beta_for_iter(optimizer_options,
+                                            PetscMax(1, final_iter))
+            : h8_heaviside_beta_for_iter(optimizer_options,
+                                         PetscMax(1, final_iter));
+    projection_options =
+        h8_projection_options_for_iter(optimizer_options,
+                                       matlab_z_projection,
+                                       PetscMax(1, final_iter));
+    PetscCall(build_h8_physical_density(eda, rho_design, mask, filter_denom,
+                                        density_options, projection_options,
+                                        current_beta, rho_filtered, rho_phys));
     PetscCall(KSPSetInitialGuessNonzero(ksp, reuse_initial_guess));
     if (!reuse_initial_guess) PetscCall(VecSet(u, 0.0));
     PetscCall(set_h8_ksp_operators(ksp, A, P, uda, eda, rho_phys, grid,
@@ -3942,7 +5375,9 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscCall(VecDot(b, u, &dot));
     compliance = PetscRealPart(dot);
     PetscCall(compute_h8_sensitivity(uda, eda, u, rho_phys, mask, grid,
-                                     density_options, ke, dc_phys, &volume));
+                                     density_options, ke,
+                                     include_fixed_solid_volume, dc_phys,
+                                     &volume));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "final compliance=%.6e volume=%.6f beta=%.3g ksp_it=%lld ksp_reason=%d(%s) residual=%.3e rel_res=%.3e\n",
                           static_cast<double>(compliance),
@@ -3987,6 +5422,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(VecDestroy(&rho_phys));
   PetscCall(VecDestroy(&rho_filtered));
   PetscCall(VecDestroy(&rho_design));
+  PetscCall(VecDestroy(&update_mask));
   PetscCall(VecDestroy(&mask));
   PetscCall(DMDestroy(&uda));
   PetscCall(DMDestroy(&eda));

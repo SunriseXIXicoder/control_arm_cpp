@@ -16,6 +16,7 @@ struct OptimizerOptions {
   PetscReal max_compliance_increase = 0.10;
   PetscBool stability_guard = PETSC_TRUE;
   PetscBool projected_volume_correction = PETSC_TRUE;
+  PetscBool use_mma = PETSC_FALSE;
   PetscReal rho_min = 1.0e-3;
   PetscBool heaviside_projection = PETSC_FALSE;
   PetscReal heaviside_eta = 0.50;
@@ -24,6 +25,7 @@ struct OptimizerOptions {
   PetscInt heaviside_beta_interval = 0;
   PetscBool z_draft_closure = PETSC_TRUE;
   PetscReal z_draft_eta = 0.50;
+  PetscReal draft_beta = 10.0;
   // H8 优化的轴向拔模闭包方向；旧 z_draft_* 参数仍作为兼容别名。
   char draft_axis[16] = "z";
   // H8 优化的有符号、多方向拔模闭包列表，例如 +x,+z 或 +z,-z。

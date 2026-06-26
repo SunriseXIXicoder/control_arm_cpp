@@ -217,18 +217,27 @@ PetscErrorCode write_objective_volume_history(
 
   PetscCall(PetscSNPrintf(csv_path, sizeof(csv_path), "%s_objective_volume.csv",
                           output_prefix));
-  PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, csv_path, &viewer));
-  PetscCall(PetscViewerASCIIPrintf(viewer,
-                                   "iter,objective,volume,volume_target\n"));
-  for (std::size_t p = 0; p < points.size(); ++p) {
-    PetscCall(PetscViewerASCIIPrintf(
-        viewer, "%lld,%.12e,%.12e,%.12e\n",
-        static_cast<long long>(points[p].iter),
-        static_cast<double>(points[p].objective),
-        static_cast<double>(points[p].volume),
-        static_cast<double>(volume_target)));
+  PetscErrorCode open_ierr =
+      PetscViewerASCIIOpen(PETSC_COMM_WORLD, csv_path, &viewer);
+  if (open_ierr) {
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                          "Warning: could not write objective history CSV %s "
+                          "(PETSc error %d); continuing optimization.\n",
+                          csv_path, static_cast<int>(open_ierr)));
+    viewer = nullptr;
+  } else {
+    PetscCall(PetscViewerASCIIPrintf(viewer,
+                                     "iter,objective,volume,volume_target\n"));
+    for (std::size_t p = 0; p < points.size(); ++p) {
+      PetscCall(PetscViewerASCIIPrintf(
+          viewer, "%lld,%.12e,%.12e,%.12e\n",
+          static_cast<long long>(points[p].iter),
+          static_cast<double>(points[p].objective),
+          static_cast<double>(points[p].volume),
+          static_cast<double>(volume_target)));
+    }
+    PetscCall(PetscViewerDestroy(&viewer));
   }
-  PetscCall(PetscViewerDestroy(&viewer));
 
   const PetscReal width = 960.0;
   const PetscReal height = 560.0;
@@ -245,7 +254,14 @@ PetscErrorCode write_objective_volume_history(
 
   PetscCall(PetscSNPrintf(svg_path, sizeof(svg_path), "%s_objective_volume.svg",
                           output_prefix));
-  PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, svg_path, &viewer));
+  open_ierr = PetscViewerASCIIOpen(PETSC_COMM_WORLD, svg_path, &viewer);
+  if (open_ierr) {
+    PetscCall(PetscPrintf(PETSC_COMM_WORLD,
+                          "Warning: could not write objective history SVG %s "
+                          "(PETSc error %d); continuing optimization.\n",
+                          svg_path, static_cast<int>(open_ierr)));
+    return 0;
+  }
   PetscCall(PetscViewerASCIIPrintf(
       viewer,
       "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%.0f\" height=\"%.0f\" viewBox=\"0 0 %.0f %.0f\">\n",

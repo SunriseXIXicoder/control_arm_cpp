@@ -19,6 +19,7 @@ struct DensityOptions {
   PetscReal emin = 1.0e-6;
   PetscReal mask_threshold = 0.5;
   PetscReal ab_triangle_retract = 0.22;
+  char benchmark_case[32] = "cantilever";
 };
 
 PetscReal domain_length(const Grid &grid);
