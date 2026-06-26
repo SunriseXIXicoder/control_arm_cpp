@@ -1,18 +1,18 @@
 #!/bin/bash
-# Six one-way draft-closure cantilever cases with the tip-center load.
-# Array cases:
-#   0:+x  1:-x  2:+y  3:-y  4:+z  5:-z
+# 右端中心集中载荷悬臂梁：六个单向拔模算例加一个无拔模对照算例。
+# Slurm 数组工况：
+#   0:+x  1:-x  2:+y  3:-y  4:+z  5:-z  6:无拔模
 #
-# Default size is 160x80x80 H8 elements, i.e. 161x81x81 nodes.
-# Each array task uses 8 nodes * 28 MPI ranks = 224 ranks.
-# With --array=0-5%6 all six directions may run concurrently and use 48 nodes.
+# 默认规模为 160x80x80 个 H8 单元，即 161x81x81 个节点。
+# 每个数组任务使用 8 节点 * 28 MPI 进程 = 224 进程。
+# --array=0-6%7 表示七个算例可以同时运行，总共占用 56 个节点。
 
-#SBATCH -J h8_tip160_6
+#SBATCH -J h8_tip160_7
 #SBATCH -N 8
 #SBATCH --ntasks-per-node=28
 #SBATCH --partition=normal,normal1,normal2,normal3,normal4
 #SBATCH --exclusive
-#SBATCH --array=0-5%6
+#SBATCH --array=0-6%7
 #SBATCH --output=result/%A_%a.%x.out
 #SBATCH --error=result/%A_%a.%x.err
 
@@ -54,18 +54,20 @@ ulimit -s unlimited || true
 ulimit -l unlimited || true
 
 CASE_ID="${CASE_ID:-${SLURM_ARRAY_TASK_ID:-0}}"
-DRAFT_AXES_LIST=("px" "mx" "py" "my" "pz" "mz")
-DRAFT_LABELS=("+x" "-x" "+y" "-y" "+z" "-z")
-RUN_NAMES=("plus_x" "minus_x" "plus_y" "minus_y" "plus_z" "minus_z")
-H8_DM_PX_LIST=(7 7 8 8 8 8)
-H8_DM_PY_LIST=(4 4 4 4 7 7)
-H8_DM_PZ_LIST=(8 8 7 7 4 4)
+DRAFT_AXES_LIST=("px" "mx" "py" "my" "pz" "mz" "none")
+DRAFT_LABELS=("+x" "-x" "+y" "-y" "+z" "-z" "none")
+DRAFT_CLOSURE_LIST=("true" "true" "true" "true" "true" "true" "false")
+RUN_NAMES=("plus_x" "minus_x" "plus_y" "minus_y" "plus_z" "minus_z" "no_draft")
+H8_DM_PX_LIST=(7 7 8 8 8 8 8)
+H8_DM_PY_LIST=(4 4 4 4 7 7 4)
+H8_DM_PZ_LIST=(8 8 7 7 4 4 7)
 if [ "${CASE_ID}" -lt 0 ] || [ "${CASE_ID}" -ge "${#DRAFT_AXES_LIST[@]}" ]; then
-  echo "Invalid CASE_ID=${CASE_ID}; expected 0..5." >&2
+  echo "Invalid CASE_ID=${CASE_ID}; expected 0..6." >&2
   exit 2
 fi
 DRAFT_AXES="${DRAFT_AXES_LIST[$CASE_ID]}"
 DRAFT_LABEL="${DRAFT_LABELS[$CASE_ID]}"
+DRAFT_CLOSURE="${DRAFT_CLOSURE_LIST[$CASE_ID]}"
 RUN_NAME="${RUN_NAMES[$CASE_ID]}"
 
 NELX="${NELX:-160}"
@@ -82,6 +84,7 @@ OPT_MAX_ITER="${OPT_MAX_ITER:-500}"
 OPT_FILTER_RADIUS="${OPT_FILTER_RADIUS:-5}"
 OPT_MOVE="${OPT_MOVE:-0.005}"
 OPT_PROJECTED_VOLUME_CORRECTION="${OPT_PROJECTED_VOLUME_CORRECTION:-true}"
+OPT_DRAFT_CLOSURE="${OPT_DRAFT_CLOSURE:-${DRAFT_CLOSURE}}"
 OPT_DRAFT_ETA="${OPT_DRAFT_ETA:-0.5}"
 OPT_MATLAB_Z_PROJECTION="${OPT_MATLAB_Z_PROJECTION:-false}"
 OPT_USE_MMA="${OPT_USE_MMA:-false}"
@@ -131,7 +134,7 @@ H8_DM_ARGS="-h8_dm_px ${H8_DM_PX} -h8_dm_py ${H8_DM_PY} -h8_dm_pz ${H8_DM_PZ}"
 
 cd "${SUBMIT_DIR}"
 mkdir -p bin result logs
-CASE_DIR="${OUTPUT_DIR:-result/h8_${BENCHMARK_CASE}_6axis_${NELX}_${NELY}_${NELZ}_${RUN_NAME}_${JOB_ID}}"
+CASE_DIR="${OUTPUT_DIR:-result/h8_${BENCHMARK_CASE}_7cases_${NELX}_${NELY}_${NELZ}_${RUN_NAME}_${JOB_ID}}"
 PREFIX="${OUTPUT_PREFIX:-${CASE_DIR}/${RUN_NAME}}"
 mkdir -p "${CASE_DIR}"
 
@@ -144,6 +147,7 @@ echo "Submit dir: ${SUBMIT_DIR}"
 echo "Run host: $(hostname)"
 echo "Job id: ${JOB_ID}"
 echo "Array case: ${CASE_ID} ${RUN_NAME}"
+echo "Draft closure: ${OPT_DRAFT_CLOSURE}"
 echo "Draft axes: ${DRAFT_LABEL} (${DRAFT_AXES})"
 echo "Output dir: ${CASE_DIR}"
 echo "Slurm nodes: ${SLURM_JOB_NODELIST:-unknown}"
@@ -165,7 +169,7 @@ command -v mpicxx || true
 mpicxx --version 2>&1 | head -n 3 || true
 make -B all CXXSTD="${CXXSTD}" PETSC_DIR="${PETSC_DIR}" PETSC_ARCH="${PETSC_ARCH}"
 
-echo "Running 160x80x80 H8 tip-center cantilever one-way draft case"
+echo "Running 160x80x80 H8 tip-center cantilever draft/no-draft case"
 echo "  elements=${NELX}x${NELY}x${NELZ}"
 echo "  nodes=${NX}x${NY}x${NZ}"
 echo "  dof=$((NX * NY * NZ * 3))"
@@ -175,6 +179,7 @@ echo "  opt_max_iter=${OPT_MAX_ITER}"
 echo "  volfrac=${VOLFRAC}"
 echo "  move=${OPT_MOVE}"
 echo "  filter_radius=${OPT_FILTER_RADIUS}"
+echo "  draft_closure=${OPT_DRAFT_CLOSURE}"
 echo "  draft_axes=${DRAFT_LABEL} (${DRAFT_AXES})"
 echo "  matlab_z_projection=${OPT_MATLAB_Z_PROJECTION}"
 echo "  h8_pc_type=${H8_PC_TYPE}"
@@ -205,7 +210,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -opt_move "${OPT_MOVE}" \
   -opt_projected_volume_correction "${OPT_PROJECTED_VOLUME_CORRECTION}" \
   -opt_filter_radius "${OPT_FILTER_RADIUS}" \
-  -opt_draft_closure true \
+  -opt_draft_closure "${OPT_DRAFT_CLOSURE}" \
   -opt_draft_axes "${DRAFT_AXES}" \
   -opt_draft_eta "${OPT_DRAFT_ETA}" \
   -opt_matlab_z_projection "${OPT_MATLAB_Z_PROJECTION}" \
