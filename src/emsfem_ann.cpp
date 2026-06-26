@@ -2003,6 +2003,111 @@ PetscErrorCode control_arm_wrench_q(DM da,
   return 0;
 }
 
+PetscErrorCode fill_control_arm_symmetric_vertical_load(
+    DM da, const Grid &grid, const EmSfemAnnOptions &options,
+    PetscReal load_scale, Vec b) {
+  static const PetscReal ab_ring_mag = 10000.0;
+  static const PetscReal spring_mag = 8000.0;
+  PetscScalar ****bg = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt local_a = 0, local_b = 0, local_spring = 0;
+  PetscInt local_a_candidates = 0, local_b_candidates = 0;
+  PetscInt local_spring_candidates = 0;
+  PetscInt global_a = 0, global_b = 0, global_spring = 0;
+  PetscInt global_a_candidates = 0, global_b_candidates = 0;
+  PetscInt global_spring_candidates = 0;
+
+  PetscCall(DMDAGetCorners(da, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscBool fixed = control_arm_fixed_node(i, j, k, grid);
+        if (select_hole_node(i, j, k, grid, 1)) {
+          ++local_a_candidates;
+          if (!fixed) ++local_a;
+        }
+        if (select_hole_node(i, j, k, grid, 2)) {
+          ++local_b_candidates;
+          if (!fixed) ++local_b;
+        }
+        if (select_spring_node(i, j, k, grid)) {
+          ++local_spring_candidates;
+          if (!fixed) ++local_spring;
+        }
+      }
+    }
+  }
+  PetscCallMPI(MPI_Allreduce(&local_a, &global_a, 1, MPIU_INT, MPI_SUM,
+                             PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local_b, &global_b, 1, MPIU_INT, MPI_SUM,
+                             PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local_spring, &global_spring, 1, MPIU_INT,
+                             MPI_SUM, PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local_a_candidates, &global_a_candidates, 1,
+                             MPIU_INT, MPI_SUM, PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local_b_candidates, &global_b_candidates, 1,
+                             MPIU_INT, MPI_SUM, PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local_spring_candidates,
+                             &global_spring_candidates, 1, MPIU_INT,
+                             MPI_SUM, PETSC_COMM_WORLD));
+
+  PetscCheck(global_a > 0 && global_b > 0, PETSC_COMM_WORLD,
+             PETSC_ERR_ARG_WRONG,
+             "EMsFEM ANN load_case=4 needs nonempty A/B load rings.");
+  PetscCheck(global_a_candidates == global_b_candidates, PETSC_COMM_WORLD,
+             PETSC_ERR_ARG_WRONG,
+             "EMsFEM ANN load_case=4 requires symmetric A/B candidate load nodes, but A=%lld and B=%lld. Check grid and control-arm geometry symmetry.",
+             static_cast<long long>(global_a_candidates),
+             static_cast<long long>(global_b_candidates));
+  PetscCheck(global_a == global_b, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "EMsFEM ANN load_case=4 requires symmetric A/B active load nodes, but A=%lld and B=%lld. Check grid and control-arm geometry symmetry.",
+             static_cast<long long>(global_a),
+             static_cast<long long>(global_b));
+  PetscCheck(!options.include_spring_load || global_spring > 0,
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "EMsFEM ANN load_case=4 includes spring load but the spring load region is empty.");
+
+  const PetscReal total_fz =
+      -load_scale *
+      (2.0 * ab_ring_mag + (options.include_spring_load ? spring_mag : 0.0));
+  PetscCall(PetscPrintf(
+      PETSC_COMM_WORLD,
+      "EMsFEM ANN load case 4 symmetric vertical load: A=%lld/%lld B=%lld/%lld spring=%lld/%lld Fz_total=%.6e\n",
+      static_cast<long long>(global_a),
+      static_cast<long long>(global_a_candidates),
+      static_cast<long long>(global_b),
+      static_cast<long long>(global_b_candidates),
+      static_cast<long long>(global_spring),
+      static_cast<long long>(global_spring_candidates),
+      static_cast<double>(total_fz)));
+
+  PetscCall(DMDAVecGetArrayDOF(da, b, &bg));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        if (control_arm_fixed_node(i, j, k, grid)) continue;
+        if (select_hole_node(i, j, k, grid, 1)) {
+          bg[k][j][i][2] +=
+              load_scale * (-ab_ring_mag) /
+              static_cast<PetscReal>(global_a);
+        }
+        if (select_hole_node(i, j, k, grid, 2)) {
+          bg[k][j][i][2] +=
+              load_scale * (-ab_ring_mag) /
+              static_cast<PetscReal>(global_b);
+        }
+        if (options.include_spring_load &&
+            select_spring_node(i, j, k, grid)) {
+          bg[k][j][i][2] += load_scale * (-spring_mag) /
+                            static_cast<PetscReal>(global_spring);
+        }
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayDOF(da, b, &bg));
+  return 0;
+}
+
 // 根据控制臂工况编号填充全局载荷向量。
 // 不同 load_case 会选择不同加载区域和力/力矩组合，用于多工况优化。
 // 该函数封装了控制臂专用的载荷生成逻辑。
@@ -2046,6 +2151,13 @@ PetscErrorCode fill_control_arm_load(DM da,
   }
 
   PetscCall(VecSet(b, 0.0));
+  if (options.load_case == 4) {
+    PetscCall(fill_control_arm_symmetric_vertical_load(da, grid, options,
+                                                       load_scale, b));
+    return 0;
+  }
+  PetscCheck(options.load_case <= 3, PETSC_COMM_WORLD, PETSC_ERR_ARG_OUTOFRANGE,
+             "EMsFEM ANN load_case must be 0, 1, 2, 3, or 4");
   PetscCall(DMDAVecGetArrayDOF(da, b, &bg));
   PetscCall(DMDAGetCorners(da, &xs, &ys, &zs, &xm, &ym, &zm));
 
@@ -3958,8 +4070,7 @@ PetscErrorCode run_emsfem_ann_postsolve(const Grid &grid,
   PetscCall(PetscTime(&t0));
   {
     const PetscBool multi_case =
-        (ems_options.control_arm_bc &&
-         (ems_options.load_case <= 0 || ems_options.load_case > 3))
+        (ems_options.control_arm_bc && ems_options.load_case <= 0)
             ? PETSC_TRUE
             : PETSC_FALSE;
     const PetscInt first_case = multi_case ? 1 : ems_options.load_case;
@@ -4379,8 +4490,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     PetscCall(VecSet(dc_phys, 0.0));
     compliance = 0.0;
     const PetscBool multi_case =
-        (ems_options.control_arm_bc &&
-         (ems_options.load_case <= 0 || ems_options.load_case > 3))
+        (ems_options.control_arm_bc && ems_options.load_case <= 0)
             ? PETSC_TRUE
             : PETSC_FALSE;
     const PetscInt first_case = multi_case ? 1 : ems_options.load_case;
@@ -4685,8 +4795,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     }
     compliance = 0.0;
     const PetscBool multi_case =
-        (ems_options.control_arm_bc &&
-         (ems_options.load_case <= 0 || ems_options.load_case > 3))
+        (ems_options.control_arm_bc && ems_options.load_case <= 0)
             ? PETSC_TRUE
             : PETSC_FALSE;
     const PetscInt first_case = multi_case ? 1 : ems_options.load_case;

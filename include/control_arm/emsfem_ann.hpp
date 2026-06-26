@@ -22,7 +22,7 @@ struct EmSfemAnnOptions {
   PetscReal cache_gib_limit = 0.0;
   // 是否使用控制臂专用固定端和加载区域；false 时使用简单测试边界。
   PetscBool control_arm_bc = PETSC_FALSE;
-  // 控制臂载荷工况编号，多工况优化会按该编号或循环选择载荷。
+  // 控制臂载荷工况编号；0 为旧 1-3 加权组合，4 为对称竖直下压单工况。
   PetscInt load_case = 2;
   // 是否同时包含弹簧/衬套区域载荷。
   PetscBool include_spring_load = PETSC_TRUE;

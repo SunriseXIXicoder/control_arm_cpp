@@ -352,7 +352,7 @@ Important optimization options:
 | --- | --- | --- |
 | `-h8_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre` | Select the H8 preconditioner. Production H8 runs normally use `aux_hypre` or `aux_elastic_hypre`. |
 | `-h8_dm_px`, `-h8_dm_py`, `-h8_dm_pz` | positive integers | Manually set the H8 3D process grid; product must equal MPI ranks. |
-| `-h8_load_case` | integer | Select H8 control-arm load case. |
+| `-h8_load_case` | `0`, `1`, `2`, `3`, `4` | Select H8 control-arm load case. `0` keeps the legacy weighted combination of cases 1-3; `4` is a symmetric pure `-Z` load on the A/B rings and spring mount. |
 | `-h8_include_spring_load` | `true|false` | Include spring/bushing load contribution. |
 | `-benchmark_case` | `cantilever`, `torsion` | Select the no-mask rectangular benchmark load. |
 | `-h8_aux_rebuild_interval` | integer | Rebuild auxiliary matrix every N iterations. |
@@ -378,6 +378,25 @@ mpirun -np 28 ./bin/control_arm_cpp \
   -output_prefix result/h8_10m_direct
 ```
 
+Symmetric vertical control-arm case 4:
+
+```sh
+# A/B rings receive equal pure -Z loads, and the spring mount receives a
+# centered pure -Z load. The code checks that the A/B load-node counts match.
+mpirun -np 28 ./bin/control_arm_cpp \
+  -mode optimize \
+  -operator h8_matrix_free \
+  -control_arm_mask true \
+  -nx 325 -ny 186 -nz 56 \
+  -volfrac 0.30 \
+  -opt_filter_radius 1.5 \
+  -h8_load_case 4 \
+  -h8_include_spring_load true \
+  -h8_pc_type aux_hypre \
+  -ksp_type fgmres \
+  -output_prefix result/h8_case4_vertical
+```
+
 ### EMsFEM ANN Options
 
 | Option | Values | Meaning |
@@ -388,7 +407,7 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | `-ems_cache_gib_limit` | real | Per-rank cache limit in GiB; `0` means unlimited. |
 | `-control_arm_bc` | `true|false` | Use control-arm boundary conditions instead of simple test BC. |
 | `-benchmark_case` | `cantilever`, `torsion` | Select the no-mask rectangular benchmark load when `-control_arm_bc false`. |
-| `-load_case` | integer | `0` means weighted multi-case load set in the production scripts. |
+| `-load_case` | `0`, `1`, `2`, `3`, `4` | Control-arm load case. `0` means the legacy weighted multi-case set 1-3; `4` is a symmetric pure `-Z` load on the A/B rings and spring mount. |
 | `-include_spring_load` | `true|false` | Include spring/bushing load contribution. |
 | `-ems_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre`, `aux_ann_gamg`, `aux_ann_hypre` | Select the EMsFEM ANN preconditioner. Production default is `aux_ann_gamg`; HYPRE comparison uses `aux_ann_hypre`. |
 | `-ems_dm_px`, `-ems_dm_py`, `-ems_dm_pz` | positive integers | Manually set the EMsFEM 3D process grid; product must equal MPI ranks. |
@@ -415,6 +434,10 @@ mpirun -np 56 ./bin/control_arm_cpp \
   -ksp_gmres_restart 200 \
   -output_prefix result/ems_ann_10m_direct
 ```
+
+For the same independent symmetric vertical case in EMsFEM ANN runs, use
+`-load_case 4 -include_spring_load true`. Case `0` remains the legacy weighted
+multi-case combination of cases 1-3.
 
 ## Postprocessing Interfaces
 
@@ -862,7 +885,7 @@ mpirun -np 4 ./bin/control_arm_cpp \
 | --- | --- | --- |
 | `-h8_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre` | 选择 H8 预条件器。生产 H8 通常用 `aux_hypre` 或 `aux_elastic_hypre`。 |
 | `-h8_dm_px`, `-h8_dm_py`, `-h8_dm_pz` | 正整数 | 手动指定 H8 三维进程网格，乘积必须等于 MPI 进程数。 |
-| `-h8_load_case` | 整数 | 选择 H8 控制臂载荷工况。 |
+| `-h8_load_case` | `0`, `1`, `2`, `3`, `4` | 选择 H8 控制臂载荷工况。`0` 保持旧的 1-3 加权组合；`4` 为 A/B 环和弹簧安装处关于模型对称的纯 `-Z` 竖直下压单工况。 |
 | `-h8_include_spring_load` | `true|false` | 是否包含弹簧/衬套区域载荷。 |
 | `-benchmark_case` | `cantilever`, `torsion` | 选择无 mask 矩形域 benchmark 载荷。 |
 | `-h8_aux_rebuild_interval` | 整数 | 每隔多少步重建辅助矩阵。 |
@@ -888,6 +911,25 @@ mpirun -np 28 ./bin/control_arm_cpp \
   -output_prefix result/h8_10m_direct
 ```
 
+控制臂对称竖直下压工况 4 示例：
+
+```sh
+# A/B 环受到大小相同的纯 -Z 载荷，弹簧安装处受到居中的纯 -Z 载荷；
+# 程序会检查 A/B 两侧加载节点数是否一致。
+mpirun -np 28 ./bin/control_arm_cpp \
+  -mode optimize \
+  -operator h8_matrix_free \
+  -control_arm_mask true \
+  -nx 325 -ny 186 -nz 56 \
+  -volfrac 0.30 \
+  -opt_filter_radius 1.5 \
+  -h8_load_case 4 \
+  -h8_include_spring_load true \
+  -h8_pc_type aux_hypre \
+  -ksp_type fgmres \
+  -output_prefix result/h8_case4_vertical
+```
+
 ### EMsFEM ANN 专用参数
 
 | 参数 | 取值 | 含义 |
@@ -898,7 +940,7 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | `-ems_cache_gib_limit` | 实数 | 每个 rank 的缓存上限，单位 GiB；`0` 表示不限。 |
 | `-control_arm_bc` | `true|false` | 是否使用控制臂专用边界条件。 |
 | `-benchmark_case` | `cantilever`, `torsion` | `-control_arm_bc false` 时选择无 mask 矩形域 benchmark 载荷。 |
-| `-load_case` | 整数 | 在生产脚本中，`0` 表示加权多工况载荷。 |
+| `-load_case` | `0`, `1`, `2`, `3`, `4` | 控制臂载荷工况。`0` 表示旧的 1-3 加权多工况；`4` 为 A/B 环和弹簧安装处关于模型对称的纯 `-Z` 竖直下压单工况。 |
 | `-include_spring_load` | `true|false` | 是否包含弹簧/衬套区域载荷。 |
 | `-ems_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre`, `aux_ann_gamg`, `aux_ann_hypre` | 选择 EMsFEM ANN 预条件器。生产默认 `aux_ann_gamg`，HYPRE 对照可用 `aux_ann_hypre`。 |
 | `-ems_dm_px`, `-ems_dm_py`, `-ems_dm_pz` | 正整数 | 手动指定 EMsFEM 三维进程网格，乘积必须等于 MPI 进程数。 |
@@ -925,6 +967,10 @@ mpirun -np 56 ./bin/control_arm_cpp \
   -ksp_gmres_restart 200 \
   -output_prefix result/ems_ann_10m_direct
 ```
+
+EMsFEM ANN 若使用同一个独立的对称竖直下压工况，设置
+`-load_case 4 -include_spring_load true`。`load_case=0` 仍然只表示旧的
+1-3 加权多工况组合。
 
 ## 后处理接口
 

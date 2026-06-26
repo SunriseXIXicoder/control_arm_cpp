@@ -3271,6 +3271,43 @@ PetscErrorCode h8_control_arm_wrench_q(DM da, DM eda, Vec mask_vec,
   return 0;
 }
 
+PetscErrorCode h8_count_supported_ab_load_nodes(DM da, DM eda, Vec mask_vec,
+                                                const Grid &grid,
+                                                PetscInt which,
+                                                PetscInt *global_count,
+                                                PetscInt *global_candidates) {
+  Vec local_mask = nullptr;
+  PetscScalar ***mask = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt local_count = 0;
+  PetscInt local_candidates = 0;
+
+  PetscCall(DMCreateLocalVector(eda, &local_mask));
+  PetscCall(DMGlobalToLocalBegin(eda, mask_vec, INSERT_VALUES, local_mask));
+  PetscCall(DMGlobalToLocalEnd(eda, mask_vec, INSERT_VALUES, local_mask));
+  PetscCall(DMDAVecGetArrayRead(eda, local_mask, &mask));
+  PetscCall(DMDAGetCorners(da, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        if (!h8_is_ab_load_node(i, j, k, grid, which)) continue;
+        ++local_candidates;
+        if (h8_is_c_support_node(i, j, k, grid)) continue;
+        if (h8_node_has_active_adjacent_element(mask, grid, i, j, k)) {
+          ++local_count;
+        }
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayRead(eda, local_mask, &mask));
+  PetscCall(VecDestroy(&local_mask));
+  PetscCallMPI(MPI_Allreduce(&local_count, global_count, 1, MPIU_INT,
+                             MPI_SUM, PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local_candidates, global_candidates, 1,
+                             MPIU_INT, MPI_SUM, PETSC_COMM_WORLD));
+  return 0;
+}
+
 PetscReal h8_control_arm_case_weight(PetscInt load_case) {
   static const PetscReal weights[3] = {0.25, 0.50, 0.25};
   if (load_case >= 1 && load_case <= 3) return weights[load_case - 1];
@@ -3420,6 +3457,101 @@ PetscErrorCode add_h8_control_arm_load_case(DM uda, DM eda, Vec mask,
   return 0;
 }
 
+PetscErrorCode add_h8_control_arm_symmetric_vertical_load_case(
+    DM uda, DM eda, Vec mask, const Grid &grid, PetscReal load_scale,
+    PetscReal case_weight, PetscBool include_spring_load, Vec b) {
+  static const PetscReal ab_ring_mag = 10000.0;
+  static const PetscReal spring_mag = 8000.0;
+  Vec local_mask = nullptr;
+  PetscScalar ****bg = nullptr;
+  PetscScalar ***mg = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt n1 = 0, n2 = 0;
+  PetscInt cand1 = 0, cand2 = 0;
+  PetscInt local_spring = 0, global_spring = 0;
+  PetscInt local_spring_candidates = 0, global_spring_candidates = 0;
+
+  PetscCall(h8_count_supported_ab_load_nodes(uda, eda, mask, grid, 1, &n1,
+                                             &cand1));
+  PetscCall(h8_count_supported_ab_load_nodes(uda, eda, mask, grid, 2, &n2,
+                                             &cand2));
+  PetscCheck(n1 > 0 && n2 > 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "H8 load_case=4 needs nonempty A/B load rings.");
+  PetscCheck(cand1 == cand2, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "H8 load_case=4 requires symmetric A/B candidate load nodes, but A=%lld and B=%lld. Check grid and control-arm mask symmetry.",
+             static_cast<long long>(cand1), static_cast<long long>(cand2));
+  PetscCheck(n1 == n2, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "H8 load_case=4 requires symmetric A/B active load nodes, but A=%lld and B=%lld. Check grid and control-arm mask symmetry.",
+             static_cast<long long>(n1), static_cast<long long>(n2));
+
+  PetscCall(DMCreateLocalVector(eda, &local_mask));
+  PetscCall(DMGlobalToLocalBegin(eda, mask, INSERT_VALUES, local_mask));
+  PetscCall(DMGlobalToLocalEnd(eda, mask, INSERT_VALUES, local_mask));
+  PetscCall(DMDAVecGetArrayRead(eda, local_mask, &mg));
+  PetscCall(DMDAGetCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        if (!h8_is_spring_load_node(i, j, k, grid)) continue;
+        ++local_spring_candidates;
+        if (h8_is_c_support_node(i, j, k, grid)) continue;
+        if (h8_node_has_active_adjacent_element(mg, grid, i, j, k)) {
+          ++local_spring;
+        }
+      }
+    }
+  }
+  PetscCallMPI(MPI_Allreduce(&local_spring, &global_spring, 1, MPIU_INT,
+                             MPI_SUM, PETSC_COMM_WORLD));
+  PetscCallMPI(MPI_Allreduce(&local_spring_candidates,
+                             &global_spring_candidates, 1, MPIU_INT,
+                             MPI_SUM, PETSC_COMM_WORLD));
+  PetscCheck(!include_spring_load || global_spring > 0, PETSC_COMM_WORLD,
+             PETSC_ERR_ARG_WRONG,
+             "H8 load_case=4 includes spring load but the spring load region is empty.");
+
+  const PetscReal total_fz =
+      -load_scale * case_weight *
+      (2.0 * ab_ring_mag + (include_spring_load ? spring_mag : 0.0));
+  PetscCall(PetscPrintf(
+      PETSC_COMM_WORLD,
+      "H8 load case 4 symmetric vertical load: A=%lld/%lld B=%lld/%lld spring=%lld/%lld Fz_total=%.6e\n",
+      static_cast<long long>(n1), static_cast<long long>(cand1),
+      static_cast<long long>(n2), static_cast<long long>(cand2),
+      static_cast<long long>(global_spring),
+      static_cast<long long>(global_spring_candidates),
+      static_cast<double>(total_fz)));
+
+  PetscCall(DMDAVecGetArrayDOF(uda, b, &bg));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        if (h8_is_c_support_node(i, j, k, grid)) continue;
+        if (!h8_node_has_active_adjacent_element(mg, grid, i, j, k)) continue;
+        if (h8_is_ab_load_node(i, j, k, grid, 1)) {
+          bg[k][j][i][2] +=
+              load_scale * case_weight * (-ab_ring_mag) /
+              static_cast<PetscReal>(n1);
+        }
+        if (h8_is_ab_load_node(i, j, k, grid, 2)) {
+          bg[k][j][i][2] +=
+              load_scale * case_weight * (-ab_ring_mag) /
+              static_cast<PetscReal>(n2);
+        }
+        if (include_spring_load && global_spring > 0 &&
+            h8_is_spring_load_node(i, j, k, grid)) {
+          bg[k][j][i][2] += load_scale * case_weight * (-spring_mag) /
+                            static_cast<PetscReal>(global_spring);
+        }
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayDOF(uda, b, &bg));
+  PetscCall(DMDAVecRestoreArrayRead(eda, local_mask, &mg));
+  PetscCall(VecDestroy(&local_mask));
+  return 0;
+}
+
 PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
                                       const OptimizerOptions &optimizer_options,
                                       Vec b) {
@@ -3530,13 +3662,21 @@ PetscErrorCode fill_h8_load(DM uda, DM eda, Vec mask, const Grid &grid,
     PetscCall(add_h8_control_arm_load_case(uda, eda, mask, grid,
                                            optimizer_options.load, load_case,
                                            1.0, include_spring_load, b));
-  } else {
+  } else if (load_case == 4) {
+    PetscCall(add_h8_control_arm_symmetric_vertical_load_case(
+        uda, eda, mask, grid, optimizer_options.load, 1.0,
+        include_spring_load, b));
+  } else if (load_case == 0) {
+    // load_case=0 保持旧三工况加权组合，不自动混入工况 4。
     for (PetscInt c = 1; c <= 3; ++c) {
       PetscCall(add_h8_control_arm_load_case(uda, eda, mask, grid,
                                              optimizer_options.load, c,
                                              h8_control_arm_case_weight(c),
                                              include_spring_load, b));
     }
+  } else {
+    PetscCheck(PETSC_FALSE, PETSC_COMM_WORLD, PETSC_ERR_ARG_OUTOFRANGE,
+               "H8 load_case must be 0, 1, 2, 3, or 4");
   }
   return 0;
 }
@@ -5013,9 +5153,11 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "H8 load options: load_case=%lld (%s), include_spring_load=%s\n",
                           static_cast<long long>(h8_load_case),
-                          (h8_load_case >= 1 && h8_load_case <= 3)
-                              ? "single case"
-                              : "AHP weighted combined cases",
+                          h8_load_case == 4
+                              ? "symmetric vertical A/B/spring case"
+                              : ((h8_load_case >= 1 && h8_load_case <= 3)
+                                     ? "single legacy case"
+                                     : "weighted legacy cases 1-3"),
                           h8_include_spring_load ? "true" : "false"));
   } else {
     if (benchmark_is_bridge(optimizer_options.benchmark_case)) {
