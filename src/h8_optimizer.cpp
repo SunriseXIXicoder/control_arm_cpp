@@ -1311,6 +1311,7 @@ PetscErrorCode h8_uses_matlab_z_projection(const OptimizerOptions &options,
   std::vector<H8DraftDirection> dirs;
   *use_projection = PETSC_FALSE;
   if (!options.z_draft_closure) return 0;
+  if (!options.matlab_z_projection) return 0;
   PetscCall(parse_h8_draft_axes(options.draft_axes, &dirs));
   for (const H8DraftDirection &dir : dirs) {
     if (dir.axis == 2) {

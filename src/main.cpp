@@ -545,6 +545,9 @@ int main(int argc, char **argv) {
                                 nullptr));
   PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_use_mma",
                                 &optimizer_options.use_mma, nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_matlab_z_projection",
+                                &optimizer_options.matlab_z_projection,
+                                nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr, "-opt_heaviside_eta",
                                 &optimizer_options.heaviside_eta, nullptr));
   PetscCall(PetscOptionsGetReal(nullptr, nullptr,
