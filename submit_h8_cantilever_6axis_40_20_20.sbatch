@@ -56,13 +56,15 @@ ulimit -s unlimited || true
 ulimit -l unlimited || true
 
 CASE_ID="${CASE_ID:-${SLURM_ARRAY_TASK_ID:-0}}"
-DRAFT_AXES_LIST=("+x" "-x" "+y" "-y" "+z" "-z")
+DRAFT_AXES_LIST=("px" "mx" "py" "my" "pz" "mz")
+DRAFT_LABELS=("+x" "-x" "+y" "-y" "+z" "-z")
 RUN_NAMES=("plus_x" "minus_x" "plus_y" "minus_y" "plus_z" "minus_z")
 if [ "${CASE_ID}" -lt 0 ] || [ "${CASE_ID}" -ge "${#DRAFT_AXES_LIST[@]}" ]; then
   echo "无效 CASE_ID=${CASE_ID}; 应为 0..5。" >&2
   exit 2
 fi
 DRAFT_AXES="${DRAFT_AXES_LIST[$CASE_ID]}"
+DRAFT_LABEL="${DRAFT_LABELS[$CASE_ID]}"
 RUN_NAME="${RUN_NAMES[$CASE_ID]}"
 
 # 这里的 NEL* 是单元数；程序参数 NX/NY/NZ 是节点数。
@@ -143,7 +145,7 @@ echo "提交目录: ${SUBMIT_DIR}"
 echo "运行节点: $(hostname)"
 echo "Job id: ${JOB_ID}"
 echo "Array case: ${CASE_ID} ${RUN_NAME}"
-echo "拔模方向: ${DRAFT_AXES}"
+echo "拔模方向: ${DRAFT_LABEL} (${DRAFT_AXES})"
 echo "输出目录: ${CASE_DIR}"
 echo "Slurm nodes: ${SLURM_JOB_NODELIST:-unknown}"
 echo "SLURM_NTASKS=${SLURM_NTASKS:-unset}"
@@ -174,7 +176,7 @@ echo "  opt_max_iter=${OPT_MAX_ITER}"
 echo "  volfrac=${VOLFRAC}"
 echo "  move=${OPT_MOVE}"
 echo "  filter_radius=${OPT_FILTER_RADIUS}"
-echo "  draft_axes=${DRAFT_AXES}"
+echo "  draft_axes=${DRAFT_LABEL} (${DRAFT_AXES})"
 echo "  matlab_z_projection=${OPT_MATLAB_Z_PROJECTION}"
 echo "  h8_pc_type=${H8_PC_TYPE}"
 echo "  output_prefix=${PREFIX}"

@@ -54,7 +54,8 @@ ulimit -s unlimited || true
 ulimit -l unlimited || true
 
 CASE_ID="${CASE_ID:-${SLURM_ARRAY_TASK_ID:-0}}"
-DRAFT_AXES_LIST=("+x" "-x" "+y" "-y" "+z" "-z")
+DRAFT_AXES_LIST=("px" "mx" "py" "my" "pz" "mz")
+DRAFT_LABELS=("+x" "-x" "+y" "-y" "+z" "-z")
 RUN_NAMES=("plus_x" "minus_x" "plus_y" "minus_y" "plus_z" "minus_z")
 H8_DM_PX_LIST=(7 7 8 8 8 8)
 H8_DM_PY_LIST=(4 4 4 4 7 7)
@@ -64,6 +65,7 @@ if [ "${CASE_ID}" -lt 0 ] || [ "${CASE_ID}" -ge "${#DRAFT_AXES_LIST[@]}" ]; then
   exit 2
 fi
 DRAFT_AXES="${DRAFT_AXES_LIST[$CASE_ID]}"
+DRAFT_LABEL="${DRAFT_LABELS[$CASE_ID]}"
 RUN_NAME="${RUN_NAMES[$CASE_ID]}"
 
 NELX="${NELX:-160}"
@@ -142,7 +144,7 @@ echo "Submit dir: ${SUBMIT_DIR}"
 echo "Run host: $(hostname)"
 echo "Job id: ${JOB_ID}"
 echo "Array case: ${CASE_ID} ${RUN_NAME}"
-echo "Draft axes: ${DRAFT_AXES}"
+echo "Draft axes: ${DRAFT_LABEL} (${DRAFT_AXES})"
 echo "Output dir: ${CASE_DIR}"
 echo "Slurm nodes: ${SLURM_JOB_NODELIST:-unknown}"
 echo "SLURM_NTASKS=${SLURM_NTASKS:-unset}"
@@ -173,7 +175,7 @@ echo "  opt_max_iter=${OPT_MAX_ITER}"
 echo "  volfrac=${VOLFRAC}"
 echo "  move=${OPT_MOVE}"
 echo "  filter_radius=${OPT_FILTER_RADIUS}"
-echo "  draft_axes=${DRAFT_AXES}"
+echo "  draft_axes=${DRAFT_LABEL} (${DRAFT_AXES})"
 echo "  matlab_z_projection=${OPT_MATLAB_Z_PROJECTION}"
 echo "  h8_pc_type=${H8_PC_TYPE}"
 echo "  checkpoint_interval=${OPT_CHECKPOINT_INTERVAL}"

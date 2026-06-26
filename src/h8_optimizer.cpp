@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1126,42 +1127,104 @@ struct H8DraftDirection {
   PetscInt sign = 0;
 };
 
+const char *h8_draft_axes_error_message() {
+  return "-opt_draft_axes must use +x,-x,+y,-y,+z,-z, "
+         "px,mx,py,my,pz,mz, x, y, z, or none";
+}
+
+PetscBool h8_axis_from_char(char c, PetscInt *axis) {
+  c = lowercase_ascii(c);
+  if (c == 'x') {
+    *axis = 0;
+    return PETSC_TRUE;
+  }
+  if (c == 'y') {
+    *axis = 1;
+    return PETSC_TRUE;
+  }
+  if (c == 'z') {
+    *axis = 2;
+    return PETSC_TRUE;
+  }
+  return PETSC_FALSE;
+}
+
+std::string h8_compact_lower_token(const char *begin, const char *end) {
+  std::string token;
+  for (const char *p = begin; p < end; ++p) {
+    const char c = lowercase_ascii(*p);
+    if (c == '_' || c == '-') continue;
+    token.push_back(c);
+  }
+  return token;
+}
+
+PetscErrorCode parse_h8_draft_axis_token(const char *begin, const char *end,
+                                         std::vector<H8DraftDirection> *dirs) {
+  while (begin < end && (*begin == ' ' || *begin == '\t')) ++begin;
+  while (end > begin && (*(end - 1) == ' ' || *(end - 1) == '\t')) --end;
+  if (begin == end) return 0;
+
+  std::string token;
+  for (const char *p = begin; p < end; ++p) {
+    token.push_back(lowercase_ascii(*p));
+  }
+  if (token == "none") return 0;
+
+  PetscInt axis = -1;
+  PetscInt sign = 0;
+  PetscBool ok = PETSC_FALSE;
+  if (token.size() == 1) {
+    ok = h8_axis_from_char(token[0], &axis);
+  } else if (token.size() == 2 && (token[0] == '+' || token[0] == '-')) {
+    ok = h8_axis_from_char(token[1], &axis);
+    sign = (token[0] == '+') ? 1 : -1;
+  } else if (token.size() == 2 &&
+             (token[0] == 'p' || token[0] == 'm' || token[0] == 'n')) {
+    ok = h8_axis_from_char(token[1], &axis);
+    sign = (token[0] == 'p') ? 1 : -1;
+  } else {
+    const std::string compact = h8_compact_lower_token(begin, end);
+    const std::size_t len = compact.size();
+    if (len >= 4 && compact.compare(0, 3, "pos") == 0) {
+      ok = h8_axis_from_char(compact[len - 1], &axis);
+      sign = 1;
+    } else if (len >= 5 && compact.compare(0, 4, "plus") == 0) {
+      ok = h8_axis_from_char(compact[len - 1], &axis);
+      sign = 1;
+    } else if (len >= 4 && compact.compare(0, 3, "neg") == 0) {
+      ok = h8_axis_from_char(compact[len - 1], &axis);
+      sign = -1;
+    } else if (len >= 6 && compact.compare(0, 5, "minus") == 0) {
+      ok = h8_axis_from_char(compact[len - 1], &axis);
+      sign = -1;
+    }
+  }
+
+  PetscCheck(ok && axis >= 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "%s", h8_draft_axes_error_message());
+  H8DraftDirection parsed;
+  parsed.axis = axis;
+  parsed.sign = sign;
+  dirs->push_back(parsed);
+  return 0;
+}
+
 PetscErrorCode parse_h8_draft_axes(const char *text,
                                    std::vector<H8DraftDirection> *dirs) {
   dirs->clear();
   PetscCheck(text != nullptr && text[0] != '\0', PETSC_COMM_WORLD,
-             PETSC_ERR_ARG_WRONG,
-             "-opt_draft_axes must use +x,-x,+y,-y,+z,-z, x, y, z, or none");
-  for (const char *p = text; *p != '\0'; ++p) {
-    char c = lowercase_ascii(*p);
-    if (c == ' ' || c == '\t' || c == ',' || c == ';' || c == '/') {
-      continue;
-    }
-    if (c == 'n' && lowercase_ascii(*(p + 1)) == 'o' &&
-        lowercase_ascii(*(p + 2)) == 'n' &&
-        lowercase_ascii(*(p + 3)) == 'e') {
-      p += 3;
-      continue;
-    }
+             PETSC_ERR_ARG_WRONG, "%s", h8_draft_axes_error_message());
 
-    PetscInt sign = 0;
-    if (c == '+' || c == '-') {
-      sign = (c == '+') ? 1 : -1;
-      ++p;
-      while (*p == ' ' || *p == '\t') ++p;
-      c = lowercase_ascii(*p);
+  const char *token_begin = text;
+  for (const char *p = text;; ++p) {
+    const char c = *p;
+    if (c == '\0' || c == ',' || c == ';' || c == '/' || c == ' ' ||
+        c == '\t') {
+      PetscCall(parse_h8_draft_axis_token(token_begin, p, dirs));
+      if (c == '\0') break;
+      token_begin = p + 1;
     }
-
-    PetscInt axis = -1;
-    if (c == 'x') axis = 0;
-    if (c == 'y') axis = 1;
-    if (c == 'z') axis = 2;
-    PetscCheck(axis >= 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-               "-opt_draft_axes must use +x,-x,+y,-y,+z,-z, x, y, z, or none");
-    H8DraftDirection parsed;
-    parsed.axis = axis;
-    parsed.sign = sign;
-    dirs->push_back(parsed);
   }
   return 0;
 }
