@@ -69,6 +69,7 @@ OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
 OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"
 OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
 OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-0}"
+OPT_MATLAB_Z_PROJECTION="${OPT_MATLAB_Z_PROJECTION:-false}"
 YOUNG_MODULUS="${YOUNG_MODULUS:-2.1e11}"
 PENAL="${PENAL:-3.0}"
 EMIN="${EMIN:-1e-6}"
@@ -148,6 +149,7 @@ echo "  ksp_rtol=${KSP_RTOL}"
 echo "  ksp_max_it=${KSP_MAX_IT}"
 echo "  ksp_type=${KSP_TYPE}"
 echo "  h8_pc_type=${H8_PC_TYPE}"
+echo "  opt_matlab_z_projection=${OPT_MATLAB_Z_PROJECTION}"
 echo "  h8_reuse_initial_guess=${H8_REUSE_INITIAL_GUESS}"
 echo "  opt_stop_on_ksp_divergence=${OPT_STOP_ON_KSP_DIVERGENCE}"
 echo "  h8_load_case=${H8_LOAD_CASE}"
@@ -191,6 +193,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -opt_heaviside_beta_initial "${OPT_HEAVISIDE_BETA_INITIAL}" \
   -opt_heaviside_beta_max "${OPT_HEAVISIDE_BETA_MAX}" \
   -opt_heaviside_beta_interval "${OPT_HEAVISIDE_BETA_INTERVAL}" \
+  -opt_matlab_z_projection "${OPT_MATLAB_Z_PROJECTION}" \
   -opt_load 1.0 \
   -h8_load_case "${H8_LOAD_CASE}" \
   -h8_include_spring_load "${H8_INCLUDE_SPRING_LOAD}" \

@@ -4760,6 +4760,9 @@ PetscErrorCode write_h8_summary(const char *output_prefix, const Grid &grid,
                                                                    : "false"));
   PetscCall(PetscViewerASCIIPrintf(viewer, "use_mma=%s\n",
                                    opt.use_mma ? "true" : "false"));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "matlab_z_projection=%s\n",
+                                   opt.matlab_z_projection ? "true"
+                                                           : "false"));
   PetscCall(PetscViewerASCIIPrintf(viewer, "z_draft_closure=%s\n",
                                    opt.z_draft_closure ? "true" : "false"));
   PetscCall(PetscViewerASCIIPrintf(viewer, "z_draft_eta=%.12e\n",
