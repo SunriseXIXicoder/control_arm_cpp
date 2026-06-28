@@ -6,6 +6,10 @@
 #
 # Each array task uses 8 nodes * 28 MPI ranks = 224 ranks.
 # The array can run all three cases concurrently, using 24 nodes in total.
+# Defaults match the current tip-center cantilever batch:
+#   - MMA update for generic H8 design variables
+#   - penal=3.0, hypre xstrong, KSP rtol=1e-9
+#   - only final VTK is written; intermediate checkpoints are disabled
 #
 # Draft-axis aliases avoid PETSc parsing "-x" or "-y" as command-line options:
 #   px,mx,py,my,pz,mz mean +x,-x,+y,-y,+z,-z.
@@ -87,19 +91,19 @@ OPT_PROJECTED_VOLUME_CORRECTION="${OPT_PROJECTED_VOLUME_CORRECTION:-true}"
 OPT_DRAFT_CLOSURE="${OPT_DRAFT_CLOSURE:-${DRAFT_CLOSURE}}"
 OPT_DRAFT_ETA="${OPT_DRAFT_ETA:-0.5}"
 OPT_MATLAB_Z_PROJECTION="${OPT_MATLAB_Z_PROJECTION:-false}"
-OPT_USE_MMA="${OPT_USE_MMA:-false}"
+OPT_USE_MMA="${OPT_USE_MMA:-true}"
 OPT_HEAVISIDE="${OPT_HEAVISIDE:-true}"
 OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
 OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"
 OPT_HEAVISIDE_BETA_MAX="${OPT_HEAVISIDE_BETA_MAX:-16.0}"
 OPT_HEAVISIDE_BETA_INTERVAL="${OPT_HEAVISIDE_BETA_INTERVAL:-50}"
 OPT_RHO_MIN="${OPT_RHO_MIN:-1e-3}"
-PENAL="${PENAL:-1}"
+PENAL="${PENAL:-3.0}"
 EMIN="${EMIN:-1e-9}"
 VOID_DENSITY="${VOID_DENSITY:-0.02}"
 YOUNG_MODULUS="${YOUNG_MODULUS:-2.1e11}"
 OPT_LOAD="${OPT_LOAD:-1}"
-KSP_RTOL="${KSP_RTOL:-1e-8}"
+KSP_RTOL="${KSP_RTOL:-1e-9}"
 KSP_MAX_IT="${KSP_MAX_IT:-1000}"
 KSP_TYPE="${KSP_TYPE:-fgmres}"
 H8_PC_TYPE="${H8_PC_TYPE:-aux_elastic_hypre}"
@@ -108,9 +112,28 @@ H8_REUSE_INITIAL_GUESS="${H8_REUSE_INITIAL_GUESS:-true}"
 OPT_STOP_ON_KSP_DIVERGENCE="${OPT_STOP_ON_KSP_DIVERGENCE:-true}"
 OPT_WRITE_FINAL_VTK="${OPT_WRITE_FINAL_VTK:-true}"
 OPT_VTK_MAX_POINTS="${OPT_VTK_MAX_POINTS:-5000000}"
-OPT_CHECKPOINT_INTERVAL="${OPT_CHECKPOINT_INTERVAL:-50}"
-PETSC_EXTRA_OPTIONS="${PETSC_EXTRA_OPTIONS:--ksp_gmres_restart 200 -ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5}"
+OPT_WRITE_CHECKPOINT="${OPT_WRITE_CHECKPOINT:-false}"
+OPT_CHECKPOINT_INTERVAL="${OPT_CHECKPOINT_INTERVAL:-0}"
+HYPRE_PROFILE="${HYPRE_PROFILE:-xstrong}"
 CXXSTD="${CXXSTD:-c++11}"
+
+if [ -z "${PETSC_EXTRA_OPTIONS+x}" ]; then
+  case "${HYPRE_PROFILE}" in
+    lowmem)
+      PETSC_EXTRA_OPTIONS="-ksp_gmres_restart 200 -ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.5 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3"
+      ;;
+    strong)
+      PETSC_EXTRA_OPTIONS="-ksp_gmres_restart 200 -ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.6 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3 -pc_hypre_boomeramg_interp_type ext+i -pc_hypre_boomeramg_relax_type_all l1scaled-Jacobi"
+      ;;
+    xstrong)
+      PETSC_EXTRA_OPTIONS="-ksp_gmres_restart 200 -ksp_norm_type unpreconditioned -ksp_monitor_true_residual -pc_hypre_type boomeramg -pc_hypre_boomeramg_strong_threshold 0.7 -pc_hypre_boomeramg_nodal_coarsen 1 -pc_hypre_boomeramg_vec_interp_variant 3 -pc_hypre_boomeramg_interp_type ext+i -pc_hypre_boomeramg_coarsen_type PMIS -pc_hypre_boomeramg_relax_type_all l1scaled-Jacobi -pc_hypre_boomeramg_max_iter 2"
+      ;;
+    *)
+      echo "Unknown HYPRE_PROFILE=${HYPRE_PROFILE}; use lowmem, strong, or xstrong." >&2
+      exit 2
+      ;;
+  esac
+fi
 
 JOB_ID="${SLURM_JOB_ID:-${SLURM_JOBID:-manual}}"
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
@@ -177,15 +200,21 @@ echo "  ranks=${TOTAL_TASKS}, dm=${H8_DM_PX}x${H8_DM_PY}x${H8_DM_PZ}"
 echo "  benchmark_case=${BENCHMARK_CASE}"
 echo "  opt_max_iter=${OPT_MAX_ITER}"
 echo "  volfrac=${VOLFRAC}"
+echo "  penal=${PENAL}"
 echo "  move=${OPT_MOVE}"
 echo "  filter_radius=${OPT_FILTER_RADIUS}"
 echo "  draft_closure=${OPT_DRAFT_CLOSURE}"
 echo "  draft_axes=${DRAFT_LABEL} (${DRAFT_AXES})"
+echo "  use_mma=${OPT_USE_MMA}"
 echo "  matlab_z_projection=${OPT_MATLAB_Z_PROJECTION}"
 echo "  h8_pc_type=${H8_PC_TYPE}"
+echo "  hypre_profile=${HYPRE_PROFILE}"
+echo "  ksp_rtol=${KSP_RTOL}"
+echo "  write_checkpoint=${OPT_WRITE_CHECKPOINT}"
 echo "  checkpoint_interval=${OPT_CHECKPOINT_INTERVAL}"
 echo "  write_final_vtk=${OPT_WRITE_FINAL_VTK}"
 echo "  output_prefix=${PREFIX}"
+echo "  petsc_extra_options=${PETSC_EXTRA_OPTIONS}"
 
 if [ "${MPI_LAUNCHER}" = "srun" ]; then
   LAUNCH_CMD="${MPI_LAUNCHER} ${MPI_LAUNCHER_ARGS} -n ${TOTAL_TASKS}"
@@ -226,7 +255,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -opt_ksp_max_it "${KSP_MAX_IT}" \
   -opt_write_final_vtk "${OPT_WRITE_FINAL_VTK}" \
   -opt_vtk_max_points "${OPT_VTK_MAX_POINTS}" \
-  -opt_write_checkpoint true \
+  -opt_write_checkpoint "${OPT_WRITE_CHECKPOINT}" \
   -opt_checkpoint_interval "${OPT_CHECKPOINT_INTERVAL}" \
   -opt_checkpoint_prefix "${PREFIX}_checkpoint" \
   -output_prefix "${PREFIX}" \

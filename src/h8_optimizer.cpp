@@ -235,8 +235,7 @@ PetscBool benchmark_has_matlab_load_elements(const char *benchmark_case) {
   return (benchmark_is_cantilever(benchmark_case) ||
           benchmark_is_bridge(benchmark_case) ||
           benchmark_is_mbb(benchmark_case) ||
-          benchmark_is_tri(benchmark_case) ||
-          benchmark_is_torsion_edge(benchmark_case))
+          benchmark_is_tri(benchmark_case))
              ? PETSC_TRUE
              : PETSC_FALSE;
 }
@@ -365,11 +364,6 @@ PetscBool h8_cell_is_forced_solid(PetscInt i, PetscInt j, PetscInt k,
     }
     if (benchmark_is_tri(opt.benchmark_case)) {
       return (i == 0 && j == 0 && k == ez - 1) ? PETSC_TRUE : PETSC_FALSE;
-    }
-    if (benchmark_is_torsion_edge(opt.benchmark_case)) {
-      return (i == ex - 1 && (j == 0 || j == ey - 1 || k == 0 || k == ez - 1))
-                 ? PETSC_TRUE
-                 : PETSC_FALSE;
     }
     if (benchmark_is_tip_center_cantilever(opt.benchmark_case)) {
       const PetscInt mid_j = ey / 2;
