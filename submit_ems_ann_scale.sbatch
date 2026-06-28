@@ -81,6 +81,7 @@ CONTROL_ARM_BC="${CONTROL_ARM_BC:-true}"
 INCLUDE_SPRING_LOAD="${INCLUDE_SPRING_LOAD:-true}"
 VOLFRAC="${VOLFRAC:-0.30}"
 FILTER_RADIUS="${FILTER_RADIUS:-1.5}"
+EMS_FILTER_MODE="${EMS_FILTER_MODE:-fine}"
 AB_TRIANGLE_RETRACT="${AB_TRIANGLE_RETRACT:-0.22}"
 YOUNG_MODULUS="${YOUNG_MODULUS:-2.1e11}"
 PENAL="${PENAL:-3.0}"
@@ -320,6 +321,7 @@ echo "  control_arm_bc=${CONTROL_ARM_BC}"
 echo "  include_spring_load=${INCLUDE_SPRING_LOAD}"
 echo "  volfrac=${VOLFRAC}"
 echo "  ab_triangle_retract=${AB_TRIANGLE_RETRACT}"
+echo "  filter_mode=${EMS_FILTER_MODE} filter_radius=${FILTER_RADIUS}"
 echo "  draft_closure=${OPT_DRAFT_CLOSURE} mode=${EMS_DRAFT_CLOSURE_MODE} axes=${OPT_DRAFT_AXES} eta=${OPT_DRAFT_ETA}"
 echo "  heaviside=${OPT_HEAVISIDE} beta0=${OPT_HEAVISIDE_BETA_INITIAL} beta_max=${OPT_HEAVISIDE_BETA_MAX} beta_interval=${OPT_HEAVISIDE_BETA_INTERVAL}"
 echo "  ems_pc_type=${EMS_PC_TYPE}"
@@ -385,6 +387,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -ems_cache_element_matrices "${CACHE_K}" \
   -ems_cache_gib_limit "${CACHE_GIB_LIMIT}" \
   -ems_pc_type "${EMS_PC_TYPE}" \
+  -ems_ann_filter_mode "${EMS_FILTER_MODE}" \
   -ems_ann_draft_closure_mode "${EMS_DRAFT_CLOSURE_MODE}" \
   -control_arm_bc "${CONTROL_ARM_BC}" \
   -load_case "${LOAD_CASE}" \

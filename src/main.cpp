@@ -641,6 +641,16 @@ int main(int argc, char **argv) {
                                   sizeof(ems_options.benchmark_case),
                                   nullptr));
   PetscCall(PetscOptionsGetString(nullptr, nullptr,
+                                  "-ems_ann_filter_mode",
+                                  ems_options.filter_mode,
+                                  sizeof(ems_options.filter_mode),
+                                  nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr,
+                                  "-ems_filter_mode",
+                                  ems_options.filter_mode,
+                                  sizeof(ems_options.filter_mode),
+                                  nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr,
                                   "-ems_ann_draft_closure_mode",
                                   ems_options.draft_closure_mode,
                                   sizeof(ems_options.draft_closure_mode),

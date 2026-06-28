@@ -404,6 +404,7 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | --- | --- | --- |
 | `-ems_ann_dir` | path | ANN model directory, for example `../input_5` or `../input_20`. |
 | `-ems_sub_n` | integer >= 2 | Fine-density subcell count per coarse element direction. |
+| `-ems_ann_filter_mode` | `fine`, `coarse` | Select EMsFEM ANN density filtering. `fine` keeps the previous fine-cell filter where `-opt_filter_radius` is multiplied by `ems_sub_n`; `coarse` treats `-opt_filter_radius` as a coarse-cell radius and shares each coarse weight across its `sub_n^3` fine cells. |
 | `-ems_cache_element_matrices` | `true|false` | Cache EMsFEM element matrices; optimization requires `true`. |
 | `-ems_cache_gib_limit` | real | Per-rank cache limit in GiB; `0` means unlimited. |
 | `-control_arm_bc` | `true|false` | Use control-arm boundary conditions instead of simple test BC. |
@@ -413,6 +414,8 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | `-ems_ann_draft_closure_mode` | `legacy_z`, `axis`, `none` | Select EMsFEM ANN draft closure. `legacy_z` preserves the previous ANN z-prefix/suffix closure; `axis` uses the shared H8 signed-axis closure; `none` skips closure even when `-opt_draft_closure true`. |
 | `-ems_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre`, `aux_ann_gamg`, `aux_ann_hypre` | Select the EMsFEM ANN preconditioner. Production default is `aux_ann_gamg`; HYPRE comparison uses `aux_ann_hypre`. |
 | `-ems_dm_px`, `-ems_dm_py`, `-ems_dm_pz` | positive integers | Manually set the EMsFEM 3D process grid; product must equal MPI ranks. |
+
+In `coarse` filter mode, each coarse element contributes the sum of its active fine cells (`mask > 0.5`) and the denominator uses the active fine-cell count. Final fine-cell values still enforce the same mask rules as the fine filter: `mask <= 0.5` stays `void_density`, `0.5 < mask <= 1.5` receives the coarse-filtered value, and `mask > 1.5` stays solid.
 
 Direct EMsFEM ANN example:
 
@@ -503,7 +506,7 @@ sbatch --export=ALL,KEY=value,KEY=value script.sbatch
 | `submit_h8_opt_100m.sbatch` | H8 100M-DOF production optimization. | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `H8_PC_TYPE`, `H8_DM_PX/PY/PZ`, `RUN_LABEL` |
 | `submit_h8_opt_100m_1step.sbatch` | One-step 100M-DOF H8 smoke run. | same as H8 production |
 | `submit_h8_draft_split_z.sbatch` | Small H8 `+z,-z` split-draw verification case. | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `OUTPUT_DIR`, `H8_PC_TYPE`, `PETSC_EXTRA_OPTIONS` |
-| `submit_ems_ann_scale.sbatch` | EMsFEM ANN optimization. | `NELX/NELY/NELZ` or `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `EMS_DRAFT_CLOSURE_MODE`, `OPT_DRAFT_AXES`, `OPT_DRAFT_ETA`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
+| `submit_ems_ann_scale.sbatch` | EMsFEM ANN optimization. | `NELX/NELY/NELZ` or `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `EMS_FILTER_MODE`, `EMS_DRAFT_CLOSURE_MODE`, `OPT_DRAFT_AXES`, `OPT_DRAFT_ETA`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
 | `submit_h8_postprocess_100m.sbatch` | Convert H8 checkpoint to downsampled VTK. | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `POST_STRIDE`, `VTK_FILE` |
 | `submit_h8_full_vtk_100m.sbatch` | Write full-resolution H8 `.pvti` and `.vti` pieces. | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `H8_PC_TYPE` |
 | `submit_ems_ann_full_vtk.sbatch` | Convert EMsFEM ANN fine-density checkpoint to full VTK through the Python converter. | `CHECKPOINT_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `EMS_SUB_N` |
@@ -528,6 +531,22 @@ Example EMsFEM ANN submission:
 ```sh
 sbatch --nodes=48 --ntasks-per-node=28 \
   --export=ALL,PETSC_DIR=/data/home/dlut_ycx/petsc/petsc-v3.19.3,PETSC_ARCH=arch-linux-c-opt-hypre,EMS_SUB_N=5,ANN_DIR=../input_5,EMS_PC_TYPE=aux_ann_gamg,GAMG_PROFILE=strong \
+  submit_ems_ann_scale.sbatch
+```
+
+EMsFEM ANN 粗单元滤波提交示例：
+
+```sh
+sbatch --nodes=48 --ntasks-per-node=28 \
+  --export=ALL,PETSC_DIR=/data/home/dlut_ycx/petsc/petsc-v3.19.3,PETSC_ARCH=arch-linux-c-opt-hypre,EMS_SUB_N=5,ANN_DIR=../input_5,EMS_FILTER_MODE=coarse,FILTER_RADIUS=5,EMS_PC_TYPE=aux_ann_gamg,GAMG_PROFILE=strong \
+  submit_ems_ann_scale.sbatch
+```
+
+Coarse ANN filter example:
+
+```sh
+sbatch --nodes=48 --ntasks-per-node=28 \
+  --export=ALL,PETSC_DIR=/data/home/dlut_ycx/petsc/petsc-v3.19.3,PETSC_ARCH=arch-linux-c-opt-hypre,EMS_SUB_N=5,ANN_DIR=../input_5,EMS_FILTER_MODE=coarse,FILTER_RADIUS=5,EMS_PC_TYPE=aux_ann_gamg,GAMG_PROFILE=strong \
   submit_ems_ann_scale.sbatch
 ```
 
@@ -939,6 +958,7 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | --- | --- | --- |
 | `-ems_ann_dir` | 路径 | ANN 模型目录，例如 `../input_5` 或 `../input_20`。 |
 | `-ems_sub_n` | >= 2 的整数 | 每个粗单元每个方向的细密度子单元数量。 |
+| `-ems_ann_filter_mode` | `fine`, `coarse` | 选择 EMsFEM ANN 密度滤波。`fine` 保留旧细单元滤波，`-opt_filter_radius` 会乘以 `ems_sub_n`；`coarse` 把 `-opt_filter_radius` 作为粗单元半径，并让每个粗权重在该粗单元的 `sub_n^3` 个细单元内共用。 |
 | `-ems_cache_element_matrices` | `true|false` | 是否缓存 EMsFEM 单元矩阵；优化模式要求为 `true`。 |
 | `-ems_cache_gib_limit` | 实数 | 每个 rank 的缓存上限，单位 GiB；`0` 表示不限。 |
 | `-control_arm_bc` | `true|false` | 是否使用控制臂专用边界条件。 |
@@ -948,6 +968,8 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | `-ems_ann_draft_closure_mode` | `legacy_z`, `axis`, `none` | 选择 EMsFEM ANN 拔模闭包。`legacy_z` 保留旧 ANN z-prefix/suffix 闭包；`axis` 使用共享的 H8 有符号轴向闭包；`none` 即使 `-opt_draft_closure true` 也跳过闭包。 |
 | `-ems_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre`, `aux_ann_gamg`, `aux_ann_hypre` | 选择 EMsFEM ANN 预条件器。生产默认 `aux_ann_gamg`，HYPRE 对照可用 `aux_ann_hypre`。 |
 | `-ems_dm_px`, `-ems_dm_py`, `-ems_dm_pz` | 正整数 | 手动指定 EMsFEM 三维进程网格，乘积必须等于 MPI 进程数。 |
+
+`coarse` 滤波模式下，每个粗单元先聚合 `mask > 0.5` 的有效细单元密度和有效细单元数量，滤波分母使用这个数量。最终写回细网格时仍采用和细滤波一致的 mask 规则：`mask <= 0.5` 保持 `void_density`，`0.5 < mask <= 1.5` 使用粗滤波值，`mask > 1.5` 保持实体。
 
 EMsFEM ANN 直接运行示例：
 
@@ -1038,7 +1060,7 @@ sbatch --export=ALL,KEY=value,KEY=value script.sbatch
 | `submit_h8_opt_100m.sbatch` | H8 约 100M 自由度生产优化。 | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `H8_PC_TYPE`, `H8_DM_PX/PY/PZ`, `RUN_LABEL` |
 | `submit_h8_opt_100m_1step.sbatch` | H8 100M 一步烟雾测试。 | 同 H8 生产脚本 |
 | `submit_h8_draft_split_z.sbatch` | H8 小网格 `+z,-z` split draw 验证算例。 | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `OUTPUT_DIR`, `H8_PC_TYPE`, `PETSC_EXTRA_OPTIONS` |
-| `submit_ems_ann_scale.sbatch` | EMsFEM ANN 优化。 | `NELX/NELY/NELZ` 或 `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `EMS_DRAFT_CLOSURE_MODE`, `OPT_DRAFT_AXES`, `OPT_DRAFT_ETA`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
+| `submit_ems_ann_scale.sbatch` | EMsFEM ANN 优化。 | `NELX/NELY/NELZ` 或 `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `EMS_FILTER_MODE`, `EMS_DRAFT_CLOSURE_MODE`, `OPT_DRAFT_AXES`, `OPT_DRAFT_ETA`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
 | `submit_h8_postprocess_100m.sbatch` | 将 H8 checkpoint 转为降采样 VTK。 | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `POST_STRIDE`, `VTK_FILE` |
 | `submit_h8_full_vtk_100m.sbatch` | 写 H8 全分辨率 `.pvti` 和 `.vti` 分片。 | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `H8_PC_TYPE` |
 | `submit_ems_ann_full_vtk.sbatch` | 通过 Python 转换器将 EMsFEM ANN 细密度 checkpoint 转为全量 VTK。 | `CHECKPOINT_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `EMS_SUB_N` |

@@ -709,11 +709,41 @@ PetscReal simp_derivative(PetscReal rho, const DensityOptions &opts) {
 
 // 计算密度过滤器的锥形权重。
 // 距离越近权重越大，超过 radius 的邻居权重为 0。
-// dx/dy/dz 是细网格索引偏移，radius 是细网格单位下的过滤半径。
+// dx/dy/dz 是网格索引偏移；细滤波用细单元单位，粗滤波用粗单元单位。
 PetscReal cone_weight(PetscInt dx, PetscInt dy, PetscInt dz, PetscReal radius) {
   const PetscReal dist =
       PetscSqrtReal(static_cast<PetscReal>(dx * dx + dy * dy + dz * dz));
   return PetscMax(0.0, radius - dist);
+}
+
+PetscBool ems_filter_mode_equals(const EmSfemAnnOptions &ems_options,
+                                 const char *name) {
+  return std::strcmp(ems_options.filter_mode, name) == 0 ? PETSC_TRUE
+                                                         : PETSC_FALSE;
+}
+
+PetscBool ems_filter_mode_is_fine(const EmSfemAnnOptions &ems_options) {
+  return (ems_filter_mode_equals(ems_options, "fine") ||
+          ems_filter_mode_equals(ems_options, "fine_cell") ||
+          ems_filter_mode_equals(ems_options, "fine_cells"))
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscBool ems_filter_mode_is_coarse(const EmSfemAnnOptions &ems_options) {
+  return (ems_filter_mode_equals(ems_options, "coarse") ||
+          ems_filter_mode_equals(ems_options, "coarse_cell") ||
+          ems_filter_mode_equals(ems_options, "coarse_cells"))
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscErrorCode validate_ems_filter_mode(const EmSfemAnnOptions &ems_options) {
+  PetscCheck(ems_filter_mode_is_fine(ems_options) ||
+                 ems_filter_mode_is_coarse(ems_options),
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "-ems_ann_filter_mode must be fine or coarse");
+  return 0;
 }
 
 PetscInt ceil_div(PetscInt a, PetscInt b) {
@@ -1380,6 +1410,498 @@ PetscErrorCode apply_sensitivity_filter_adjoint(DM eda, Vec dc_phys, Vec mask,
   PetscCall(VecDestroy(&local_dc));
   PetscCall(VecDestroy(&local_mask));
   PetscCall(VecDestroy(&local_denom));
+  return 0;
+}
+
+PetscErrorCode build_coarse_filter_active_count(DM cda,
+                                                DM fda,
+                                                Vec mask,
+                                                const Grid &grid,
+                                                PetscInt sub_n,
+                                                Vec active_count) {
+  PetscScalar ***m = nullptr;
+  PetscScalar ***count = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+
+  PetscCall(DMDAVecGetArrayRead(fda, mask, &m));
+  PetscCall(DMDAVecGetArray(cda, active_count, &count));
+  PetscCall(DMDAGetCorners(cda, &xs, &ys, &zs, &xm, &ym, &zm));
+  ElementCacheBox box;
+  box.xs = xs;
+  box.ys = ys;
+  box.zs = zs;
+  box.xm = xm;
+  box.ym = ym;
+  box.zm = zm;
+  PetscCall(check_ems_fda_ghost_covers_element_box(
+      fda, box, sub_n, "EMsFEM coarse-filter active-count build"));
+
+  for (PetscInt ez = zs; ez < zs + zm; ++ez) {
+    for (PetscInt ey = ys; ey < ys + ym; ++ey) {
+      for (PetscInt ex = xs; ex < xs + xm; ++ex) {
+        PetscReal active = 0.0;
+        for (PetscInt fz = 0; fz < sub_n; ++fz) {
+          const PetscInt k = ez * sub_n + fz;
+          for (PetscInt fy = 0; fy < sub_n; ++fy) {
+            const PetscInt j = ey * sub_n + fy;
+            for (PetscInt fx = 0; fx < sub_n; ++fx) {
+              const PetscInt i = ex * sub_n + fx;
+              if (PetscRealPart(m[k][j][i]) > 0.5) active += 1.0;
+            }
+          }
+        }
+        count[ez][ey][ex] = active;
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayRead(fda, mask, &m));
+  PetscCall(DMDAVecRestoreArray(cda, active_count, &count));
+  (void)grid;
+  return 0;
+}
+
+PetscErrorCode compute_coarse_filter_denominator(DM cda,
+                                                 Vec active_count,
+                                                 PetscReal radius,
+                                                 Vec denom) {
+  if (radius <= 0.0) {
+    PetscCall(VecSet(denom, 1.0));
+    return 0;
+  }
+  Vec local_active = nullptr;
+  PetscScalar ***active = nullptr;
+  PetscScalar ***d = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt ex = 0, ey = 0, ez = 0;
+  const PetscInt rr = PetscMax(0, static_cast<PetscInt>(PetscCeilReal(radius)));
+
+  PetscCall(DMDAGetInfo(cda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  PetscCall(DMCreateLocalVector(cda, &local_active));
+  PetscCall(DMGlobalToLocalBegin(cda, active_count, INSERT_VALUES,
+                                 local_active));
+  PetscCall(DMGlobalToLocalEnd(cda, active_count, INSERT_VALUES,
+                               local_active));
+  PetscCall(DMDAVecGetArrayRead(cda, local_active, &active));
+  PetscCall(DMDAVecGetArray(cda, denom, &d));
+  PetscCall(DMDAGetCorners(cda, &xs, &ys, &zs, &xm, &ym, &zm));
+
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        PetscReal sum = 0.0;
+        for (PetscInt dz = -rr; dz <= rr; ++dz) {
+          const PetscInt kk = k + dz;
+          if (kk < 0 || kk >= ez) continue;
+          for (PetscInt dy = -rr; dy <= rr; ++dy) {
+            const PetscInt jj = j + dy;
+            if (jj < 0 || jj >= ey) continue;
+            for (PetscInt dx = -rr; dx <= rr; ++dx) {
+              const PetscInt ii = i + dx;
+              if (ii < 0 || ii >= ex) continue;
+              const PetscReal w = cone_weight(dx, dy, dz, radius);
+              const PetscReal count = PetscRealPart(active[kk][jj][ii]);
+              if (w > 0.0 && count > 0.0) sum += w * count;
+            }
+          }
+        }
+        d[k][j][i] = PetscMax(sum, 1.0e-12);
+      }
+    }
+  }
+
+  PetscCall(DMDAVecRestoreArrayRead(cda, local_active, &active));
+  PetscCall(DMDAVecRestoreArray(cda, denom, &d));
+  PetscCall(VecDestroy(&local_active));
+  return 0;
+}
+
+PetscErrorCode build_coarse_filter_source_sum(DM cda,
+                                              DM fda,
+                                              Vec rho_design,
+                                              Vec mask,
+                                              const Grid &grid,
+                                              PetscInt sub_n,
+                                              Vec source_sum) {
+  PetscScalar ***rho = nullptr;
+  PetscScalar ***m = nullptr;
+  PetscScalar ***source = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+
+  PetscCall(DMDAVecGetArrayRead(fda, rho_design, &rho));
+  PetscCall(DMDAVecGetArrayRead(fda, mask, &m));
+  PetscCall(DMDAVecGetArray(cda, source_sum, &source));
+  PetscCall(DMDAGetCorners(cda, &xs, &ys, &zs, &xm, &ym, &zm));
+  ElementCacheBox box;
+  box.xs = xs;
+  box.ys = ys;
+  box.zs = zs;
+  box.xm = xm;
+  box.ym = ym;
+  box.zm = zm;
+  PetscCall(check_ems_fda_ghost_covers_element_box(
+      fda, box, sub_n, "EMsFEM coarse-filter source build"));
+
+  for (PetscInt ez = zs; ez < zs + zm; ++ez) {
+    for (PetscInt ey = ys; ey < ys + ym; ++ey) {
+      for (PetscInt ex = xs; ex < xs + xm; ++ex) {
+        PetscReal sum = 0.0;
+        for (PetscInt fz = 0; fz < sub_n; ++fz) {
+          const PetscInt k = ez * sub_n + fz;
+          for (PetscInt fy = 0; fy < sub_n; ++fy) {
+            const PetscInt j = ey * sub_n + fy;
+            for (PetscInt fx = 0; fx < sub_n; ++fx) {
+              const PetscInt i = ex * sub_n + fx;
+              if (PetscRealPart(m[k][j][i]) > 0.5) {
+                sum += PetscRealPart(rho[k][j][i]);
+              }
+            }
+          }
+        }
+        source[ez][ey][ex] = sum;
+      }
+    }
+  }
+
+  PetscCall(DMDAVecRestoreArrayRead(fda, rho_design, &rho));
+  PetscCall(DMDAVecRestoreArrayRead(fda, mask, &m));
+  PetscCall(DMDAVecRestoreArray(cda, source_sum, &source));
+  (void)grid;
+  return 0;
+}
+
+PetscErrorCode apply_coarse_filter_to_source(DM cda,
+                                             Vec source_sum,
+                                             Vec active_count,
+                                             Vec denom,
+                                             PetscReal radius,
+                                             Vec coarse_filtered) {
+  Vec local_source = nullptr;
+  Vec local_active = nullptr;
+  PetscScalar ***source = nullptr;
+  PetscScalar ***active = nullptr;
+  PetscScalar ***den = nullptr;
+  PetscScalar ***out = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt ex = 0, ey = 0, ez = 0;
+  const PetscInt rr = PetscMax(0, static_cast<PetscInt>(PetscCeilReal(radius)));
+
+  PetscCall(DMDAGetInfo(cda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  PetscCall(DMCreateLocalVector(cda, &local_source));
+  PetscCall(DMCreateLocalVector(cda, &local_active));
+  PetscCall(DMGlobalToLocalBegin(cda, source_sum, INSERT_VALUES,
+                                 local_source));
+  PetscCall(DMGlobalToLocalEnd(cda, source_sum, INSERT_VALUES, local_source));
+  PetscCall(DMGlobalToLocalBegin(cda, active_count, INSERT_VALUES,
+                                 local_active));
+  PetscCall(DMGlobalToLocalEnd(cda, active_count, INSERT_VALUES,
+                               local_active));
+  PetscCall(DMDAVecGetArrayRead(cda, local_source, &source));
+  PetscCall(DMDAVecGetArrayRead(cda, local_active, &active));
+  PetscCall(DMDAVecGetArrayRead(cda, denom, &den));
+  PetscCall(DMDAVecGetArray(cda, coarse_filtered, &out));
+  PetscCall(DMDAGetCorners(cda, &xs, &ys, &zs, &xm, &ym, &zm));
+
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        PetscReal sum = 0.0;
+        for (PetscInt dz = -rr; dz <= rr; ++dz) {
+          const PetscInt kk = k + dz;
+          if (kk < 0 || kk >= ez) continue;
+          for (PetscInt dy = -rr; dy <= rr; ++dy) {
+            const PetscInt jj = j + dy;
+            if (jj < 0 || jj >= ey) continue;
+            for (PetscInt dx = -rr; dx <= rr; ++dx) {
+              const PetscInt ii = i + dx;
+              if (ii < 0 || ii >= ex) continue;
+              const PetscReal w = cone_weight(dx, dy, dz, radius);
+              if (w > 0.0 && PetscRealPart(active[kk][jj][ii]) > 0.0) {
+                sum += w * PetscRealPart(source[kk][jj][ii]);
+              }
+            }
+          }
+        }
+        out[k][j][i] = sum / PetscRealPart(den[k][j][i]);
+      }
+    }
+  }
+
+  PetscCall(DMDAVecRestoreArrayRead(cda, local_source, &source));
+  PetscCall(DMDAVecRestoreArrayRead(cda, local_active, &active));
+  PetscCall(DMDAVecRestoreArrayRead(cda, denom, &den));
+  PetscCall(DMDAVecRestoreArray(cda, coarse_filtered, &out));
+  PetscCall(VecDestroy(&local_source));
+  PetscCall(VecDestroy(&local_active));
+  return 0;
+}
+
+PetscErrorCode scatter_coarse_filter_to_fine(DM cda,
+                                             DM fda,
+                                             Vec coarse_filtered,
+                                             Vec mask,
+                                             PetscInt sub_n,
+                                             PetscReal void_density,
+                                             Vec rho_filtered) {
+  PetscScalar ***coarse = nullptr;
+  PetscScalar ***m = nullptr;
+  PetscScalar ***out = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+
+  PetscCall(DMDAVecGetArrayRead(cda, coarse_filtered, &coarse));
+  PetscCall(DMDAVecGetArrayRead(fda, mask, &m));
+  PetscCall(DMDAVecGetArray(fda, rho_filtered, &out));
+  PetscCall(DMDAGetCorners(fda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    const PetscInt ez = k / sub_n;
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      const PetscInt ey = j / sub_n;
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscInt ex = i / sub_n;
+        const PetscReal mask_value = PetscRealPart(m[k][j][i]);
+        if (mask_value > 1.5) {
+          out[k][j][i] = 1.0;
+        } else if (mask_value <= 0.5) {
+          out[k][j][i] = void_density;
+        } else {
+          out[k][j][i] = coarse[ez][ey][ex];
+        }
+      }
+    }
+  }
+
+  PetscCall(DMDAVecRestoreArrayRead(cda, coarse_filtered, &coarse));
+  PetscCall(DMDAVecRestoreArrayRead(fda, mask, &m));
+  PetscCall(DMDAVecRestoreArray(fda, rho_filtered, &out));
+  return 0;
+}
+
+PetscErrorCode apply_coarse_density_filter(DM cda,
+                                           DM fda,
+                                           Vec rho_design,
+                                           Vec mask,
+                                           Vec active_count,
+                                           Vec denom,
+                                           Vec source_sum,
+                                           Vec coarse_filtered,
+                                           const Grid &grid,
+                                           PetscInt sub_n,
+                                           PetscReal radius,
+                                           PetscReal void_density,
+                                           Vec rho_filtered) {
+  PetscCall(build_coarse_filter_source_sum(cda, fda, rho_design, mask, grid,
+                                           sub_n, source_sum));
+  PetscCall(apply_coarse_filter_to_source(cda, source_sum, active_count, denom,
+                                          radius, coarse_filtered));
+  PetscCall(scatter_coarse_filter_to_fine(cda, fda, coarse_filtered, mask,
+                                          sub_n, void_density, rho_filtered));
+  return 0;
+}
+
+PetscErrorCode build_coarse_sensitivity_sum(DM cda,
+                                            DM fda,
+                                            Vec dc_filtered,
+                                            Vec mask,
+                                            const Grid &grid,
+                                            PetscInt sub_n,
+                                            Vec coarse_dc_sum) {
+  PetscScalar ***dc = nullptr;
+  PetscScalar ***m = nullptr;
+  PetscScalar ***coarse = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+
+  PetscCall(DMDAVecGetArrayRead(fda, dc_filtered, &dc));
+  PetscCall(DMDAVecGetArrayRead(fda, mask, &m));
+  PetscCall(DMDAVecGetArray(cda, coarse_dc_sum, &coarse));
+  PetscCall(DMDAGetCorners(cda, &xs, &ys, &zs, &xm, &ym, &zm));
+  ElementCacheBox box;
+  box.xs = xs;
+  box.ys = ys;
+  box.zs = zs;
+  box.xm = xm;
+  box.ym = ym;
+  box.zm = zm;
+  PetscCall(check_ems_fda_ghost_covers_element_box(
+      fda, box, sub_n, "EMsFEM coarse-filter sensitivity build"));
+
+  for (PetscInt ez = zs; ez < zs + zm; ++ez) {
+    for (PetscInt ey = ys; ey < ys + ym; ++ey) {
+      for (PetscInt ex = xs; ex < xs + xm; ++ex) {
+        PetscReal sum = 0.0;
+        for (PetscInt fz = 0; fz < sub_n; ++fz) {
+          const PetscInt k = ez * sub_n + fz;
+          for (PetscInt fy = 0; fy < sub_n; ++fy) {
+            const PetscInt j = ey * sub_n + fy;
+            for (PetscInt fx = 0; fx < sub_n; ++fx) {
+              const PetscInt i = ex * sub_n + fx;
+              const PetscReal mask_value = PetscRealPart(m[k][j][i]);
+              if (mask_value > 0.5 && mask_value <= 1.5) {
+                sum += PetscRealPart(dc[k][j][i]);
+              }
+            }
+          }
+        }
+        coarse[ez][ey][ex] = sum;
+      }
+    }
+  }
+
+  PetscCall(DMDAVecRestoreArrayRead(fda, dc_filtered, &dc));
+  PetscCall(DMDAVecRestoreArrayRead(fda, mask, &m));
+  PetscCall(DMDAVecRestoreArray(cda, coarse_dc_sum, &coarse));
+  (void)grid;
+  return 0;
+}
+
+PetscErrorCode apply_coarse_sensitivity_filter_adjoint(
+    DM cda,
+    DM fda,
+    Vec dc_filtered,
+    Vec mask,
+    Vec denom,
+    Vec coarse_dc_sum,
+    const Grid &grid,
+    PetscInt sub_n,
+    PetscReal radius,
+    Vec dc_design) {
+  Vec local_dc = nullptr;
+  Vec local_denom = nullptr;
+  PetscScalar ***dc = nullptr;
+  PetscScalar ***den = nullptr;
+  PetscScalar ***m = nullptr;
+  PetscScalar ***out = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscInt exn = 0, eyn = 0, ezn = 0;
+  const PetscInt rr = PetscMax(0, static_cast<PetscInt>(PetscCeilReal(radius)));
+
+  PetscCall(build_coarse_sensitivity_sum(cda, fda, dc_filtered, mask, grid,
+                                         sub_n, coarse_dc_sum));
+  PetscCall(DMDAGetInfo(cda, nullptr, &exn, &eyn, &ezn, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                        nullptr));
+  PetscCall(DMCreateLocalVector(cda, &local_dc));
+  PetscCall(DMCreateLocalVector(cda, &local_denom));
+  PetscCall(DMGlobalToLocalBegin(cda, coarse_dc_sum, INSERT_VALUES, local_dc));
+  PetscCall(DMGlobalToLocalEnd(cda, coarse_dc_sum, INSERT_VALUES, local_dc));
+  PetscCall(DMGlobalToLocalBegin(cda, denom, INSERT_VALUES, local_denom));
+  PetscCall(DMGlobalToLocalEnd(cda, denom, INSERT_VALUES, local_denom));
+  PetscCall(DMDAVecGetArrayRead(cda, local_dc, &dc));
+  PetscCall(DMDAVecGetArrayRead(cda, local_denom, &den));
+  PetscCall(DMDAVecGetArrayRead(fda, mask, &m));
+  PetscCall(VecSet(dc_design, 0.0));
+  PetscCall(DMDAVecGetArray(fda, dc_design, &out));
+  PetscCall(DMDAGetCorners(cda, &xs, &ys, &zs, &xm, &ym, &zm));
+
+  for (PetscInt ez = zs; ez < zs + zm; ++ez) {
+    for (PetscInt ey = ys; ey < ys + ym; ++ey) {
+      for (PetscInt ex = xs; ex < xs + xm; ++ex) {
+        PetscReal coarse_grad = 0.0;
+        for (PetscInt dz = -rr; dz <= rr; ++dz) {
+          const PetscInt kk = ez + dz;
+          if (kk < 0 || kk >= ezn) continue;
+          for (PetscInt dy = -rr; dy <= rr; ++dy) {
+            const PetscInt jj = ey + dy;
+            if (jj < 0 || jj >= eyn) continue;
+            for (PetscInt dx = -rr; dx <= rr; ++dx) {
+              const PetscInt ii = ex + dx;
+              if (ii < 0 || ii >= exn) continue;
+              const PetscReal w = cone_weight(dx, dy, dz, radius);
+              if (w > 0.0) {
+                coarse_grad += w * PetscRealPart(dc[kk][jj][ii]) /
+                               PetscRealPart(den[kk][jj][ii]);
+              }
+            }
+          }
+        }
+        for (PetscInt fz = 0; fz < sub_n; ++fz) {
+          const PetscInt k = ez * sub_n + fz;
+          for (PetscInt fy = 0; fy < sub_n; ++fy) {
+            const PetscInt j = ey * sub_n + fy;
+            for (PetscInt fx = 0; fx < sub_n; ++fx) {
+              const PetscInt i = ex * sub_n + fx;
+              const PetscReal mask_value = PetscRealPart(m[k][j][i]);
+              out[k][j][i] =
+                  (mask_value > 0.5 && mask_value <= 1.5) ? coarse_grad : 0.0;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  PetscCall(DMDAVecRestoreArrayRead(cda, local_dc, &dc));
+  PetscCall(DMDAVecRestoreArrayRead(cda, local_denom, &den));
+  PetscCall(DMDAVecRestoreArrayRead(fda, mask, &m));
+  PetscCall(DMDAVecRestoreArray(fda, dc_design, &out));
+  PetscCall(VecDestroy(&local_dc));
+  PetscCall(VecDestroy(&local_denom));
+  return 0;
+}
+
+PetscErrorCode apply_ems_density_filter(DM fda,
+                                        DM cda,
+                                        Vec rho_design,
+                                        Vec mask,
+                                        Vec fine_denom,
+                                        Vec coarse_active_count,
+                                        Vec coarse_denom,
+                                        Vec coarse_source_sum,
+                                        Vec coarse_filtered,
+                                        const Grid &grid,
+                                        const DensityOptions &density_options,
+                                        const OptimizerOptions &optimizer_options,
+                                        const EmSfemAnnOptions &ems_options,
+                                        PetscReal fine_filter_radius,
+                                        PetscBool use_coarse_filter,
+                                        Vec rho_filtered) {
+  if (use_coarse_filter) {
+    PetscCheck(cda != nullptr && coarse_active_count != nullptr &&
+                   coarse_denom != nullptr && coarse_source_sum != nullptr &&
+                   coarse_filtered != nullptr,
+               PETSC_COMM_WORLD, PETSC_ERR_ARG_NULL,
+               "EMsFEM ANN coarse filter workspace is not initialized");
+    PetscCall(apply_coarse_density_filter(
+        cda, fda, rho_design, mask, coarse_active_count, coarse_denom,
+        coarse_source_sum, coarse_filtered, grid, ems_options.sub_n,
+        optimizer_options.filter_radius, density_options.void_density,
+        rho_filtered));
+  } else {
+    PetscCall(apply_density_filter(fda, rho_design, mask, fine_denom,
+                                   fine_filter_radius,
+                                   density_options.void_density,
+                                   rho_filtered));
+  }
+  return 0;
+}
+
+PetscErrorCode apply_ems_sensitivity_filter_adjoint(
+    DM fda,
+    DM cda,
+    Vec dc_filtered,
+    Vec mask,
+    Vec fine_denom,
+    Vec coarse_denom,
+    Vec coarse_dc_sum,
+    const Grid &grid,
+    const OptimizerOptions &optimizer_options,
+    const EmSfemAnnOptions &ems_options,
+    PetscReal fine_filter_radius,
+    PetscBool use_coarse_filter,
+    Vec dc_design) {
+  if (use_coarse_filter) {
+    PetscCheck(cda != nullptr && coarse_denom != nullptr &&
+                   coarse_dc_sum != nullptr,
+               PETSC_COMM_WORLD, PETSC_ERR_ARG_NULL,
+               "EMsFEM ANN coarse sensitivity filter workspace is not initialized");
+    PetscCall(apply_coarse_sensitivity_filter_adjoint(
+        cda, fda, dc_filtered, mask, coarse_denom, coarse_dc_sum, grid,
+        ems_options.sub_n, optimizer_options.filter_radius, dc_design));
+  } else {
+    PetscCall(apply_sensitivity_filter_adjoint(fda, dc_filtered, mask,
+                                               fine_denom, fine_filter_radius,
+                                               dc_design));
+  }
   return 0;
 }
 
@@ -2589,8 +3111,12 @@ PetscErrorCode ems_block_jacobi_apply(PC pc, Vec x, Vec y) {
 // 创建与 uda 分区对齐的粗单元密度 DMDA cda。
 // cda 的网格尺寸是粗单元数 (nx-1, ny-1, nz-1)，每个单元一个平均密度。
 // 低阶辅助矩阵会用 cda 上的粗密度来近似真实 EMsFEM 刚度。
-PetscErrorCode create_ems_coarse_density_dm(DM uda, const Grid &grid, DM *cda) {
+PetscErrorCode create_ems_coarse_density_dm(DM uda,
+                                            const Grid &grid,
+                                            PetscInt stencil_width,
+                                            DM *cda) {
   PetscInt px = 1, py = 1, pz = 1;
+  const PetscInt stencil = PetscMax(1, stencil_width);
   std::vector<PetscInt> ex_lens, ey_lens, ez_lens;
   std::vector<PetscInt> fx_lens, fy_lens, fz_lens;
   PetscCall(ems_get_aligned_ownership(uda, grid, 1, &px, &py, &pz,
@@ -2599,7 +3125,7 @@ PetscErrorCode create_ems_coarse_density_dm(DM uda, const Grid &grid, DM *cda) {
   PetscCall(DMDACreate3d(PETSC_COMM_WORLD, DM_BOUNDARY_NONE,
                          DM_BOUNDARY_NONE, DM_BOUNDARY_NONE,
                          DMDA_STENCIL_BOX, grid.nx - 1, grid.ny - 1,
-                         grid.nz - 1, px, py, pz, 1, 2,
+                         grid.nz - 1, px, py, pz, 1, stencil,
                          ex_lens.data(), ey_lens.data(), ez_lens.data(), cda));
   PetscCall(DMSetUp(*cda));
   return 0;
@@ -3599,6 +4125,13 @@ PetscErrorCode write_ems_summary(const char *output_prefix,
   PetscCall(PetscViewerASCIIPrintf(viewer, "young_modulus=%.12e\n",
                                    static_cast<double>(density_options.young_modulus)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "filter_radius=%.12e\n", static_cast<double>(opt.filter_radius)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "filter_mode=%s\n",
+                                   ems.filter_mode));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "fine_filter_radius=%.12e\n",
+                                   ems_filter_mode_is_coarse(ems)
+                                       ? 0.0
+                                       : static_cast<double>(
+                                             opt.filter_radius * ems.sub_n)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "move_initial=%.12e\n", static_cast<double>(opt.move)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "move_min=%.12e\n", static_cast<double>(opt.move_min)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "move_shrink=%.12e\n", static_cast<double>(opt.move_shrink)));
@@ -3986,13 +4519,8 @@ PetscErrorCode run_emsfem_ann_postsolve(const Grid &grid,
   write_options.write_checkpoint = PETSC_TRUE;
   PetscCall(get_ems_pc_type_option(ems_pc_type, sizeof(ems_pc_type),
                                    &ems_uses_aux_matrix));
-  const PetscReal fine_filter_radius =
-      optimizer_options.filter_radius *
-      static_cast<PetscReal>(ems_options.sub_n);
-  // K-cache 只需要一层粗单元宽度的细密度 ghost；密度过滤需要覆盖过滤半径。
-  const PetscInt fine_stencil =
-      PetscMax(ems_options.sub_n,
-               static_cast<PetscInt>(PetscCeilReal(fine_filter_radius)));
+  // Postsolve 读取的是已经生成的物理密度，只需要 K-cache 覆盖粗单元内部细胞。
+  const PetscInt fine_stencil = ems_options.sub_n;
 
   PetscCall(PetscTime(&t0));
   PetscCall(create_ems_opt_dms(grid, ems_options.sub_n, fine_stencil,
@@ -4070,7 +4598,7 @@ PetscErrorCode run_emsfem_ann_postsolve(const Grid &grid,
   PetscCall(MatSetOption(A, MAT_SYMMETRIC, PETSC_TRUE));
 
   if (ems_pc_type_uses_coarse_density_aux_matrix(ems_pc_type)) {
-    PetscCall(create_ems_coarse_density_dm(uda, grid, &cda));
+    PetscCall(create_ems_coarse_density_dm(uda, grid, 2, &cda));
     PetscCall(DMCreateGlobalVector(cda, &coarse_rho));
     PetscCall(build_ems_coarse_density(cda, fda, rho_phys, grid,
                                        ems_options.sub_n, coarse_rho));
@@ -4234,6 +4762,11 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   KSP ksp = nullptr;
   DM cda = nullptr;
   Vec coarse_rho = nullptr;
+  Vec coarse_active_count = nullptr;
+  Vec coarse_filter_denom = nullptr;
+  Vec coarse_source_sum = nullptr;
+  Vec coarse_filtered = nullptr;
+  Vec coarse_dc_sum = nullptr;
   EmsBlockJacobiContext *pc_ctx = nullptr;
   PetscViewer hist = nullptr;
   char hist_path[PETSC_MAX_PATH_LEN];
@@ -4256,18 +4789,50 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   PetscBool ems_uses_aux_matrix = PETSC_FALSE;
   PetscCall(PetscTime(&topopt_start));
   PetscCall(PetscTime(&setup_start));
+  PetscCall(validate_ems_filter_mode(ems_options));
   PetscCall(get_ems_pc_type_option(ems_pc_type, sizeof(ems_pc_type),
                                    &ems_uses_aux_matrix));
+  const PetscBool use_coarse_aux_matrix =
+      ems_pc_type_uses_coarse_density_aux_matrix(ems_pc_type);
+  const PetscBool requested_coarse_filter =
+      ems_filter_mode_is_coarse(ems_options);
+  const PetscBool use_coarse_filter =
+      (requested_coarse_filter && optimizer_options.filter_radius > 0.0)
+          ? PETSC_TRUE
+          : PETSC_FALSE;
   const PetscReal fine_filter_radius =
-      optimizer_options.filter_radius *
-      static_cast<PetscReal>(ems_options.sub_n);
+      requested_coarse_filter
+          ? 0.0
+          : optimizer_options.filter_radius *
+                static_cast<PetscReal>(ems_options.sub_n);
   // K-cache 只需要一层粗单元宽度的细密度 ghost；密度过滤需要覆盖过滤半径。
+  // 粗滤波使用单独的粗单元 DMDA，因此细密度 DMDA 不随粗滤波半径膨胀。
   const PetscInt fine_stencil =
       PetscMax(ems_options.sub_n,
                static_cast<PetscInt>(PetscCeilReal(fine_filter_radius)));
+  const PetscInt coarse_filter_stencil =
+      use_coarse_filter
+          ? static_cast<PetscInt>(PetscCeilReal(optimizer_options.filter_radius))
+          : 0;
+  const PetscInt coarse_dm_stencil =
+      PetscMax(use_coarse_aux_matrix ? 2 : 1, coarse_filter_stencil);
 
   PetscCall(create_ems_opt_dms(grid, ems_options.sub_n, fine_stencil,
                                &uda, &fda));
+  if (use_coarse_filter || use_coarse_aux_matrix) {
+    PetscCall(create_ems_coarse_density_dm(uda, grid, coarse_dm_stencil,
+                                           &cda));
+  }
+  if (use_coarse_aux_matrix) {
+    PetscCall(DMCreateGlobalVector(cda, &coarse_rho));
+  }
+  if (use_coarse_filter) {
+    PetscCall(DMCreateGlobalVector(cda, &coarse_active_count));
+    PetscCall(VecDuplicate(coarse_active_count, &coarse_filter_denom));
+    PetscCall(VecDuplicate(coarse_active_count, &coarse_source_sum));
+    PetscCall(VecDuplicate(coarse_active_count, &coarse_filtered));
+    PetscCall(VecDuplicate(coarse_active_count, &coarse_dc_sum));
+  }
   ctx->da = uda;
   ctx->grid = grid;
   ctx->density_options = density_options;
@@ -4307,16 +4872,27 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   PetscCall(VecDuplicate(rho_design, &rho_phys));
   PetscCall(VecDuplicate(rho_design, &rho_last_good));
   PetscCall(VecDuplicate(rho_design, &filter_denom));
+  if (use_coarse_filter) {
+    PetscCall(build_coarse_filter_active_count(cda, fda, mask, grid,
+                                               ems_options.sub_n,
+                                               coarse_active_count));
+    PetscCall(compute_coarse_filter_denominator(
+        cda, coarse_active_count, optimizer_options.filter_radius,
+        coarse_filter_denom));
+  } else {
+    PetscCall(compute_filter_denominator(fda, mask, fine_filter_radius,
+                                         filter_denom));
+  }
   PetscReal current_beta = heaviside_beta_for_iter(optimizer_options, 1);
   {
     PetscLogDouble stage_start = 0.0;
     PetscReal elapsed = 0.0;
     PetscCall(PetscTime(&stage_start));
-    PetscCall(compute_filter_denominator(fda, mask, fine_filter_radius,
-                                         filter_denom));
-    PetscCall(apply_density_filter(fda, rho_design, mask, filter_denom,
-                                   fine_filter_radius,
-                                   density_options.void_density, rho_filtered));
+    PetscCall(apply_ems_density_filter(
+        fda, cda, rho_design, mask, filter_denom, coarse_active_count,
+        coarse_filter_denom, coarse_source_sum, coarse_filtered, grid,
+        density_options, optimizer_options, ems_options, fine_filter_radius,
+        use_coarse_filter, rho_filtered));
     PetscCall(apply_heaviside_projection(fda, rho_filtered, mask,
                                          optimizer_options, current_beta,
                                          density_options.void_density,
@@ -4387,12 +4963,10 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                  reinterpret_cast<void (*)(void)>(emsfem_destroy)));
   PetscCall(MatSetOption(A, MAT_SYMMETRIC, PETSC_TRUE));
 
-  if (ems_pc_type_uses_coarse_density_aux_matrix(ems_pc_type)) {
+  if (use_coarse_aux_matrix) {
     PetscLogDouble stage_start = 0.0;
     PetscReal elapsed = 0.0;
     PetscCall(PetscTime(&stage_start));
-    PetscCall(create_ems_coarse_density_dm(uda, grid, &cda));
-    PetscCall(DMCreateGlobalVector(cda, &coarse_rho));
     PetscCall(build_ems_coarse_density(cda, fda, rho_phys, grid,
                                        ems_options.sub_n, coarse_rho));
     if (ems_pc_type_uses_low_order_aux_matrix(ems_pc_type)) {
@@ -4441,7 +5015,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   PetscCall(PetscViewerASCIIPrintf(hist,
                                    "iter,compliance,volume,raw_design_volume,effective_raw_volfrac,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_residual,effective_move,converged_cases,diverged_cases,accepted,iteration_total_time_s,density_filter_time_s,draft_closure_time_s,ann_cache_time_s,fine_material_sampling_time_s,ann_shape_predict_time_s,ems_matrix_assembly_time_s,preconditioner_setup_time_s,load_assembly_time_s,ksp_solve_time_s,sensitivity_time_s,sensitivity_filter_time_s,mma_oc_update_time_s,checkpoint_write_time_s,fem_total_time_s\n"));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "Optimize mode: emsfem_ann nx=%lld ny=%lld nz=%lld sub_n=%lld fine_density_cells=%lld max_iter=%lld volfrac=%g coarse_filter_radius=%g fine_filter_radius=%g draft_closure=%d draft_mode=%s draft_axes=%s draft_eta=%g heaviside=%d beta0=%g beta_max=%g beta_interval=%lld fixed_nodes=%lld\n",
+                        "Optimize mode: emsfem_ann nx=%lld ny=%lld nz=%lld sub_n=%lld fine_density_cells=%lld max_iter=%lld volfrac=%g filter_mode=%s coarse_filter_radius=%g fine_filter_radius=%g fine_stencil=%lld coarse_stencil=%lld draft_closure=%d draft_mode=%s draft_axes=%s draft_eta=%g heaviside=%d beta0=%g beta_max=%g beta_interval=%lld fixed_nodes=%lld\n",
                         static_cast<long long>(grid.nx),
                         static_cast<long long>(grid.ny),
                         static_cast<long long>(grid.nz),
@@ -4449,8 +5023,11 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                         static_cast<long long>(fine_cell_count(grid, ems_options.sub_n)),
                         static_cast<long long>(optimizer_options.max_iter),
                         static_cast<double>(optimizer_options.volfrac),
+                        ems_options.filter_mode,
                         static_cast<double>(optimizer_options.filter_radius),
                         static_cast<double>(fine_filter_radius),
+                        static_cast<long long>(fine_stencil),
+                        static_cast<long long>(coarse_dm_stencil),
                         static_cast<int>(optimizer_options.z_draft_closure),
                         ems_options.draft_closure_mode,
                         optimizer_options.draft_axes,
@@ -4488,9 +5065,11 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     {
       PetscLogDouble stage_start = 0.0;
       PetscCall(PetscTime(&stage_start));
-      PetscCall(apply_density_filter(fda, rho_design, mask, filter_denom,
-                                     fine_filter_radius,
-                                     density_options.void_density, rho_filtered));
+      PetscCall(apply_ems_density_filter(
+          fda, cda, rho_design, mask, filter_denom, coarse_active_count,
+          coarse_filter_denom, coarse_source_sum, coarse_filtered, grid,
+          density_options, optimizer_options, ems_options, fine_filter_radius,
+          use_coarse_filter, rho_filtered));
       PetscCall(apply_heaviside_projection(fda, rho_filtered, mask,
                                            optimizer_options, current_beta,
                                            density_options.void_density,
@@ -4525,7 +5104,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     {
       PetscLogDouble stage_start = 0.0;
       PetscCall(PetscTime(&stage_start));
-      if (ems_pc_type_uses_coarse_density_aux_matrix(ems_pc_type)) {
+      if (use_coarse_aux_matrix) {
         PetscCall(build_ems_coarse_density(cda, fda, rho_phys, grid,
                                            ems_options.sub_n, coarse_rho));
       }
@@ -4614,9 +5193,10 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       PetscCall(apply_heaviside_sensitivity(fda, dc_phys, rho_filtered, mask,
                                             optimizer_options, current_beta,
                                             dc_projected));
-      PetscCall(apply_sensitivity_filter_adjoint(fda, dc_projected, mask, filter_denom,
-                                                 fine_filter_radius,
-                                                 dc_design));
+      PetscCall(apply_ems_sensitivity_filter_adjoint(
+          fda, cda, dc_projected, mask, filter_denom, coarse_filter_denom,
+          coarse_dc_sum, grid, optimizer_options, ems_options,
+          fine_filter_radius, use_coarse_filter, dc_design));
       PetscCall(elapsed_max_since(stage_start, &iter_sensitivity_filter_s));
       timings.sensitivity_filter_s += iter_sensitivity_filter_s;
     }
@@ -4690,9 +5270,11 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
         iter % optimizer_options.checkpoint_interval == 0) {
       PetscLogDouble stage_start = 0.0;
       PetscCall(PetscTime(&stage_start));
-      PetscCall(apply_density_filter(fda, rho_design, mask, filter_denom,
-                                     fine_filter_radius,
-                                     density_options.void_density, rho_filtered));
+      PetscCall(apply_ems_density_filter(
+          fda, cda, rho_design, mask, filter_denom, coarse_active_count,
+          coarse_filter_denom, coarse_source_sum, coarse_filtered, grid,
+          density_options, optimizer_options, ems_options, fine_filter_radius,
+          use_coarse_filter, rho_filtered));
       PetscCall(apply_heaviside_projection(fda, rho_filtered, mask,
                                            optimizer_options, current_beta,
                                            density_options.void_density,
@@ -4796,9 +5378,11 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       PetscLogDouble stage_start = 0.0;
       PetscReal elapsed = 0.0;
       PetscCall(PetscTime(&stage_start));
-      PetscCall(apply_density_filter(fda, rho_design, mask, filter_denom,
-                                     fine_filter_radius,
-                                     density_options.void_density, rho_filtered));
+      PetscCall(apply_ems_density_filter(
+          fda, cda, rho_design, mask, filter_denom, coarse_active_count,
+          coarse_filter_denom, coarse_source_sum, coarse_filtered, grid,
+          density_options, optimizer_options, ems_options, fine_filter_radius,
+          use_coarse_filter, rho_filtered));
       PetscCall(apply_heaviside_projection(fda, rho_filtered, mask,
                                            optimizer_options, current_beta,
                                            density_options.void_density,
@@ -4833,7 +5417,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       PetscLogDouble stage_start = 0.0;
       PetscReal elapsed = 0.0;
       PetscCall(PetscTime(&stage_start));
-      if (ems_pc_type_uses_coarse_density_aux_matrix(ems_pc_type)) {
+      if (use_coarse_aux_matrix) {
         PetscCall(build_ems_coarse_density(cda, fda, rho_phys, grid,
                                            ems_options.sub_n, coarse_rho));
       }
@@ -4970,6 +5554,11 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   PetscCall(VecDestroy(&rho_filtered));
   PetscCall(VecDestroy(&rho_design));
   PetscCall(VecDestroy(&mask));
+  PetscCall(VecDestroy(&coarse_dc_sum));
+  PetscCall(VecDestroy(&coarse_filtered));
+  PetscCall(VecDestroy(&coarse_source_sum));
+  PetscCall(VecDestroy(&coarse_filter_denom));
+  PetscCall(VecDestroy(&coarse_active_count));
   PetscCall(VecDestroy(&coarse_rho));
   PetscCall(DMDestroy(&cda));
   PetscCall(DMDestroy(&fda));

@@ -28,6 +28,8 @@ struct EmSfemAnnOptions {
   PetscBool include_spring_load = PETSC_TRUE;
   // 无控制臂边界条件时使用的矩形域 benchmark：cantilever 或 torsion。
   char benchmark_case[32] = "cantilever";
+  // fine 保留旧细单元滤波；coarse 用粗单元中心和粗单元半径滤波。
+  char filter_mode[32] = "fine";
   // legacy_z 保留旧 ANN z-prefix/suffix 闭包；axis 使用共享 H8 有符号轴向闭包。
   char draft_closure_mode[32] = "legacy_z";
 };
