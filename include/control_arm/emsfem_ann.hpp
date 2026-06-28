@@ -28,6 +28,8 @@ struct EmSfemAnnOptions {
   PetscBool include_spring_load = PETSC_TRUE;
   // 无控制臂边界条件时使用的矩形域 benchmark：cantilever 或 torsion。
   char benchmark_case[32] = "cantilever";
+  // legacy_z 保留旧 ANN z-prefix/suffix 闭包；axis 使用共享 H8 有符号轴向闭包。
+  char draft_closure_mode[32] = "legacy_z";
 };
 
 // 创建一次 EMsFEM ANN 线性求解所需的 matrix-free 矩阵、位移向量和载荷向量。

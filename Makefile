@@ -15,7 +15,7 @@ PETSC_LIB_GUESS = -L${PETSC_DIR}/lib -lpetsc
 endif
 
 TARGET = bin/control_arm_cpp
-SRC = src/main.cpp src/geometry.cpp src/density.cpp src/vtk.cpp src/petsc_utils.cpp src/h8_matrix_free.cpp src/density_pipeline.cpp src/low_order_optimizer.cpp src/h8_optimizer.cpp src/ann_model.cpp src/emsfem_ann.cpp
+SRC = src/main.cpp src/geometry.cpp src/density.cpp src/vtk.cpp src/petsc_utils.cpp src/h8_matrix_free.cpp src/density_pipeline.cpp src/low_order_optimizer.cpp src/draft_closure.cpp src/h8_optimizer.cpp src/ann_model.cpp src/emsfem_ann.cpp
 OBJ = $(SRC:.cpp=.o)
 
 CXXSTD ?= c++11

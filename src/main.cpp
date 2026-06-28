@@ -640,6 +640,16 @@ int main(int argc, char **argv) {
                                   ems_options.benchmark_case,
                                   sizeof(ems_options.benchmark_case),
                                   nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr,
+                                  "-ems_ann_draft_closure_mode",
+                                  ems_options.draft_closure_mode,
+                                  sizeof(ems_options.draft_closure_mode),
+                                  nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr,
+                                  "-ems_draft_closure_mode",
+                                  ems_options.draft_closure_mode,
+                                  sizeof(ems_options.draft_closure_mode),
+                                  nullptr));
 
   PetscCall(PetscStrcmp(mode, "geometry", &is_geometry_mode));
   PetscCall(PetscStrcmp(mode, "solve", &is_solve_mode));

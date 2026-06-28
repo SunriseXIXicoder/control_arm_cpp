@@ -1,5 +1,6 @@
 #include "control_arm/emsfem_ann.hpp"
 
+#include "control_arm/draft_closure.hpp"
 #include "control_arm/petsc_utils.hpp"
 #include "control_arm/vtk.hpp"
 
@@ -1587,6 +1588,38 @@ PetscErrorCode apply_z_draft_closure(DM fda,
   PetscCall(VecDestroy(&local_mask));
   PetscCallMPI(MPI_Comm_free(&zcol_comm));
   return 0;
+}
+
+PetscBool ems_draft_mode_equals(const EmSfemAnnOptions &ems_options,
+                                const char *name) {
+  return std::strcmp(ems_options.draft_closure_mode, name) == 0
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscErrorCode apply_ems_draft_closure(DM fda,
+                                       Vec mask,
+                                       const DensityOptions &density_options,
+                                       const OptimizerOptions &optimizer_options,
+                                       const EmSfemAnnOptions &ems_options,
+                                       Vec rho_phys) {
+  if (!optimizer_options.z_draft_closure) return 0;
+  if (ems_draft_mode_equals(ems_options, "none")) return 0;
+  if (ems_draft_mode_equals(ems_options, "legacy_z") ||
+      ems_draft_mode_equals(ems_options, "legacy") ||
+      ems_draft_mode_equals(ems_options, "ann_z")) {
+    PetscCall(apply_z_draft_closure(fda, mask, density_options.void_density,
+                                    rho_phys));
+    return 0;
+  }
+  if (ems_draft_mode_equals(ems_options, "axis") ||
+      ems_draft_mode_equals(ems_options, "h8") ||
+      ems_draft_mode_equals(ems_options, "h8_axis")) {
+    PetscCall(apply_draft_closure(fda, mask, optimizer_options, rho_phys));
+    return 0;
+  }
+  SETERRQ(PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+          "-ems_ann_draft_closure_mode must be legacy_z, axis, or none");
 }
 
 // 根据当前物理密度 rho_phys 重建本 rank 的 EMsFEM 单元刚度缓存。
@@ -3576,6 +3609,14 @@ PetscErrorCode write_ems_summary(const char *output_prefix,
                                    static_cast<int>(opt.stability_guard)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "projected_volume_correction=%d\n",
                                    static_cast<int>(opt.projected_volume_correction)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "draft_closure=%d\n",
+                                   static_cast<int>(opt.z_draft_closure)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "draft_closure_mode=%s\n",
+                                   ems.draft_closure_mode));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "draft_axes=%s\n",
+                                   opt.draft_axes));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "draft_eta=%.12e\n",
+                                   static_cast<double>(opt.z_draft_eta)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "heaviside_projection=%d\n",
                                    static_cast<int>(opt.heaviside_projection)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "heaviside_eta=%.12e\n",
@@ -4287,8 +4328,9 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     PetscLogDouble stage_start = 0.0;
     PetscReal elapsed = 0.0;
     PetscCall(PetscTime(&stage_start));
-    PetscCall(apply_z_draft_closure(fda, mask, density_options.void_density,
-                                    rho_phys));
+    PetscCall(apply_ems_draft_closure(fda, mask, density_options,
+                                      optimizer_options, ems_options,
+                                      rho_phys));
     PetscCall(elapsed_max_since(stage_start, &elapsed));
     timings.draft_closure_s += elapsed;
   }
@@ -4399,7 +4441,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   PetscCall(PetscViewerASCIIPrintf(hist,
                                    "iter,compliance,volume,raw_design_volume,effective_raw_volfrac,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_residual,effective_move,converged_cases,diverged_cases,accepted,iteration_total_time_s,density_filter_time_s,draft_closure_time_s,ann_cache_time_s,fine_material_sampling_time_s,ann_shape_predict_time_s,ems_matrix_assembly_time_s,preconditioner_setup_time_s,load_assembly_time_s,ksp_solve_time_s,sensitivity_time_s,sensitivity_filter_time_s,mma_oc_update_time_s,checkpoint_write_time_s,fem_total_time_s\n"));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "Optimize mode: emsfem_ann nx=%lld ny=%lld nz=%lld sub_n=%lld fine_density_cells=%lld max_iter=%lld volfrac=%g coarse_filter_radius=%g fine_filter_radius=%g heaviside=%d beta0=%g beta_max=%g beta_interval=%lld fixed_nodes=%lld\n",
+                        "Optimize mode: emsfem_ann nx=%lld ny=%lld nz=%lld sub_n=%lld fine_density_cells=%lld max_iter=%lld volfrac=%g coarse_filter_radius=%g fine_filter_radius=%g draft_closure=%d draft_mode=%s draft_axes=%s draft_eta=%g heaviside=%d beta0=%g beta_max=%g beta_interval=%lld fixed_nodes=%lld\n",
                         static_cast<long long>(grid.nx),
                         static_cast<long long>(grid.ny),
                         static_cast<long long>(grid.nz),
@@ -4409,6 +4451,10 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                         static_cast<double>(optimizer_options.volfrac),
                         static_cast<double>(optimizer_options.filter_radius),
                         static_cast<double>(fine_filter_radius),
+                        static_cast<int>(optimizer_options.z_draft_closure),
+                        ems_options.draft_closure_mode,
+                        optimizer_options.draft_axes,
+                        static_cast<double>(optimizer_options.z_draft_eta),
                         static_cast<int>(optimizer_options.heaviside_projection),
                         static_cast<double>(optimizer_options.heaviside_beta_initial),
                         static_cast<double>(optimizer_options.heaviside_beta_max),
@@ -4455,8 +4501,9 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     {
       PetscLogDouble stage_start = 0.0;
       PetscCall(PetscTime(&stage_start));
-      PetscCall(apply_z_draft_closure(fda, mask, density_options.void_density,
-                                      rho_phys));
+      PetscCall(apply_ems_draft_closure(fda, mask, density_options,
+                                        optimizer_options, ems_options,
+                                        rho_phys));
       PetscCall(elapsed_max_since(stage_start, &iter_draft_closure_s));
       timings.draft_closure_s += iter_draft_closure_s;
     }
@@ -4650,8 +4697,9 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                            optimizer_options, current_beta,
                                            density_options.void_density,
                                            rho_phys));
-      PetscCall(apply_z_draft_closure(fda, mask, density_options.void_density,
-                                      rho_phys));
+      PetscCall(apply_ems_draft_closure(fda, mask, density_options,
+                                        optimizer_options, ems_options,
+                                        rho_phys));
       PetscCall(write_ems_checkpoint(optimizer_options, iter, PETSC_FALSE,
                                      rho_design, rho_phys, mask));
       PetscCall(elapsed_max_since(stage_start, &iter_checkpoint_s));
@@ -4762,8 +4810,9 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       PetscLogDouble stage_start = 0.0;
       PetscReal elapsed = 0.0;
       PetscCall(PetscTime(&stage_start));
-      PetscCall(apply_z_draft_closure(fda, mask, density_options.void_density,
-                                      rho_phys));
+      PetscCall(apply_ems_draft_closure(fda, mask, density_options,
+                                        optimizer_options, ems_options,
+                                        rho_phys));
       PetscCall(elapsed_max_since(stage_start, &elapsed));
       timings.draft_closure_s += elapsed;
     }

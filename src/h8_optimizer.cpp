@@ -1,5 +1,6 @@
 #include "control_arm/h8_optimizer.hpp"
 
+#include "control_arm/draft_closure.hpp"
 #include "control_arm/petsc_utils.hpp"
 
 #include <petscdmda.h>
@@ -1140,146 +1141,7 @@ PetscErrorCode apply_h8_heaviside_sensitivity(
   return 0;
 }
 
-char lowercase_ascii(char c) {
-  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
-struct H8DraftDirection {
-  PetscInt axis = 2;
-  PetscInt sign = 0;
-};
-
-const char *h8_draft_axes_error_message() {
-  return "-opt_draft_axes must use +x,-x,+y,-y,+z,-z, "
-         "px,mx,py,my,pz,mz, x, y, z, or none";
-}
-
-PetscBool h8_axis_from_char(char c, PetscInt *axis) {
-  c = lowercase_ascii(c);
-  if (c == 'x') {
-    *axis = 0;
-    return PETSC_TRUE;
-  }
-  if (c == 'y') {
-    *axis = 1;
-    return PETSC_TRUE;
-  }
-  if (c == 'z') {
-    *axis = 2;
-    return PETSC_TRUE;
-  }
-  return PETSC_FALSE;
-}
-
-std::string h8_compact_lower_token(const char *begin, const char *end) {
-  std::string token;
-  for (const char *p = begin; p < end; ++p) {
-    const char c = lowercase_ascii(*p);
-    if (c == '_' || c == '-') continue;
-    token.push_back(c);
-  }
-  return token;
-}
-
-PetscErrorCode parse_h8_draft_axis_token(const char *begin, const char *end,
-                                         std::vector<H8DraftDirection> *dirs) {
-  while (begin < end && (*begin == ' ' || *begin == '\t')) ++begin;
-  while (end > begin && (*(end - 1) == ' ' || *(end - 1) == '\t')) --end;
-  if (begin == end) return 0;
-
-  std::string token;
-  for (const char *p = begin; p < end; ++p) {
-    token.push_back(lowercase_ascii(*p));
-  }
-  if (token == "none") return 0;
-
-  PetscInt axis = -1;
-  PetscInt sign = 0;
-  PetscBool ok = PETSC_FALSE;
-  if (token.size() == 1) {
-    ok = h8_axis_from_char(token[0], &axis);
-  } else if (token.size() == 2 && (token[0] == '+' || token[0] == '-')) {
-    ok = h8_axis_from_char(token[1], &axis);
-    sign = (token[0] == '+') ? 1 : -1;
-  } else if (token.size() == 2 &&
-             (token[0] == 'p' || token[0] == 'm' || token[0] == 'n')) {
-    ok = h8_axis_from_char(token[1], &axis);
-    sign = (token[0] == 'p') ? 1 : -1;
-  } else {
-    const std::string compact = h8_compact_lower_token(begin, end);
-    const std::size_t len = compact.size();
-    if (len >= 4 && compact.compare(0, 3, "pos") == 0) {
-      ok = h8_axis_from_char(compact[len - 1], &axis);
-      sign = 1;
-    } else if (len >= 5 && compact.compare(0, 4, "plus") == 0) {
-      ok = h8_axis_from_char(compact[len - 1], &axis);
-      sign = 1;
-    } else if (len >= 4 && compact.compare(0, 3, "neg") == 0) {
-      ok = h8_axis_from_char(compact[len - 1], &axis);
-      sign = -1;
-    } else if (len >= 6 && compact.compare(0, 5, "minus") == 0) {
-      ok = h8_axis_from_char(compact[len - 1], &axis);
-      sign = -1;
-    }
-  }
-
-  PetscCheck(ok && axis >= 0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-             "%s", h8_draft_axes_error_message());
-  H8DraftDirection parsed;
-  parsed.axis = axis;
-  parsed.sign = sign;
-  dirs->push_back(parsed);
-  return 0;
-}
-
-PetscErrorCode parse_h8_draft_axes(const char *text,
-                                   std::vector<H8DraftDirection> *dirs) {
-  dirs->clear();
-  PetscCheck(text != nullptr && text[0] != '\0', PETSC_COMM_WORLD,
-             PETSC_ERR_ARG_WRONG, "%s", h8_draft_axes_error_message());
-
-  const char *token_begin = text;
-  for (const char *p = text;; ++p) {
-    const char c = *p;
-    if (c == '\0' || c == ',' || c == ';' || c == '/' || c == ' ' ||
-        c == '\t') {
-      PetscCall(parse_h8_draft_axis_token(token_begin, p, dirs));
-      if (c == '\0') break;
-      token_begin = p + 1;
-    }
-  }
-  return 0;
-}
-
-PetscInt h8_draft_axis_length(PetscInt axis, PetscInt ex, PetscInt ey,
-                              PetscInt ez) {
-  if (axis == 0) return ex;
-  if (axis == 1) return ey;
-  return ez;
-}
-
-PetscInt h8_draft_column_count(PetscInt axis, PetscInt ex, PetscInt ey,
-                               PetscInt ez) {
-  if (axis == 0) return ey * ez;
-  if (axis == 1) return ex * ez;
-  return ex * ey;
-}
-
-PetscInt h8_draft_axis_coordinate(PetscInt axis, PetscInt i, PetscInt j,
-                                  PetscInt k) {
-  if (axis == 0) return i;
-  if (axis == 1) return j;
-  return k;
-}
-
-PetscInt h8_draft_column_id(PetscInt axis, PetscInt i, PetscInt j, PetscInt k,
-                            PetscInt ex, PetscInt ey, PetscInt ez) {
-  (void)ez;
-  if (axis == 0) return k * ey + j;
-  if (axis == 1) return k * ex + i;
-  return j * ex + i;
-}
-
+#if 0
 PetscErrorCode apply_axis_draft_closure(DM eda, Vec mask, PetscReal eta,
                                         PetscInt axis, PetscInt sign, Vec rho) {
   PetscScalar ***r = nullptr;
@@ -1413,15 +1275,23 @@ PetscErrorCode apply_h8_draft_closure(DM eda, Vec mask,
   }
   return 0;
 }
+#endif
+
+PetscErrorCode apply_h8_draft_closure(DM eda, Vec mask,
+                                      const OptimizerOptions &options,
+                                      Vec rho) {
+  PetscCall(apply_draft_closure(eda, mask, options, rho));
+  return 0;
+}
 
 PetscErrorCode h8_uses_matlab_z_projection(const OptimizerOptions &options,
                                            PetscBool *use_projection) {
-  std::vector<H8DraftDirection> dirs;
+  std::vector<DraftDirection> dirs;
   *use_projection = PETSC_FALSE;
   if (!options.z_draft_closure) return 0;
   if (!options.matlab_z_projection) return 0;
-  PetscCall(parse_h8_draft_axes(options.draft_axes, &dirs));
-  for (const H8DraftDirection &dir : dirs) {
+  PetscCall(parse_draft_axes(options.draft_axes, &dirs));
+  for (const DraftDirection &dir : dirs) {
     if (dir.axis == 2) {
       *use_projection = PETSC_TRUE;
       return 0;

@@ -93,6 +93,10 @@ OPT_MOVE_MIN="${OPT_MOVE_MIN:-0.004}"
 OPT_MOVE_SHRINK="${OPT_MOVE_SHRINK:-0.5}"
 OPT_MOVE_GROWTH="${OPT_MOVE_GROWTH:-1.05}"
 OPT_MAX_COMPLIANCE_INCREASE="${OPT_MAX_COMPLIANCE_INCREASE:-0.08}"
+OPT_DRAFT_CLOSURE="${OPT_DRAFT_CLOSURE:-true}"
+OPT_DRAFT_AXES="${OPT_DRAFT_AXES:-+z}"
+OPT_DRAFT_ETA="${OPT_DRAFT_ETA:-0.50}"
+EMS_DRAFT_CLOSURE_MODE="${EMS_DRAFT_CLOSURE_MODE:-legacy_z}"
 OPT_HEAVISIDE="${OPT_HEAVISIDE:-true}"
 OPT_HEAVISIDE_ETA="${OPT_HEAVISIDE_ETA:-0.50}"
 OPT_HEAVISIDE_BETA_INITIAL="${OPT_HEAVISIDE_BETA_INITIAL:-1.0}"
@@ -316,6 +320,7 @@ echo "  control_arm_bc=${CONTROL_ARM_BC}"
 echo "  include_spring_load=${INCLUDE_SPRING_LOAD}"
 echo "  volfrac=${VOLFRAC}"
 echo "  ab_triangle_retract=${AB_TRIANGLE_RETRACT}"
+echo "  draft_closure=${OPT_DRAFT_CLOSURE} mode=${EMS_DRAFT_CLOSURE_MODE} axes=${OPT_DRAFT_AXES} eta=${OPT_DRAFT_ETA}"
 echo "  heaviside=${OPT_HEAVISIDE} beta0=${OPT_HEAVISIDE_BETA_INITIAL} beta_max=${OPT_HEAVISIDE_BETA_MAX} beta_interval=${OPT_HEAVISIDE_BETA_INTERVAL}"
 echo "  ems_pc_type=${EMS_PC_TYPE}"
 echo "  gamg_profile=${GAMG_PROFILE}"
@@ -356,6 +361,9 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -opt_max_compliance_increase "${OPT_MAX_COMPLIANCE_INCREASE}" \
   -opt_stability_guard true \
   -opt_filter_radius "${FILTER_RADIUS}" \
+  -opt_draft_closure "${OPT_DRAFT_CLOSURE}" \
+  -opt_draft_axes "${OPT_DRAFT_AXES}" \
+  -opt_draft_eta "${OPT_DRAFT_ETA}" \
   -opt_rho_min "${OPT_RHO_MIN}" \
   -opt_heaviside_projection "${OPT_HEAVISIDE}" \
   -opt_heaviside_eta "${OPT_HEAVISIDE_ETA}" \
@@ -377,6 +385,7 @@ ${LAUNCH_CMD} ./bin/control_arm_cpp \
   -ems_cache_element_matrices "${CACHE_K}" \
   -ems_cache_gib_limit "${CACHE_GIB_LIMIT}" \
   -ems_pc_type "${EMS_PC_TYPE}" \
+  -ems_ann_draft_closure_mode "${EMS_DRAFT_CLOSURE_MODE}" \
   -control_arm_bc "${CONTROL_ARM_BC}" \
   -load_case "${LOAD_CASE}" \
   -include_spring_load "${INCLUDE_SPRING_LOAD}" \

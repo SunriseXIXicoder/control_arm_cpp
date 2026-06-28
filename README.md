@@ -229,6 +229,7 @@ mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator emsfem_ann \
   -nx 121 -ny 41 -nz 31 -ems_sub_n 5 -ems_ann_dir ../input_5 \
   -volfrac 0.30 -opt_max_iter 200 -opt_filter_radius 1.5 \
   -opt_draft_closure true -opt_draft_axes +z -opt_draft_eta 0.5 \
+  -ems_ann_draft_closure_mode axis \
   -opt_write_checkpoint true -opt_checkpoint_interval 50 \
   -ems_pc_type aux_ann_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
   -output_prefix result/layer2_ems_ann_cantilever_zdraft
@@ -273,7 +274,7 @@ These scripts default to `61 x 31 x 31` nodes (`60 x 30 x 30` H8 elements, `1758
 
 For Heaviside continuation, read `heaviside_beta` in the H8 history CSV; a beta stage change is a new projected-density mapping, so interpret compliance curves stage by stage.
 
-For EMsFEM ANN optimization, keep `-opt_draft_axes +z`; this change extends the H8 optimizer to signed x/y/z closure while the EMsFEM ANN optimizer remains a Z-direction draft-closure path.
+For EMsFEM ANN optimization, `-ems_ann_draft_closure_mode legacy_z` keeps the previous ANN z-prefix/suffix closure and remains the default. Set `-ems_ann_draft_closure_mode axis` to use the shared H8 signed x/y/z closure controlled by `-opt_draft_closure`, `-opt_draft_axes`, and `-opt_draft_eta`.
 
 ## Solve Interface
 
@@ -341,7 +342,7 @@ Important optimization options:
 | `-opt_max_compliance_increase` | Stability guard threshold used by guarded optimizers such as EMsFEM ANN; the H8 optimizer no longer rolls back candidates. |
 | `-opt_projected_volume_correction` | Post-projection volume correction. H8 selects the OC lambda from trial designs evaluated after filter, Heaviside projection, and draft closure; EMsFEM ANN still uses raw-volume target correction on its fine-density grid. |
 | `-opt_rho_min` | Lower bound on design density. |
-| `-opt_draft_closure`, `-opt_draft_axes`, `-opt_draft_eta` | Draft closure controls. H8 supports signed and multi-axis lists such as `+x`, `+z,+x`, `+z,-z`, and `+x,+y,+z`; EMsFEM ANN currently uses Z closure. The old `-opt_z_draft_closure`, `-opt_z_draft_eta`, and single-axis `-opt_draft_axis` names remain compatibility aliases. |
+| `-opt_draft_closure`, `-opt_draft_axes`, `-opt_draft_eta` | Draft closure controls. H8 supports signed and multi-axis lists such as `+x`, `+z,+x`, `+z,-z`, and `+x,+y,+z`; EMsFEM ANN uses the same signed-axis closure when `-ems_ann_draft_closure_mode axis`, or the previous ANN Z closure when `legacy_z`. The old `-opt_z_draft_closure`, `-opt_z_draft_eta`, and single-axis `-opt_draft_axis` names remain compatibility aliases. |
 | `-opt_write_checkpoint` | Write PETSc binary density/mask checkpoints. |
 | `-opt_stop_on_ksp_divergence` | Stop or skip unsafe optimization updates when KSP diverges. |
 | `-benchmark_case` | `cantilever` or `torsion` when `-control_arm_mask false`. |
@@ -409,6 +410,7 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | `-benchmark_case` | `cantilever`, `torsion` | Select the no-mask rectangular benchmark load when `-control_arm_bc false`. |
 | `-load_case` | `0`, `1`, `2`, `3`, `4` | Control-arm load case. `0` means the legacy weighted multi-case set 1-3; `4` is a symmetric pure `-Z` load on the A/B rings and spring mount. |
 | `-include_spring_load` | `true|false` | Include spring/bushing load contribution. |
+| `-ems_ann_draft_closure_mode` | `legacy_z`, `axis`, `none` | Select EMsFEM ANN draft closure. `legacy_z` preserves the previous ANN z-prefix/suffix closure; `axis` uses the shared H8 signed-axis closure; `none` skips closure even when `-opt_draft_closure true`. |
 | `-ems_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre`, `aux_ann_gamg`, `aux_ann_hypre` | Select the EMsFEM ANN preconditioner. Production default is `aux_ann_gamg`; HYPRE comparison uses `aux_ann_hypre`. |
 | `-ems_dm_px`, `-ems_dm_py`, `-ems_dm_pz` | positive integers | Manually set the EMsFEM 3D process grid; product must equal MPI ranks. |
 
@@ -501,7 +503,7 @@ sbatch --export=ALL,KEY=value,KEY=value script.sbatch
 | `submit_h8_opt_100m.sbatch` | H8 100M-DOF production optimization. | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `H8_PC_TYPE`, `H8_DM_PX/PY/PZ`, `RUN_LABEL` |
 | `submit_h8_opt_100m_1step.sbatch` | One-step 100M-DOF H8 smoke run. | same as H8 production |
 | `submit_h8_draft_split_z.sbatch` | Small H8 `+z,-z` split-draw verification case. | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `OUTPUT_DIR`, `H8_PC_TYPE`, `PETSC_EXTRA_OPTIONS` |
-| `submit_ems_ann_scale.sbatch` | EMsFEM ANN optimization. | `NELX/NELY/NELZ` or `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
+| `submit_ems_ann_scale.sbatch` | EMsFEM ANN optimization. | `NELX/NELY/NELZ` or `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `EMS_DRAFT_CLOSURE_MODE`, `OPT_DRAFT_AXES`, `OPT_DRAFT_ETA`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
 | `submit_h8_postprocess_100m.sbatch` | Convert H8 checkpoint to downsampled VTK. | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `POST_STRIDE`, `VTK_FILE` |
 | `submit_h8_full_vtk_100m.sbatch` | Write full-resolution H8 `.pvti` and `.vti` pieces. | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `H8_PC_TYPE` |
 | `submit_ems_ann_full_vtk.sbatch` | Convert EMsFEM ANN fine-density checkpoint to full VTK through the Python converter. | `CHECKPOINT_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `EMS_SUB_N` |
@@ -762,6 +764,7 @@ mpirun -np 8 ./bin/control_arm_cpp -mode optimize -operator emsfem_ann \
   -nx 121 -ny 41 -nz 31 -ems_sub_n 5 -ems_ann_dir ../input_5 \
   -volfrac 0.30 -opt_max_iter 200 -opt_filter_radius 1.5 \
   -opt_draft_closure true -opt_draft_axes +z -opt_draft_eta 0.5 \
+  -ems_ann_draft_closure_mode axis \
   -opt_write_checkpoint true -opt_checkpoint_interval 50 \
   -ems_pc_type aux_ann_hypre -ksp_type fgmres -ksp_gmres_restart 200 \
   -output_prefix result/layer2_ems_ann_cantilever_zdraft
@@ -806,7 +809,7 @@ sbatch submit_h8_draft_split_z.sbatch
 
 使用 Heaviside continuation 时，请结合 H8 history CSV 里的 `heaviside_beta` 字段分阶段解读曲线；beta 阶段切换代表投影密度映射发生了变化。
 
-EMsFEM ANN 优化仍保持 `-opt_draft_axes +z`；本次改动扩展的是 H8 优化器的有符号 x/y/z 闭包，EMsFEM ANN 仍是 Z 方向拔模闭包路径。
+EMsFEM ANN 优化默认使用 `-ems_ann_draft_closure_mode legacy_z`，保留原 ANN 的 z-prefix/suffix 闭包。若要切到 H8 同款有符号轴向闭包，设置 `-ems_ann_draft_closure_mode axis`，并继续用 `-opt_draft_closure`、`-opt_draft_axes`、`-opt_draft_eta` 控制方向和阈值。
 
 ## 求解接口
 
@@ -874,7 +877,7 @@ mpirun -np 4 ./bin/control_arm_cpp \
 | `-opt_max_compliance_increase` | EMsFEM ANN 等带保护优化器使用的稳定性阈值；H8 优化器不再回滚候选设计。 |
 | `-opt_projected_volume_correction` | 投影后的体积修正。H8 对 trial 设计执行滤波、Heaviside 投影和拔模闭包后选择 OC lambda；EMsFEM ANN 仍在细密度网格上使用 raw 体积目标修正。 |
 | `-opt_rho_min` | 设计变量密度下界。 |
-| `-opt_draft_closure`, `-opt_draft_axes`, `-opt_draft_eta` | 拔模闭包控制。H8 支持 `+x`、`+z,+x`、`+z,-z`、`+x,+y,+z` 等有符号多轴列表；EMsFEM ANN 当前仍使用 Z 方向闭包。旧的 `-opt_z_draft_closure`、`-opt_z_draft_eta` 和单轴 `-opt_draft_axis` 仍作为兼容别名。 |
+| `-opt_draft_closure`, `-opt_draft_axes`, `-opt_draft_eta` | 拔模闭包控制。H8 支持 `+x`、`+z,+x`、`+z,-z`、`+x,+y,+z` 等有符号多轴列表；EMsFEM ANN 在 `-ems_ann_draft_closure_mode axis` 时使用同一套轴向闭包，在 `legacy_z` 时保留旧 ANN Z 闭包。旧的 `-opt_z_draft_closure`、`-opt_z_draft_eta` 和单轴 `-opt_draft_axis` 仍作为兼容别名。 |
 | `-opt_write_checkpoint` | 写 PETSc 二进制密度/mask checkpoint。 |
 | `-opt_stop_on_ksp_divergence` | KSP 发散时停止或跳过不可靠更新。 |
 | `-benchmark_case` | `-control_arm_mask false` 时选择 `cantilever` 或 `torsion`。 |
@@ -942,6 +945,7 @@ mpirun -np 28 ./bin/control_arm_cpp \
 | `-benchmark_case` | `cantilever`, `torsion` | `-control_arm_bc false` 时选择无 mask 矩形域 benchmark 载荷。 |
 | `-load_case` | `0`, `1`, `2`, `3`, `4` | 控制臂载荷工况。`0` 表示旧的 1-3 加权多工况；`4` 为 A/B 环和弹簧安装处关于模型对称的纯 `-Z` 竖直下压单工况。 |
 | `-include_spring_load` | `true|false` | 是否包含弹簧/衬套区域载荷。 |
+| `-ems_ann_draft_closure_mode` | `legacy_z`, `axis`, `none` | 选择 EMsFEM ANN 拔模闭包。`legacy_z` 保留旧 ANN z-prefix/suffix 闭包；`axis` 使用共享的 H8 有符号轴向闭包；`none` 即使 `-opt_draft_closure true` 也跳过闭包。 |
 | `-ems_pc_type` | `block_jacobi`, `jacobi`, `petsc`, `aux_gamg`, `aux_hypre`, `aux_elastic_gamg`, `aux_elastic_hypre`, `aux_ann_gamg`, `aux_ann_hypre` | 选择 EMsFEM ANN 预条件器。生产默认 `aux_ann_gamg`，HYPRE 对照可用 `aux_ann_hypre`。 |
 | `-ems_dm_px`, `-ems_dm_py`, `-ems_dm_pz` | 正整数 | 手动指定 EMsFEM 三维进程网格，乘积必须等于 MPI 进程数。 |
 
@@ -1034,7 +1038,7 @@ sbatch --export=ALL,KEY=value,KEY=value script.sbatch
 | `submit_h8_opt_100m.sbatch` | H8 约 100M 自由度生产优化。 | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `H8_PC_TYPE`, `H8_DM_PX/PY/PZ`, `RUN_LABEL` |
 | `submit_h8_opt_100m_1step.sbatch` | H8 100M 一步烟雾测试。 | 同 H8 生产脚本 |
 | `submit_h8_draft_split_z.sbatch` | H8 小网格 `+z,-z` split draw 验证算例。 | `NX`, `NY`, `NZ`, `OPT_MAX_ITER`, `OUTPUT_DIR`, `H8_PC_TYPE`, `PETSC_EXTRA_OPTIONS` |
-| `submit_ems_ann_scale.sbatch` | EMsFEM ANN 优化。 | `NELX/NELY/NELZ` 或 `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
+| `submit_ems_ann_scale.sbatch` | EMsFEM ANN 优化。 | `NELX/NELY/NELZ` 或 `NX/NY/NZ`, `EMS_SUB_N`, `ANN_DIR`, `EMS_PC_TYPE`, `EMS_DRAFT_CLOSURE_MODE`, `OPT_DRAFT_AXES`, `OPT_DRAFT_ETA`, `GAMG_PROFILE`, `HYPRE_PROFILE`, `ALLOW_HUGE_EMS` |
 | `submit_h8_postprocess_100m.sbatch` | 将 H8 checkpoint 转为降采样 VTK。 | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `POST_STRIDE`, `VTK_FILE` |
 | `submit_h8_full_vtk_100m.sbatch` | 写 H8 全分辨率 `.pvti` 和 `.vti` 分片。 | `SOURCE_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `H8_PC_TYPE` |
 | `submit_ems_ann_full_vtk.sbatch` | 通过 Python 转换器将 EMsFEM ANN 细密度 checkpoint 转为全量 VTK。 | `CHECKPOINT_PREFIX`, `DENSITY_FILE`, `MASK_FILE`, `VTK_FILE`, `EMS_SUB_N` |
