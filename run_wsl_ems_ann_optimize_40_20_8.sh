@@ -19,6 +19,7 @@ ANN_DIR="${ANN_DIR:-../input_${EMS_SUB_N}}"
 # 0 means the previous three control-arm load cases with AHP weights.
 LOAD_CASE="${LOAD_CASE:-0}"
 FILTER_RADIUS="${FILTER_RADIUS:-1.5}"
+EMS_UPDATE_METHOD="${EMS_UPDATE_METHOD:-oc}"
 AB_TRIANGLE_RETRACT="${AB_TRIANGLE_RETRACT:-0.22}"
 YOUNG_MODULUS="${YOUNG_MODULUS:-2.1e11}"
 OPT_MOVE="${OPT_MOVE:-0.025}"
@@ -89,6 +90,7 @@ mpirun -np "${NP}" ./bin/control_arm_cpp \
   -output_prefix "${PREFIX}" \
   -ems_ann_dir "${ANN_DIR}" \
   -ems_sub_n "${EMS_SUB_N}" \
+  -ems_ann_update_method "${EMS_UPDATE_METHOD}" \
   -ems_cache_element_matrices true \
   -ems_cache_gib_limit 2 \
   -control_arm_bc true \

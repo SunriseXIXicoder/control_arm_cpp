@@ -85,6 +85,17 @@ struct EmsCacheTiming {
   PetscReal matrix_assembly_s = 0.0;
 };
 
+// ANN 的 MMA 状态与细密度 DMDA 对齐，避免把全部设计变量收集到单个 rank。
+struct EmsAnnMMAState {
+  PetscBool initialized = PETSC_FALSE;
+  PetscInt n_updates = 0;
+  PetscReal c_scale = 0.0;
+  Vec xold1 = nullptr;
+  Vec xold2 = nullptr;
+  Vec low = nullptr;
+  Vec upp = nullptr;
+};
+
 // 计算从 start 到当前时刻的并行最大耗时。
 // 每个 rank 先计算自己的本地耗时，然后用 MPI_MAX 取所有 rank 中最慢的那个。
 // 并行程序的实际等待时间由最慢 rank 决定，所以日志里一般记录这个最大值。
@@ -743,6 +754,35 @@ PetscErrorCode validate_ems_filter_mode(const EmSfemAnnOptions &ems_options) {
                  ems_filter_mode_is_coarse(ems_options),
              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
              "-ems_ann_filter_mode must be fine or coarse");
+  return 0;
+}
+
+PetscBool ems_update_method_equals(const EmSfemAnnOptions &ems_options,
+                                   const char *name) {
+  return std::strcmp(ems_options.update_method, name) == 0 ? PETSC_TRUE
+                                                           : PETSC_FALSE;
+}
+
+PetscBool ems_update_method_is_oc(const EmSfemAnnOptions &ems_options) {
+  return (ems_update_method_equals(ems_options, "oc") ||
+          ems_update_method_equals(ems_options, "OC"))
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscBool ems_update_method_is_mma(const EmSfemAnnOptions &ems_options) {
+  return (ems_update_method_equals(ems_options, "mma") ||
+          ems_update_method_equals(ems_options, "MMA"))
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscErrorCode validate_ems_update_method(
+    const EmSfemAnnOptions &ems_options) {
+  PetscCheck(ems_update_method_is_oc(ems_options) ||
+                 ems_update_method_is_mma(ems_options),
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "-ems_ann_update_method must be oc or mma");
   return 0;
 }
 
@@ -3997,6 +4037,389 @@ PetscErrorCode oc_update(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
   return 0;
 }
 
+PetscReal ems_ann_clamp(PetscReal value, PetscReal lower, PetscReal upper) {
+  return PetscMax(lower, PetscMin(upper, value));
+}
+
+PetscBool ems_ann_mma_is_active(PetscReal mask_value, PetscReal dv_value) {
+  return (mask_value > 0.5 && mask_value <= 1.5 && dv_value > 0.0)
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+void ems_ann_mma_bounds(PetscReal x, PetscReal low, PetscReal upp,
+                        const OptimizerOptions &opt, PetscReal *alpha,
+                        PetscReal *beta) {
+  const PetscReal xmin = PetscMax(opt.rho_min, x - opt.move);
+  const PetscReal xmax = PetscMin(1.0, x + opt.move);
+  *alpha = PetscMax(xmin, 0.9 * low + 0.1 * x);
+  *beta = PetscMin(xmax, 0.9 * upp + 0.1 * x);
+  if (*alpha > *beta) {
+    const PetscReal mid = ems_ann_clamp(x, xmin, xmax);
+    *alpha = mid;
+    *beta = mid;
+  }
+}
+
+void ems_ann_mma_coefficients(PetscReal x, PetscReal df0dx, PetscReal dgdx,
+                              PetscReal low, PetscReal upp, PetscReal *p0,
+                              PetscReal *q0, PetscReal *pij,
+                              PetscReal *qij) {
+  const PetscReal ux = PetscMax(1.0e-30, upp - x);
+  const PetscReal xl = PetscMax(1.0e-30, x - low);
+  const PetscReal inv_width = 1.0 / PetscMax(1.0e-30, upp - low);
+  const PetscReal dfdxp = PetscMax(0.0, df0dx);
+  const PetscReal dfdxm = PetscMax(0.0, -df0dx);
+  const PetscReal dgdxp = PetscMax(0.0, dgdx);
+  const PetscReal dgdxm = PetscMax(0.0, -dgdx);
+  *p0 = ux * ux *
+        (dfdxp + 0.001 * PetscAbsReal(df0dx) + 1.0e-6 * inv_width);
+  *q0 = xl * xl *
+        (dfdxm + 0.001 * PetscAbsReal(df0dx) + 1.0e-6 * inv_width);
+  *pij = ux * ux *
+         (dgdxp + 0.001 * PetscAbsReal(dgdx) + 1.0e-6 * inv_width);
+  *qij = xl * xl *
+         (dgdxm + 0.001 * PetscAbsReal(dgdx) + 1.0e-6 * inv_width);
+}
+
+PetscReal ems_ann_mma_candidate(PetscReal x, PetscReal df0dx,
+                                PetscReal dgdx, PetscReal low, PetscReal upp,
+                                PetscReal alpha, PetscReal beta,
+                                PetscReal lambda) {
+  PetscReal p0 = 0.0, q0 = 0.0, pij = 0.0, qij = 0.0;
+  ems_ann_mma_coefficients(x, df0dx, dgdx, low, upp, &p0, &q0, &pij, &qij);
+  const PetscReal pjlam = PetscMax(0.0, p0 + lambda * pij);
+  const PetscReal qjlam = PetscMax(0.0, q0 + lambda * qij);
+  const PetscReal sp = PetscSqrtReal(pjlam);
+  const PetscReal sq = PetscSqrtReal(qjlam);
+  const PetscReal denom = sp + sq;
+  const PetscReal value =
+      denom > 0.0 ? (sp * low + sq * upp) / denom : 0.5 * (alpha + beta);
+  return ems_ann_clamp(value, alpha, beta);
+}
+
+PetscErrorCode ensure_ems_ann_mma_state(Vec rho, EmsAnnMMAState *state) {
+  if (state->initialized) return 0;
+  PetscCall(VecDuplicate(rho, &state->xold1));
+  PetscCall(VecDuplicate(rho, &state->xold2));
+  PetscCall(VecDuplicate(rho, &state->low));
+  PetscCall(VecDuplicate(rho, &state->upp));
+  PetscCall(VecCopy(rho, state->xold1));
+  PetscCall(VecCopy(rho, state->xold2));
+  PetscCall(VecCopy(rho, state->low));
+  PetscCall(VecCopy(rho, state->upp));
+  state->initialized = PETSC_TRUE;
+  state->n_updates = 0;
+  return 0;
+}
+
+PetscErrorCode destroy_ems_ann_mma_state(EmsAnnMMAState *state) {
+  PetscCall(VecDestroy(&state->upp));
+  PetscCall(VecDestroy(&state->low));
+  PetscCall(VecDestroy(&state->xold2));
+  PetscCall(VecDestroy(&state->xold1));
+  state->initialized = PETSC_FALSE;
+  state->n_updates = 0;
+  state->c_scale = 0.0;
+  return 0;
+}
+
+PetscErrorCode update_ems_ann_mma_asymptotes(
+    DM eda, Vec rho, Vec mask, Vec dv, const OptimizerOptions &opt,
+    EmsAnnMMAState *state) {
+  PetscScalar ***r = nullptr, ***m = nullptr, ***v = nullptr;
+  PetscScalar ***x1 = nullptr, ***x2 = nullptr, ***lo = nullptr, ***up = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscCall(DMDAVecGetArrayRead(eda, rho, &r));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecGetArrayRead(eda, dv, &v));
+  PetscCall(DMDAVecGetArrayRead(eda, state->xold1, &x1));
+  PetscCall(DMDAVecGetArrayRead(eda, state->xold2, &x2));
+  PetscCall(DMDAVecGetArray(eda, state->low, &lo));
+  PetscCall(DMDAVecGetArray(eda, state->upp, &up));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscReal x = PetscRealPart(r[k][j][i]);
+        if (!ems_ann_mma_is_active(PetscRealPart(m[k][j][i]),
+                                   PetscRealPart(v[k][j][i]))) {
+          lo[k][j][i] = x - 0.5;
+          up[k][j][i] = x + 0.5;
+          continue;
+        }
+        const PetscReal xmin = PetscMax(opt.rho_min, x - opt.move);
+        const PetscReal xmax = PetscMin(1.0, x + opt.move);
+        const PetscReal width = PetscMax(1.0e-5, xmax - xmin);
+        if (state->n_updates < 2) {
+          lo[k][j][i] = x - 0.5 * width;
+          up[k][j][i] = x + 0.5 * width;
+        } else {
+          PetscReal gamma = 1.0;
+          const PetscReal help =
+              (x - PetscRealPart(x1[k][j][i])) *
+              (PetscRealPart(x1[k][j][i]) - PetscRealPart(x2[k][j][i]));
+          if (help < 0.0) gamma = 0.7;
+          else if (help > 0.0) gamma = 1.2;
+          lo[k][j][i] =
+              x - gamma * (PetscRealPart(x1[k][j][i]) -
+                           PetscRealPart(lo[k][j][i]));
+          up[k][j][i] =
+              x + gamma * (PetscRealPart(up[k][j][i]) -
+                           PetscRealPart(x1[k][j][i]));
+          lo[k][j][i] = PetscMax(PetscRealPart(lo[k][j][i]), x - 10.0 * width);
+          lo[k][j][i] = PetscMin(PetscRealPart(lo[k][j][i]), x - 0.01 * width);
+          up[k][j][i] = PetscMax(PetscRealPart(up[k][j][i]), x + 0.01 * width);
+          up[k][j][i] = PetscMin(PetscRealPart(up[k][j][i]), x + 10.0 * width);
+        }
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayRead(eda, rho, &r));
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecRestoreArrayRead(eda, dv, &v));
+  PetscCall(DMDAVecRestoreArrayRead(eda, state->xold1, &x1));
+  PetscCall(DMDAVecRestoreArrayRead(eda, state->xold2, &x2));
+  PetscCall(DMDAVecRestoreArray(eda, state->low, &lo));
+  PetscCall(DMDAVecRestoreArray(eda, state->upp, &up));
+  return 0;
+}
+
+PetscErrorCode prepare_ems_ann_mma_constraint(
+    DM eda, Vec rho, Vec mask, Vec dc, Vec dv, const OptimizerOptions &opt,
+    const EmsAnnMMAState &state, PetscReal *target_sum, PetscReal *raw_sum,
+    PetscReal *rhs_b) {
+  PetscScalar ***r = nullptr, ***m = nullptr, ***d = nullptr, ***v = nullptr;
+  PetscScalar ***lo = nullptr, ***up = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscReal local_values[3] = {0.0, 0.0, 0.0};
+  PetscReal global_values[3] = {0.0, 0.0, 0.0};
+  PetscCall(DMDAVecGetArrayRead(eda, rho, &r));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecGetArrayRead(eda, dc, &d));
+  PetscCall(DMDAVecGetArrayRead(eda, dv, &v));
+  PetscCall(DMDAVecGetArrayRead(eda, state.low, &lo));
+  PetscCall(DMDAVecGetArrayRead(eda, state.upp, &up));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscReal dv_value = PetscRealPart(v[k][j][i]);
+        if (!ems_ann_mma_is_active(PetscRealPart(m[k][j][i]), dv_value)) {
+          continue;
+        }
+        const PetscReal x = PetscRealPart(r[k][j][i]);
+        local_values[0] += dv_value;
+        local_values[1] += dv_value * x;
+      }
+    }
+  }
+  PetscCallMPI(MPI_Allreduce(local_values, global_values, 2, MPIU_REAL,
+                             MPI_SUM, PETSC_COMM_WORLD));
+  *target_sum = opt.volfrac * global_values[0];
+  *raw_sum = global_values[1];
+  PetscCheck(*target_sum > 0.0, PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "EMsFEM ANN MMA needs at least one active design cell and a positive volume target");
+
+  local_values[2] = 0.0;
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscReal dv_value = PetscRealPart(v[k][j][i]);
+        if (!ems_ann_mma_is_active(PetscRealPart(m[k][j][i]), dv_value)) {
+          continue;
+        }
+        const PetscReal x = PetscRealPart(r[k][j][i]);
+        const PetscReal df0dx = state.c_scale * PetscRealPart(d[k][j][i]);
+        const PetscReal dgdx = dv_value / *target_sum;
+        PetscReal p0 = 0.0, q0 = 0.0, pij = 0.0, qij = 0.0;
+        ems_ann_mma_coefficients(x, df0dx, dgdx,
+                                 PetscRealPart(lo[k][j][i]),
+                                 PetscRealPart(up[k][j][i]),
+                                 &p0, &q0, &pij, &qij);
+        const PetscReal ux =
+            PetscMax(1.0e-30, PetscRealPart(up[k][j][i]) - x);
+        const PetscReal xl =
+            PetscMax(1.0e-30, x - PetscRealPart(lo[k][j][i]));
+        local_values[2] += pij / ux + qij / xl;
+      }
+    }
+  }
+  PetscCallMPI(MPI_Allreduce(&local_values[2], &global_values[2], 1,
+                             MPIU_REAL, MPI_SUM, PETSC_COMM_WORLD));
+  const PetscReal g = *raw_sum / *target_sum - 1.0;
+  *rhs_b = -g + global_values[2];
+  PetscCall(DMDAVecRestoreArrayRead(eda, rho, &r));
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecRestoreArrayRead(eda, dc, &d));
+  PetscCall(DMDAVecRestoreArrayRead(eda, dv, &v));
+  PetscCall(DMDAVecRestoreArrayRead(eda, state.low, &lo));
+  PetscCall(DMDAVecRestoreArrayRead(eda, state.upp, &up));
+  return 0;
+}
+
+PetscErrorCode ems_ann_mma_constraint_value(
+    DM eda, Vec rho, Vec mask, Vec dc, Vec dv, const OptimizerOptions &opt,
+    const EmsAnnMMAState &state, PetscReal target_sum, PetscReal rhs_b,
+    PetscReal lambda, PetscReal *constraint_value) {
+  PetscScalar ***r = nullptr, ***m = nullptr, ***d = nullptr, ***v = nullptr;
+  PetscScalar ***lo = nullptr, ***up = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscReal local_sum = 0.0, global_sum = 0.0;
+  PetscCall(DMDAVecGetArrayRead(eda, rho, &r));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecGetArrayRead(eda, dc, &d));
+  PetscCall(DMDAVecGetArrayRead(eda, dv, &v));
+  PetscCall(DMDAVecGetArrayRead(eda, state.low, &lo));
+  PetscCall(DMDAVecGetArrayRead(eda, state.upp, &up));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscReal dv_value = PetscRealPart(v[k][j][i]);
+        if (!ems_ann_mma_is_active(PetscRealPart(m[k][j][i]), dv_value)) {
+          continue;
+        }
+        const PetscReal x = PetscRealPart(r[k][j][i]);
+        const PetscReal low = PetscRealPart(lo[k][j][i]);
+        const PetscReal upp = PetscRealPart(up[k][j][i]);
+        const PetscReal df0dx = state.c_scale * PetscRealPart(d[k][j][i]);
+        const PetscReal dgdx = dv_value / target_sum;
+        PetscReal alpha = 0.0, beta = 0.0;
+        PetscReal p0 = 0.0, q0 = 0.0, pij = 0.0, qij = 0.0;
+        ems_ann_mma_bounds(x, low, upp, opt, &alpha, &beta);
+        const PetscReal xmma =
+            ems_ann_mma_candidate(x, df0dx, dgdx, low, upp, alpha, beta,
+                                  lambda);
+        ems_ann_mma_coefficients(x, df0dx, dgdx, low, upp,
+                                 &p0, &q0, &pij, &qij);
+        local_sum += pij / PetscMax(1.0e-30, upp - xmma) +
+                     qij / PetscMax(1.0e-30, xmma - low);
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArrayRead(eda, rho, &r));
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecRestoreArrayRead(eda, dc, &d));
+  PetscCall(DMDAVecRestoreArrayRead(eda, dv, &v));
+  PetscCall(DMDAVecRestoreArrayRead(eda, state.low, &lo));
+  PetscCall(DMDAVecRestoreArrayRead(eda, state.upp, &up));
+  PetscCallMPI(MPI_Allreduce(&local_sum, &global_sum, 1, MPIU_REAL, MPI_SUM,
+                             PETSC_COMM_WORLD));
+  *constraint_value = global_sum - rhs_b;
+  return 0;
+}
+
+PetscErrorCode write_ems_ann_mma_candidate(
+    DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
+    const DensityOptions &density_options, const OptimizerOptions &opt,
+    EmsAnnMMAState *state, PetscReal target_sum, PetscReal lambda,
+    PetscReal *max_change) {
+  PetscScalar ***r = nullptr, ***m = nullptr, ***d = nullptr, ***v = nullptr;
+  PetscScalar ***lo = nullptr, ***up = nullptr;
+  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
+  PetscReal local_change = 0.0, global_change = 0.0;
+
+  PetscCall(VecCopy(state->xold1, state->xold2));
+  PetscCall(VecCopy(rho, state->xold1));
+  ++state->n_updates;
+
+  PetscCall(DMDAVecGetArray(eda, rho, &r));
+  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecGetArrayRead(eda, dc, &d));
+  PetscCall(DMDAVecGetArrayRead(eda, dv, &v));
+  PetscCall(DMDAVecGetArrayRead(eda, state->low, &lo));
+  PetscCall(DMDAVecGetArrayRead(eda, state->upp, &up));
+  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
+  for (PetscInt k = zs; k < zs + zm; ++k) {
+    for (PetscInt j = ys; j < ys + ym; ++j) {
+      for (PetscInt i = xs; i < xs + xm; ++i) {
+        const PetscReal old_value = PetscRealPart(r[k][j][i]);
+        const PetscReal mask_value = PetscRealPart(m[k][j][i]);
+        const PetscReal dv_value = PetscRealPart(v[k][j][i]);
+        PetscReal new_value = density_options.void_density;
+        if (mask_value > 1.5) {
+          new_value = 1.0;
+        } else if (ems_ann_mma_is_active(mask_value, dv_value)) {
+          const PetscReal low = PetscRealPart(lo[k][j][i]);
+          const PetscReal upp = PetscRealPart(up[k][j][i]);
+          const PetscReal df0dx = state->c_scale * PetscRealPart(d[k][j][i]);
+          const PetscReal dgdx = dv_value / target_sum;
+          PetscReal alpha = 0.0, beta = 0.0;
+          ems_ann_mma_bounds(old_value, low, upp, opt, &alpha, &beta);
+          new_value = ems_ann_mma_candidate(old_value, df0dx, dgdx, low, upp,
+                                            alpha, beta, lambda);
+        }
+        r[k][j][i] = new_value;
+        local_change =
+            PetscMax(local_change, PetscAbsReal(new_value - old_value));
+      }
+    }
+  }
+  PetscCall(DMDAVecRestoreArray(eda, rho, &r));
+  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
+  PetscCall(DMDAVecRestoreArrayRead(eda, dc, &d));
+  PetscCall(DMDAVecRestoreArrayRead(eda, dv, &v));
+  PetscCall(DMDAVecRestoreArrayRead(eda, state->low, &lo));
+  PetscCall(DMDAVecRestoreArrayRead(eda, state->upp, &up));
+  PetscCallMPI(MPI_Allreduce(&local_change, &global_change, 1, MPIU_REAL,
+                             MPI_MAX, PETSC_COMM_WORLD));
+  *max_change = global_change;
+  return 0;
+}
+
+// 执行一次 ANN MMA 更新；体积约束是一条全局约束，双变量 lambda 用全局规约二分求解。
+PetscErrorCode mma_update(DM eda, Vec rho, Vec mask, Vec dc, Vec dv,
+                          const DensityOptions &density_options,
+                          const OptimizerOptions &opt,
+                          PetscReal compliance,
+                          EmsAnnMMAState *state,
+                          PetscReal *max_change) {
+  PetscReal target_sum = 0.0, raw_sum = 0.0, rhs_b = 0.0;
+  PetscReal lambda = 0.0;
+  PetscCall(ensure_ems_ann_mma_state(rho, state));
+  if (state->c_scale <= 0.0) {
+    state->c_scale =
+        compliance != 0.0 ? 1.0 / PetscAbsReal(compliance) : 1.0;
+  }
+  PetscCall(update_ems_ann_mma_asymptotes(eda, rho, mask, dv, opt, state));
+  PetscCall(prepare_ems_ann_mma_constraint(eda, rho, mask, dc, dv, opt,
+                                           *state, &target_sum, &raw_sum,
+                                           &rhs_b));
+
+  PetscReal g0 = 0.0;
+  PetscCall(ems_ann_mma_constraint_value(eda, rho, mask, dc, dv, opt, *state,
+                                         target_sum, rhs_b, 0.0, &g0));
+  if (g0 > 0.0) {
+    PetscReal lo_lam = 0.0;
+    PetscReal hi_lam = 1.0;
+    PetscReal ghi = 0.0;
+    for (PetscInt grow = 0; grow < 80; ++grow) {
+      PetscCall(ems_ann_mma_constraint_value(eda, rho, mask, dc, dv, opt,
+                                             *state, target_sum, rhs_b,
+                                             hi_lam, &ghi));
+      if (ghi <= 0.0 || hi_lam >= 1.0e30) break;
+      hi_lam *= 10.0;
+    }
+    for (PetscInt it = 0; it < 80; ++it) {
+      const PetscReal mid = 0.5 * (lo_lam + hi_lam);
+      PetscReal gmid = 0.0;
+      PetscCall(ems_ann_mma_constraint_value(eda, rho, mask, dc, dv, opt,
+                                             *state, target_sum, rhs_b, mid,
+                                             &gmid));
+      if (gmid > 0.0) lo_lam = mid;
+      else hi_lam = mid;
+    }
+    lambda = 0.5 * (lo_lam + hi_lam);
+  }
+
+  PetscCall(write_ems_ann_mma_candidate(eda, rho, mask, dc, dv,
+                                        density_options, opt, state,
+                                        target_sum, lambda, max_change));
+  (void)raw_sum;
+  return 0;
+}
+
 // 将 PETSc Vec 以二进制 PETSc viewer 格式写到 path。
 // 这种 .petscbin 文件可用于 checkpoint、后处理脚本读取和本地 VTK 转换。
 // 写出是并行 collective 操作，所有 rank 都要参与。
@@ -4127,6 +4550,8 @@ PetscErrorCode write_ems_summary(const char *output_prefix,
   PetscCall(PetscViewerASCIIPrintf(viewer, "filter_radius=%.12e\n", static_cast<double>(opt.filter_radius)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "filter_mode=%s\n",
                                    ems.filter_mode));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "update_method=%s\n",
+                                   ems.update_method));
   PetscCall(PetscViewerASCIIPrintf(viewer, "fine_filter_radius=%.12e\n",
                                    ems_filter_mode_is_coarse(ems)
                                        ? 0.0
@@ -4181,7 +4606,7 @@ PetscErrorCode write_ems_summary(const char *output_prefix,
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_ksp_solve_s=%.12e\n", static_cast<double>(timing.ksp_solve_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_sensitivity_s=%.12e\n", static_cast<double>(timing.sensitivity_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_sensitivity_filter_s=%.12e\n", static_cast<double>(timing.sensitivity_filter_s)));
-  PetscCall(PetscViewerASCIIPrintf(viewer, "timing_mma_oc_update_s=%.12e\n", static_cast<double>(timing.optimizer_update_s)));
+  PetscCall(PetscViewerASCIIPrintf(viewer, "timing_optimizer_update_s=%.12e\n", static_cast<double>(timing.optimizer_update_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_checkpoint_write_s=%.12e\n", static_cast<double>(timing.checkpoint_write_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_iteration_total_s=%.12e\n", static_cast<double>(timing.iteration_total_s)));
   PetscCall(PetscViewerASCIIPrintf(viewer, "timing_final_eval_s=%.12e\n", static_cast<double>(timing.final_eval_s)));
@@ -4783,6 +5208,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   PetscInt local_fixed = 0, global_fixed = 0;
   EmSfemAnnContext *ctx = new EmSfemAnnContext();
   TimingTotals timings;
+  EmsAnnMMAState mma_state;
   PetscLogDouble topopt_start = 0.0;
   PetscLogDouble setup_start = 0.0;
   char ems_pc_type[64] = "aux_ann_gamg";
@@ -4790,8 +5216,11 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   PetscCall(PetscTime(&topopt_start));
   PetscCall(PetscTime(&setup_start));
   PetscCall(validate_ems_filter_mode(ems_options));
+  PetscCall(validate_ems_update_method(ems_options));
   PetscCall(get_ems_pc_type_option(ems_pc_type, sizeof(ems_pc_type),
                                    &ems_uses_aux_matrix));
+  const PetscBool use_mma_update = ems_update_method_is_mma(ems_options);
+  const char *update_method = use_mma_update ? "mma" : "oc";
   const PetscBool use_coarse_aux_matrix =
       ems_pc_type_uses_coarse_density_aux_matrix(ems_pc_type);
   const PetscBool requested_coarse_filter =
@@ -5013,9 +5442,9 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                           output_prefix));
   PetscCall(PetscViewerASCIIOpen(PETSC_COMM_WORLD, hist_path, &hist));
   PetscCall(PetscViewerASCIIPrintf(hist,
-                                   "iter,compliance,volume,raw_design_volume,effective_raw_volfrac,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_residual,effective_move,converged_cases,diverged_cases,accepted,iteration_total_time_s,density_filter_time_s,draft_closure_time_s,ann_cache_time_s,fine_material_sampling_time_s,ann_shape_predict_time_s,ems_matrix_assembly_time_s,preconditioner_setup_time_s,load_assembly_time_s,ksp_solve_time_s,sensitivity_time_s,sensitivity_filter_time_s,mma_oc_update_time_s,checkpoint_write_time_s,fem_total_time_s\n"));
+                                   "iter,compliance,volume,raw_design_volume,effective_raw_volfrac,projected_volume_gap,heaviside_beta,change,ksp_iterations,ksp_residual,effective_move,converged_cases,diverged_cases,accepted,update_method,iteration_total_time_s,density_filter_time_s,draft_closure_time_s,ann_cache_time_s,fine_material_sampling_time_s,ann_shape_predict_time_s,ems_matrix_assembly_time_s,preconditioner_setup_time_s,load_assembly_time_s,ksp_solve_time_s,sensitivity_time_s,sensitivity_filter_time_s,optimizer_update_time_s,checkpoint_write_time_s,fem_total_time_s\n"));
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                        "Optimize mode: emsfem_ann nx=%lld ny=%lld nz=%lld sub_n=%lld fine_density_cells=%lld max_iter=%lld volfrac=%g filter_mode=%s coarse_filter_radius=%g fine_filter_radius=%g fine_stencil=%lld coarse_stencil=%lld draft_closure=%d draft_mode=%s draft_axes=%s draft_eta=%g heaviside=%d beta0=%g beta_max=%g beta_interval=%lld fixed_nodes=%lld\n",
+                        "Optimize mode: emsfem_ann nx=%lld ny=%lld nz=%lld sub_n=%lld fine_density_cells=%lld max_iter=%lld volfrac=%g update_method=%s filter_mode=%s coarse_filter_radius=%g fine_filter_radius=%g fine_stencil=%lld coarse_stencil=%lld draft_closure=%d draft_mode=%s draft_axes=%s draft_eta=%g heaviside=%d beta0=%g beta_max=%g beta_interval=%lld fixed_nodes=%lld\n",
                         static_cast<long long>(grid.nx),
                         static_cast<long long>(grid.ny),
                         static_cast<long long>(grid.nz),
@@ -5023,6 +5452,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                         static_cast<long long>(fine_cell_count(grid, ems_options.sub_n)),
                         static_cast<long long>(optimizer_options.max_iter),
                         static_cast<double>(optimizer_options.volfrac),
+                        update_method,
                         ems_options.filter_mode,
                         static_cast<double>(optimizer_options.filter_radius),
                         static_cast<double>(fine_filter_radius),
@@ -5239,14 +5669,21 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                               current_move * optimizer_options.move_shrink);
       step_options.move = current_move;
       PetscCall(VecCopy(rho_last_good, rho_design));
-      PetscCall(oc_update(fda, rho_design, mask, dc_last_good, dv_design,
-                          density_options, step_options, &change));
+      if (use_mma_update) {
+        PetscCall(mma_update(fda, rho_design, mask, dc_last_good, dv_design,
+                             density_options, step_options,
+                             accepted_compliance, &mma_state, &change));
+      } else {
+        PetscCall(oc_update(fda, rho_design, mask, dc_last_good, dv_design,
+                            density_options, step_options, &change));
+      }
       PetscCall(PetscPrintf(
           PETSC_COMM_WORLD,
-          "it=%lld rejected candidate: diverged_cases=%lld compliance_spike=%d; restored previous accepted design and retried OC with move=%.3e\n",
+          "it=%lld rejected candidate: diverged_cases=%lld compliance_spike=%d; restored previous accepted design and retried %s with move=%.3e\n",
           static_cast<long long>(iter),
           static_cast<long long>(diverged_cases),
           static_cast<int>(compliance_spike),
+          update_method,
           static_cast<double>(current_move)));
     } else {
       step_options.move = current_move;
@@ -5256,8 +5693,14 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
       last_good_effective_raw_volfrac = effective_raw_volfrac;
       have_last_good = PETSC_TRUE;
       reject_streak = 0;
-      PetscCall(oc_update(fda, rho_design, mask, dc_design, dv_design,
-                          density_options, step_options, &change));
+      if (use_mma_update) {
+        PetscCall(mma_update(fda, rho_design, mask, dc_design, dv_design,
+                             density_options, step_options, compliance,
+                             &mma_state, &change));
+      } else {
+        PetscCall(oc_update(fda, rho_design, mask, dc_design, dv_design,
+                            density_options, step_options, &change));
+      }
       if (optimizer_options.stability_guard && diverged_cases == 0) {
         current_move = PetscMin(optimizer_options.move,
                                 current_move * optimizer_options.move_growth);
@@ -5293,7 +5736,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
         iter_load_assembly_s + iter_ksp_solve_s + iter_sensitivity_s;
     final_iter = iter;
     PetscCall(PetscViewerASCIIPrintf(hist,
-                                     "%lld,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%lld,%.12e,%.12e,%lld,%lld,%d,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
+                                     "%lld,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%lld,%.12e,%.12e,%lld,%lld,%d,%s,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e,%.12e\n",
                                      static_cast<long long>(iter),
                                      static_cast<double>(compliance),
                                      static_cast<double>(volume),
@@ -5308,6 +5751,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                                      static_cast<long long>(converged_cases),
                                      static_cast<long long>(diverged_cases),
                                      static_cast<int>(accepted),
+                                     update_method,
                                      static_cast<double>(iter_total_s),
                                      static_cast<double>(iter_density_filter_s),
                                      static_cast<double>(iter_draft_closure_s),
@@ -5328,7 +5772,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
     PetscCall(write_objective_volume_history(output_prefix, objective_history,
                                              optimizer_options.volfrac));
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
-                          "it=%lld compliance=%.6e volume=%.6f raw=%.6f raw_target=%.6f beta=%.3g change=%.3e ksp_it=%lld move=%.3e accepted=%d time=%.3fs ann_cache=%.3fs ann_shape=%.3fs ems_ke=%.3fs linear_solve=%.3fs fem=%.3fs mma/oc=%.3fs\n",
+                          "it=%lld compliance=%.6e volume=%.6f raw=%.6f raw_target=%.6f beta=%.3g change=%.3e ksp_it=%lld move=%.3e accepted=%d update=%s time=%.3fs ann_cache=%.3fs ann_shape=%.3fs ems_ke=%.3fs linear_solve=%.3fs fem=%.3fs update_time=%.3fs\n",
                           static_cast<long long>(iter),
                           static_cast<double>(compliance),
                           static_cast<double>(volume),
@@ -5339,6 +5783,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
                           static_cast<long long>(its),
                           static_cast<double>(step_options.move),
                           static_cast<int>(accepted),
+                          update_method,
                           static_cast<double>(iter_total_s),
                           static_cast<double>(iter_ann_cache_s),
                           static_cast<double>(iter_ann_shape_predict_s),
@@ -5560,6 +6005,7 @@ PetscErrorCode run_emsfem_ann_optimizer(const Grid &grid,
   PetscCall(VecDestroy(&coarse_filter_denom));
   PetscCall(VecDestroy(&coarse_active_count));
   PetscCall(VecDestroy(&coarse_rho));
+  PetscCall(destroy_ems_ann_mma_state(&mma_state));
   PetscCall(DMDestroy(&cda));
   PetscCall(DMDestroy(&fda));
   return 0;

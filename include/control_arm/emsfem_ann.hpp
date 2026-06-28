@@ -30,6 +30,8 @@ struct EmSfemAnnOptions {
   char benchmark_case[32] = "cantilever";
   // fine 保留旧细单元滤波；coarse 用粗单元中心和粗单元半径滤波。
   char filter_mode[32] = "fine";
+  // ANN 优化器更新方法；oc 为旧路径，mma 为一约束分布式 MMA。
+  char update_method[32] = "oc";
   // legacy_z 保留旧 ANN z-prefix/suffix 闭包；axis 使用共享 H8 有符号轴向闭包。
   char draft_closure_mode[32] = "legacy_z";
 };

@@ -437,6 +437,8 @@ int main(int argc, char **argv) {
   EmSfemAnnOptions ems_options;
   char opt_vtk_file[PETSC_MAX_PATH_LEN] = "";
   PetscBool has_opt_vtk_file = PETSC_FALSE;
+  PetscBool has_ems_update_method = PETSC_FALSE;
+  PetscBool has_ems_update_alias = PETSC_FALSE;
 
   PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-nx", &grid.nx, nullptr));
   PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-ny", &grid.ny, nullptr));
@@ -650,6 +652,22 @@ int main(int argc, char **argv) {
                                   ems_options.filter_mode,
                                   sizeof(ems_options.filter_mode),
                                   nullptr));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr,
+                                  "-ems_ann_update_method",
+                                  ems_options.update_method,
+                                  sizeof(ems_options.update_method),
+                                  &has_ems_update_method));
+  PetscCall(PetscOptionsGetString(nullptr, nullptr,
+                                  "-ems_update_method",
+                                  ems_options.update_method,
+                                  sizeof(ems_options.update_method),
+                                  &has_ems_update_alias));
+  if (!has_ems_update_method && !has_ems_update_alias &&
+      optimizer_options.use_mma) {
+    // 兼容旧的通用开关：ANN 未显式指定更新器时，-opt_use_mma true 切到 MMA。
+    PetscCall(PetscStrncpy(ems_options.update_method, "mma",
+                           sizeof(ems_options.update_method)));
+  }
   PetscCall(PetscOptionsGetString(nullptr, nullptr,
                                   "-ems_ann_draft_closure_mode",
                                   ems_options.draft_closure_mode,
