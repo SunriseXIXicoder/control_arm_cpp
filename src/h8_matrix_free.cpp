@@ -258,6 +258,22 @@ PetscBool benchmark_is_torsion(const char *benchmark_case) {
   return std::strcmp(benchmark_case, "torsion") == 0 ? PETSC_TRUE : PETSC_FALSE;
 }
 
+PetscBool benchmark_is_torsion_edge(const char *benchmark_case) {
+  return (std::strcmp(benchmark_case, "torsion_edge") == 0 ||
+          std::strcmp(benchmark_case, "edge_torsion") == 0 ||
+          std::strcmp(benchmark_case, "torsion_ring") == 0)
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscBool h8_is_right_face_edge_node(PetscInt i, PetscInt j, PetscInt k,
+                                     const Grid &grid) {
+  return (i == grid.nx - 1 &&
+          (j == 0 || j == grid.ny - 1 || k == 0 || k == grid.nz - 1))
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
 PetscErrorCode fill_h8_load(DM da, const Grid &grid, PetscReal load, Vec b) {
   PetscScalar ****bg = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
@@ -270,15 +286,18 @@ PetscErrorCode fill_h8_load(DM da, const Grid &grid, PetscReal load, Vec b) {
                                   benchmark_case, sizeof(benchmark_case),
                                   nullptr));
   const PetscBool torsion = benchmark_is_torsion(benchmark_case);
-  PetscCheck(torsion || std::strcmp(benchmark_case, "cantilever") == 0,
+  const PetscBool torsion_edge = benchmark_is_torsion_edge(benchmark_case);
+  PetscCheck(torsion || torsion_edge ||
+                 std::strcmp(benchmark_case, "cantilever") == 0,
              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-             "-benchmark_case must be cantilever or torsion");
+             "-benchmark_case must be cantilever, torsion, or torsion_edge");
   PetscCall(DMDAGetCorners(da, &xs, &ys, &zs, &xm, &ym, &zm));
-  if (torsion) {
+  if (torsion || torsion_edge) {
     for (PetscInt k = zs; k < zs + zm; ++k) {
       for (PetscInt j = ys; j < ys + ym; ++j) {
         for (PetscInt i = xs; i < xs + xm; ++i) {
           if (i != grid.nx - 1) continue;
+          if (torsion_edge && !h8_is_right_face_edge_node(i, j, k, grid)) continue;
           const PetscReal y =
               grid.ny > 1 ? static_cast<PetscReal>(j) /
                                 static_cast<PetscReal>(grid.ny - 1) *
@@ -307,7 +326,8 @@ PetscErrorCode fill_h8_load(DM da, const Grid &grid, PetscReal load, Vec b) {
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
         if (i == grid.nx - 1) {
-          if (torsion) {
+          if (torsion || torsion_edge) {
+            if (torsion_edge && !h8_is_right_face_edge_node(i, j, k, grid)) continue;
             const PetscReal y =
                 grid.ny > 1 ? static_cast<PetscReal>(j) /
                                   static_cast<PetscReal>(grid.ny - 1) *

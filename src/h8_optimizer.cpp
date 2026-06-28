@@ -185,6 +185,14 @@ PetscBool benchmark_is_torsion(const char *benchmark_case) {
   return std::strcmp(benchmark_case, "torsion") == 0 ? PETSC_TRUE : PETSC_FALSE;
 }
 
+PetscBool benchmark_is_torsion_edge(const char *benchmark_case) {
+  return (std::strcmp(benchmark_case, "torsion_edge") == 0 ||
+          std::strcmp(benchmark_case, "edge_torsion") == 0 ||
+          std::strcmp(benchmark_case, "torsion_ring") == 0)
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
 PetscBool benchmark_is_bridge(const char *benchmark_case) {
   return std::strcmp(benchmark_case, "bridge") == 0 ? PETSC_TRUE : PETSC_FALSE;
 }
@@ -226,7 +234,16 @@ PetscBool benchmark_has_matlab_load_elements(const char *benchmark_case) {
   return (benchmark_is_cantilever(benchmark_case) ||
           benchmark_is_bridge(benchmark_case) ||
           benchmark_is_mbb(benchmark_case) ||
-          benchmark_is_tri(benchmark_case))
+          benchmark_is_tri(benchmark_case) ||
+          benchmark_is_torsion_edge(benchmark_case))
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscBool h8_is_right_face_edge_node(PetscInt i, PetscInt j, PetscInt k,
+                                     const Grid &grid) {
+  return (i == grid.nx - 1 &&
+          (j == 0 || j == grid.ny - 1 || k == 0 || k == grid.nz - 1))
              ? PETSC_TRUE
              : PETSC_FALSE;
 }
@@ -347,6 +364,11 @@ PetscBool h8_cell_is_forced_solid(PetscInt i, PetscInt j, PetscInt k,
     }
     if (benchmark_is_tri(opt.benchmark_case)) {
       return (i == 0 && j == 0 && k == ez - 1) ? PETSC_TRUE : PETSC_FALSE;
+    }
+    if (benchmark_is_torsion_edge(opt.benchmark_case)) {
+      return (i == ex - 1 && (j == 0 || j == ey - 1 || k == 0 || k == ez - 1))
+                 ? PETSC_TRUE
+                 : PETSC_FALSE;
     }
     if (benchmark_is_tip_center_cantilever(opt.benchmark_case)) {
       const PetscInt mid_j = ey / 2;
@@ -3647,6 +3669,8 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
   PetscReal local_torsion_denom = 0.0;
   PetscReal global_torsion_denom = 0.0;
   const PetscBool torsion = benchmark_is_torsion(optimizer_options.benchmark_case);
+  const PetscBool torsion_edge =
+      benchmark_is_torsion_edge(optimizer_options.benchmark_case);
   const PetscBool bridge = benchmark_is_bridge(optimizer_options.benchmark_case);
   const PetscBool mbb = benchmark_is_mbb(optimizer_options.benchmark_case);
   const PetscBool tri = benchmark_is_tri(optimizer_options.benchmark_case);
@@ -3664,18 +3688,19 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
   const PetscInt matlab_load_k =
       PetscMax(static_cast<PetscInt>(0), (grid.nz - 1) / 2);
 
-  PetscCheck(torsion || bridge || mbb || tri ||
-                 benchmark_is_cantilever(optimizer_options.benchmark_case),
+  PetscCheck(torsion || torsion_edge || bridge || mbb || tri ||
+                  benchmark_is_cantilever(optimizer_options.benchmark_case),
              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-             "-benchmark_case must be cantilever, cant, bottom_point, tip_center, bridge, mbb, tri, or torsion");
+             "-benchmark_case must be cantilever, cant, bottom_point, tip_center, bridge, mbb, tri, torsion, or torsion_edge");
 
   PetscCall(VecSet(b, 0.0));
   PetscCall(DMDAGetCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
-  if (torsion) {
+  if (torsion || torsion_edge) {
     for (PetscInt k = zs; k < zs + zm; ++k) {
       for (PetscInt j = ys; j < ys + ym; ++j) {
         for (PetscInt i = xs; i < xs + xm; ++i) {
           if (i != grid.nx - 1) continue;
+          if (torsion_edge && !h8_is_right_face_edge_node(i, j, k, grid)) continue;
           PetscReal x = 0.0, y = 0.0, z = 0.0;
           h8_node_physical(i, j, k, grid, &x, &y, &z);
           const PetscReal yc = y - 0.5 * domain_width(grid);
@@ -3709,8 +3734,9 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
           if (i != 0 || j != grid.ny - 1 || k != grid.nz - 1) continue;
           bg[k][j][i][0] += -optimizer_options.load;
           bg[k][j][i][1] += -optimizer_options.load;
-        } else if (torsion) {
+        } else if (torsion || torsion_edge) {
           if (i != grid.nx - 1) continue;
+          if (torsion_edge && !h8_is_right_face_edge_node(i, j, k, grid)) continue;
           PetscReal x = 0.0, y = 0.0, z = 0.0;
           h8_node_physical(i, j, k, grid, &x, &y, &z);
           const PetscReal yc = y - 0.5 * domain_width(grid);
@@ -5282,6 +5308,22 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
       PetscCall(PetscPrintf(
           PETSC_COMM_WORLD,
           "H8 rectangular benchmark: case=tri, fixed nodes match MATLAB [1,nely+1,(nely+1)*(nelx+1)], z-top y-high x-left corner loaded in -x/-y; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.z_draft_closure ? "true" : "false",
+          optimizer_options.draft_axes,
+          static_cast<double>(optimizer_options.z_draft_eta)));
+    } else if (benchmark_is_torsion_edge(optimizer_options.benchmark_case)) {
+      PetscCall(PetscPrintf(
+          PETSC_COMM_WORLD,
+          "H8 rectangular benchmark: case=%s, left face fixed, right-end edge ring loaded tangentially for torque Mx=opt_load; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.benchmark_case,
+          optimizer_options.z_draft_closure ? "true" : "false",
+          optimizer_options.draft_axes,
+          static_cast<double>(optimizer_options.z_draft_eta)));
+    } else if (benchmark_is_torsion(optimizer_options.benchmark_case)) {
+      PetscCall(PetscPrintf(
+          PETSC_COMM_WORLD,
+          "H8 rectangular benchmark: case=%s, left face fixed, right face loaded tangentially for torque Mx=opt_load; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.benchmark_case,
           optimizer_options.z_draft_closure ? "true" : "false",
           optimizer_options.draft_axes,
           static_cast<double>(optimizer_options.z_draft_eta)));
