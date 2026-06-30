@@ -996,20 +996,16 @@ PetscReal h8_heaviside_beta_for_iter(const OptimizerOptions &opt,
 
 PetscReal h8_matlab_outer_beta_for_iter(const OptimizerOptions &opt,
                                         PetscInt iter) {
-  const PetscReal beta0 =
-      opt.heaviside_projection ? opt.heaviside_beta_initial : 2.0;
-  const PetscReal beta_max =
-      opt.heaviside_projection ? opt.heaviside_beta_max : 10.0;
-  return PetscMin(PetscMax(1.0e-12, beta0) +
-                      0.1 * static_cast<PetscReal>(PetscMax(iter, 0)),
-                  PetscMax(PetscMax(1.0e-12, beta0), beta_max));
+  (void)opt;
+  return PetscMin(2.0 + 0.1 * static_cast<PetscReal>(PetscMax(iter, 0)),
+                  10.0);
 }
 
 PetscReal h8_matlab_inner_beta_for_iter(const OptimizerOptions &opt,
                                         PetscInt iter) {
-  return PetscMin(PetscMax(1.0e-12, opt.draft_beta) +
-                      0.1 * static_cast<PetscReal>(PetscMax(iter, 0)),
-                  PetscMax(PetscMax(1.0e-12, opt.draft_beta), 20.0));
+  (void)opt;
+  return PetscMin(10.0 + 0.1 * static_cast<PetscReal>(PetscMax(iter, 0)),
+                  20.0);
 }
 
 OptimizerOptions h8_projection_options_for_iter(const OptimizerOptions &opt,
@@ -1125,6 +1121,28 @@ char lowercase_ascii(char c) {
 struct H8DraftDirection {
   PetscInt axis = 2;
   PetscInt sign = 0;
+};
+
+struct H8MatlabProjectionLayout {
+  PetscInt ex = 0;
+  PetscInt ey = 0;
+  PetscInt ez = 0;
+  PetscInt x_face_count = 0;
+  PetscInt y_face_count = 0;
+  PetscInt z_face_count = 0;
+  PetscInt y_offset = 0;
+  PetscInt z_offset = 0;
+  PetscInt full_count = 0;
+  PetscInt cell_count = 0;
+};
+
+struct H8MatlabProjectionFlags {
+  PetscBool minus_x = PETSC_FALSE;
+  PetscBool plus_x = PETSC_FALSE;
+  PetscBool minus_y = PETSC_FALSE;
+  PetscBool plus_y = PETSC_FALSE;
+  PetscBool minus_z = PETSC_FALSE;
+  PetscBool plus_z = PETSC_FALSE;
 };
 
 const char *h8_draft_axes_error_message() {
@@ -1392,19 +1410,122 @@ PetscErrorCode apply_h8_draft_closure(DM eda, Vec mask,
   return 0;
 }
 
+H8MatlabProjectionLayout h8_matlab_projection_layout(PetscInt ex, PetscInt ey,
+                                                     PetscInt ez) {
+  H8MatlabProjectionLayout layout;
+  layout.ex = ex;
+  layout.ey = ey;
+  layout.ez = ez;
+  layout.x_face_count = ey * ez;
+  layout.y_face_count = ex * ez;
+  layout.z_face_count = ex * ey;
+  layout.y_offset = 2 * layout.x_face_count;
+  layout.z_offset = layout.y_offset + 2 * layout.y_face_count;
+  layout.full_count = layout.z_offset + 2 * layout.z_face_count;
+  layout.cell_count = ex * ey * ez;
+  return layout;
+}
+
+PetscInt h8_matlab_pack_cell_id(PetscInt i, PetscInt j, PetscInt k,
+                                const H8MatlabProjectionLayout &layout) {
+  return i + layout.ex * (j + layout.ey * k);
+}
+
+PetscInt h8_matlab_x_var_id(PetscInt j, PetscInt k,
+                            const H8MatlabProjectionLayout &layout) {
+  return j * layout.ez + k;
+}
+
+PetscInt h8_matlab_y_var_id(PetscInt i, PetscInt k,
+                            const H8MatlabProjectionLayout &layout) {
+  return i * layout.ez + k;
+}
+
+PetscInt h8_matlab_z_var_id(PetscInt i, PetscInt j, PetscInt ey) {
+  return i * ey + j;
+}
+
+PetscInt h8_matlab_z_var_id(PetscInt i, PetscInt j,
+                            const H8MatlabProjectionLayout &layout) {
+  return h8_matlab_z_var_id(i, j, layout.ey);
+}
+
+PetscErrorCode h8_matlab_projection_flags(
+    const OptimizerOptions &options, H8MatlabProjectionFlags *flags) {
+  std::vector<H8DraftDirection> dirs;
+  *flags = H8MatlabProjectionFlags();
+  if (!options.z_draft_closure) return 0;
+  PetscCall(parse_h8_draft_axes(options.draft_axes, &dirs));
+  for (const H8DraftDirection &dir : dirs) {
+    if (dir.axis == 0) {
+      if (dir.sign <= 0) flags->minus_x = PETSC_TRUE;
+      if (dir.sign >= 0) flags->plus_x = PETSC_TRUE;
+    } else if (dir.axis == 1) {
+      if (dir.sign <= 0) flags->minus_y = PETSC_TRUE;
+      if (dir.sign >= 0) flags->plus_y = PETSC_TRUE;
+    } else if (dir.axis == 2) {
+      if (dir.sign <= 0) flags->minus_z = PETSC_TRUE;
+      if (dir.sign >= 0) flags->plus_z = PETSC_TRUE;
+    }
+  }
+  return 0;
+}
+
+PetscBool h8_matlab_projection_has_active(
+    const H8MatlabProjectionFlags &flags) {
+  return (flags.minus_x || flags.plus_x || flags.minus_y || flags.plus_y ||
+          flags.minus_z || flags.plus_z)
+             ? PETSC_TRUE
+             : PETSC_FALSE;
+}
+
+PetscBool h8_matlab_var_is_upper(PetscInt var,
+                                 const H8MatlabProjectionLayout &layout) {
+  if (var < layout.x_face_count) return PETSC_FALSE;
+  if (var < 2 * layout.x_face_count) return PETSC_TRUE;
+  if (var < layout.y_offset + layout.y_face_count) return PETSC_FALSE;
+  if (var < layout.y_offset + 2 * layout.y_face_count) return PETSC_TRUE;
+  if (var < layout.z_offset + layout.z_face_count) return PETSC_FALSE;
+  return PETSC_TRUE;
+}
+
+PetscReal h8_matlab_var_default(PetscInt var,
+                                const H8MatlabProjectionLayout &layout) {
+  return h8_matlab_var_is_upper(var, layout) ? 1.0 : 0.0;
+}
+
+PetscBool h8_matlab_var_is_active(PetscInt var,
+                                  const H8MatlabProjectionLayout &layout,
+                                  const H8MatlabProjectionFlags &flags) {
+  if (var < layout.x_face_count) return flags.minus_x;
+  if (var < 2 * layout.x_face_count) return flags.plus_x;
+  if (var < layout.y_offset + layout.y_face_count) return flags.minus_y;
+  if (var < layout.y_offset + 2 * layout.y_face_count) return flags.plus_y;
+  if (var < layout.z_offset + layout.z_face_count) return flags.minus_z;
+  if (var < layout.full_count) return flags.plus_z;
+  return PETSC_FALSE;
+}
+
+PetscErrorCode h8_matlab_projection_validate_capacity(
+    const H8MatlabProjectionLayout &layout) {
+  PetscCheck(layout.full_count <= layout.cell_count, PETSC_COMM_WORLD,
+             PETSC_ERR_ARG_SIZ,
+             "MATLAB projection variable count (%lld) exceeds H8 element "
+             "storage count (%lld). Increase the mesh or disable "
+             "-opt_matlab_z_projection.",
+             static_cast<long long>(layout.full_count),
+             static_cast<long long>(layout.cell_count));
+  return 0;
+}
+
 PetscErrorCode h8_uses_matlab_z_projection(const OptimizerOptions &options,
                                            PetscBool *use_projection) {
-  std::vector<H8DraftDirection> dirs;
+  H8MatlabProjectionFlags flags;
   *use_projection = PETSC_FALSE;
   if (!options.z_draft_closure) return 0;
   if (!options.matlab_z_projection) return 0;
-  PetscCall(parse_h8_draft_axes(options.draft_axes, &dirs));
-  for (const H8DraftDirection &dir : dirs) {
-    if (dir.axis == 2) {
-      *use_projection = PETSC_TRUE;
-      return 0;
-    }
-  }
+  PetscCall(h8_matlab_projection_flags(options, &flags));
+  *use_projection = h8_matlab_projection_has_active(flags);
   return 0;
 }
 
@@ -1443,21 +1564,6 @@ PetscReal h8_matlab_cut_deta(PetscReal x, PetscReal eta, PetscReal beta) {
   return (v * u_prime - u * v_prime) / (v * v);
 }
 
-PetscReal h8_matlab_fixed_xy_factor(PetscInt i, PetscInt j, PetscInt ex,
-                                    PetscInt ey, PetscReal beta) {
-  const PetscReal xf = h8_matlab_cell_coordinate(i, ex);
-  const PetscReal yf = h8_matlab_cell_coordinate(j, ey);
-  const PetscReal xt1 = h8_matlab_cut_value(xf, 0.0, beta);
-  const PetscReal xt2 = 1.0 - h8_matlab_cut_value(xf, 1.0, beta);
-  const PetscReal yt1 = h8_matlab_cut_value(yf, 0.0, beta);
-  const PetscReal yt2 = 1.0 - h8_matlab_cut_value(yf, 1.0, beta);
-  return xt1 * xt2 * yt1 * yt2;
-}
-
-PetscInt h8_matlab_z_var_id(PetscInt i, PetscInt j, PetscInt ey) {
-  return i * ey + j;
-}
-
 PetscReal h8_outer_projection_value(PetscReal rho1,
                                     const OptimizerOptions &opt,
                                     PetscReal beta) {
@@ -1472,54 +1578,53 @@ PetscReal h8_outer_projection_derivative(PetscReal rho1,
                                         opt.z_draft_eta);
 }
 
-PetscErrorCode gather_h8_z_surface_variables(
-    DM eda, Vec rho_design, Vec mask, const OptimizerOptions &opt,
-    std::vector<PetscReal> *bottom, std::vector<PetscReal> *top) {
-  (void)opt;
-  PetscScalar ***r = nullptr, ***m = nullptr;
+PetscErrorCode collect_h8_matlab_projection_variables(
+    DM eda, Vec rho_design, const OptimizerOptions &opt,
+    std::vector<PetscReal> *x,
+    H8MatlabProjectionLayout *layout_out = nullptr,
+    H8MatlabProjectionFlags *flags_out = nullptr) {
+  PetscScalar ***r = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
   PetscInt ex = 0, ey = 0, ez = 0;
   PetscMPIInt reduce_count = 0;
+  H8MatlabProjectionFlags flags;
 
   PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
-  const PetscInt column_count = ex * ey;
-  PetscCall(PetscMPIIntCast(column_count, &reduce_count));
-  std::vector<PetscReal> local_bottom(static_cast<std::size_t>(column_count),
-                                      0.0);
-  std::vector<PetscReal> local_top(static_cast<std::size_t>(column_count), 0.0);
-  bottom->assign(static_cast<std::size_t>(column_count), 0.0);
-  top->assign(static_cast<std::size_t>(column_count), 0.0);
+  const H8MatlabProjectionLayout layout =
+      h8_matlab_projection_layout(ex, ey, ez);
+  PetscCall(h8_matlab_projection_validate_capacity(layout));
+  PetscCall(h8_matlab_projection_flags(opt, &flags));
+  PetscCall(PetscMPIIntCast(layout.full_count, &reduce_count));
+
+  std::vector<PetscReal> local_x(static_cast<std::size_t>(layout.full_count),
+                                 0.0);
+  x->assign(static_cast<std::size_t>(layout.full_count), 0.0);
 
   PetscCall(DMDAVecGetArrayRead(eda, rho_design, &r));
-  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
   PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
   for (PetscInt k = zs; k < zs + zm; ++k) {
-    if (k != 0 && k != ez - 1) continue;
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
-        const PetscReal mask_value = PetscRealPart(m[k][j][i]);
-        if (!h8_mask_is_design(mask_value) &&
-            !h8_mask_is_fixed_solid(mask_value)) {
-          continue;
-        }
-        const PetscInt id = h8_matlab_z_var_id(i, j, ey);
-        const PetscReal value = PetscMax(
-            0.0, PetscMin(1.0, PetscRealPart(r[k][j][i])));
-        if (k == 0) {
-          local_bottom[static_cast<std::size_t>(id)] = value;
-        } else {
-          local_top[static_cast<std::size_t>(id)] = value;
-        }
+        const PetscInt var = h8_matlab_pack_cell_id(i, j, k, layout);
+        if (var >= layout.full_count) continue;
+        local_x[static_cast<std::size_t>(var)] =
+            PetscMax(0.0, PetscMin(1.0, PetscRealPart(r[k][j][i])));
       }
     }
   }
   PetscCall(DMDAVecRestoreArrayRead(eda, rho_design, &r));
-  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
-  PetscCallMPI(MPI_Allreduce(local_bottom.data(), bottom->data(), reduce_count,
+  PetscCallMPI(MPI_Allreduce(local_x.data(), x->data(), reduce_count,
                              MPIU_REAL, MPI_MAX, PETSC_COMM_WORLD));
-  PetscCallMPI(MPI_Allreduce(local_top.data(), top->data(), reduce_count,
-                             MPIU_REAL, MPI_MAX, PETSC_COMM_WORLD));
+
+  for (PetscInt var = 0; var < layout.full_count; ++var) {
+    if (!h8_matlab_var_is_active(var, layout, flags)) {
+      (*x)[static_cast<std::size_t>(var)] =
+          h8_matlab_var_default(var, layout);
+    }
+  }
+  if (layout_out != nullptr) *layout_out = layout;
+  if (flags_out != nullptr) *flags_out = flags;
   return 0;
 }
 
@@ -1531,19 +1636,20 @@ PetscErrorCode apply_h8_matlab_z_projection(
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
   PetscInt ex = 0, ey = 0, ez = 0;
   const PetscReal beta = PetscMax(1.0e-12, opt.draft_beta);
-  std::vector<PetscReal> bottom;
-  std::vector<PetscReal> top;
+  H8MatlabProjectionLayout layout;
+  std::vector<PetscReal> x;
 
   PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
-  PetscCall(gather_h8_z_surface_variables(eda, rho_design, mask, opt,
-                                          &bottom, &top));
+  PetscCall(collect_h8_matlab_projection_variables(eda, rho_design, opt, &x,
+                                                   &layout));
   PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
   PetscCall(DMDAVecGetArray(eda, rho_phys, &out));
   PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
   for (PetscInt k = zs; k < zs + zm; ++k) {
     const PetscReal zf = h8_matlab_cell_coordinate(k, ez);
     for (PetscInt j = ys; j < ys + ym; ++j) {
+      const PetscReal yf = h8_matlab_cell_coordinate(j, ey);
       for (PetscInt i = xs; i < xs + xm; ++i) {
         const PetscReal mask_value = PetscRealPart(m[k][j][i]);
         if (h8_mask_is_fixed_solid(mask_value)) {
@@ -1554,16 +1660,28 @@ PetscErrorCode apply_h8_matlab_z_projection(
           out[k][j][i] = density_options.void_density;
           continue;
         }
-        const PetscInt id = h8_matlab_z_var_id(i, j, ey);
-        const PetscReal eta_lower =
-            1.0 - bottom[static_cast<std::size_t>(id)];
-        const PetscReal eta_upper = top[static_cast<std::size_t>(id)];
-        const PetscReal zt1 = h8_matlab_cut_value(zf, eta_lower, beta);
-        const PetscReal zt2 =
-            1.0 - h8_matlab_cut_value(zf, eta_upper, beta);
-        const PetscReal xy_factor =
-            h8_matlab_fixed_xy_factor(i, j, ex, ey, beta);
-        const PetscReal rho1 = xy_factor * zt1 * zt2;
+        const PetscReal xf = h8_matlab_cell_coordinate(i, ex);
+        const PetscInt xid = h8_matlab_x_var_id(j, k, layout);
+        const PetscInt yid = h8_matlab_y_var_id(i, k, layout);
+        const PetscInt zid = h8_matlab_z_var_id(i, j, layout);
+        const PetscReal eta1_x = x[static_cast<std::size_t>(xid)];
+        const PetscReal eta2_x =
+            x[static_cast<std::size_t>(layout.x_face_count + xid)];
+        const PetscReal eta1_y =
+            x[static_cast<std::size_t>(layout.y_offset + yid)];
+        const PetscReal eta2_y = x[static_cast<std::size_t>(
+            layout.y_offset + layout.y_face_count + yid)];
+        const PetscReal eta1_z =
+            x[static_cast<std::size_t>(layout.z_offset + zid)];
+        const PetscReal eta2_z = x[static_cast<std::size_t>(
+            layout.z_offset + layout.z_face_count + zid)];
+        const PetscReal xt1 = h8_matlab_cut_value(xf, eta1_x, beta);
+        const PetscReal xt2 = 1.0 - h8_matlab_cut_value(xf, eta2_x, beta);
+        const PetscReal yt1 = h8_matlab_cut_value(yf, eta1_y, beta);
+        const PetscReal yt2 = 1.0 - h8_matlab_cut_value(yf, eta2_y, beta);
+        const PetscReal zt1 = h8_matlab_cut_value(zf, eta1_z, beta);
+        const PetscReal zt2 = 1.0 - h8_matlab_cut_value(zf, eta2_z, beta);
+        const PetscReal rho1 = xt1 * xt2 * yt1 * yt2 * zt1 * zt2;
         out[k][j][i] = h8_outer_projection_value(rho1, opt, outer_beta);
       }
     }
@@ -1595,192 +1713,35 @@ PetscErrorCode build_h8_physical_density(
 }
 
 PetscErrorCode create_h8_z_surface_update_mask(DM eda, Vec mask,
+                                               const OptimizerOptions &opt,
                                                Vec update_mask) {
-  PetscScalar ***m = nullptr, ***u = nullptr;
+  (void)mask;
+  PetscScalar ***u = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
-  PetscInt ez = 0;
-  PetscCall(DMDAGetInfo(eda, nullptr, nullptr, nullptr, &ez, nullptr, nullptr,
+  PetscInt ex = 0, ey = 0, ez = 0;
+  H8MatlabProjectionFlags flags;
+  PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr,
                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                         nullptr));
-  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
+  const H8MatlabProjectionLayout layout =
+      h8_matlab_projection_layout(ex, ey, ez);
+  PetscCall(h8_matlab_projection_validate_capacity(layout));
+  PetscCall(h8_matlab_projection_flags(opt, &flags));
   PetscCall(DMDAVecGetArray(eda, update_mask, &u));
   PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
   for (PetscInt k = zs; k < zs + zm; ++k) {
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
-        const PetscReal mask_value = PetscRealPart(m[k][j][i]);
+        const PetscInt var = h8_matlab_pack_cell_id(i, j, k, layout);
         u[k][j][i] =
-            ((h8_mask_is_design(mask_value) ||
-              h8_mask_is_fixed_solid(mask_value)) &&
-             (k == 0 || k == ez - 1))
+            (var < layout.full_count &&
+             h8_matlab_var_is_active(var, layout, flags))
                 ? 1.0
                 : 0.0;
       }
     }
   }
-  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
   PetscCall(DMDAVecRestoreArray(eda, update_mask, &u));
-  return 0;
-}
-
-void filter_h8_z_surface_array(const std::vector<PetscReal> &input,
-                               PetscInt ex, PetscInt ey, PetscReal radius,
-                               std::vector<PetscReal> *output) {
-  output->assign(input.size(), 0.0);
-  if (radius <= 0.0) {
-    *output = input;
-    return;
-  }
-
-  const PetscInt rr =
-      PetscMax(0, static_cast<PetscInt>(PetscCeilReal(radius)));
-  for (PetscInt i = 0; i < ex; ++i) {
-    for (PetscInt j = 0; j < ey; ++j) {
-      PetscReal sum = 0.0;
-      PetscReal denom = 0.0;
-      for (PetscInt dx = -rr; dx <= rr; ++dx) {
-        const PetscInt ii = i + dx;
-        if (ii < 0 || ii >= ex) continue;
-        for (PetscInt dy = -rr; dy <= rr; ++dy) {
-          const PetscInt jj = j + dy;
-          if (jj < 0 || jj >= ey) continue;
-          const PetscReal w = cone_weight(dx, dy, 0, radius);
-          if (w <= 0.0) continue;
-          const std::size_t sid =
-              static_cast<std::size_t>(h8_matlab_z_var_id(ii, jj, ey));
-          sum += w * input[sid];
-          denom += w;
-        }
-      }
-      const std::size_t out_id =
-          static_cast<std::size_t>(h8_matlab_z_var_id(i, j, ey));
-      (*output)[out_id] = denom > 0.0 ? sum / denom : input[out_id];
-    }
-  }
-}
-
-PetscErrorCode apply_h8_matlab_z_surface_sensitivity(
-    DM eda, Vec dc_phys, Vec mask, Vec rho_design,
-    const DensityOptions &density_options, const OptimizerOptions &opt,
-    PetscReal outer_beta, Vec dc_design, Vec dv_design) {
-  (void)density_options;
-  PetscScalar ***dc = nullptr, ***m = nullptr;
-  PetscScalar ***dc_out = nullptr, ***dv_out = nullptr;
-  PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
-  PetscInt ex = 0, ey = 0, ez = 0;
-  PetscMPIInt reduce_count = 0;
-  const PetscReal beta = PetscMax(1.0e-12, opt.draft_beta);
-  std::vector<PetscReal> bottom;
-  std::vector<PetscReal> top;
-
-  PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
-                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
-  const PetscInt column_count = ex * ey;
-  PetscCall(PetscMPIIntCast(column_count, &reduce_count));
-  std::vector<PetscReal> local_dc_bottom(static_cast<std::size_t>(column_count),
-                                         0.0);
-  std::vector<PetscReal> local_dc_top(static_cast<std::size_t>(column_count),
-                                      0.0);
-  std::vector<PetscReal> local_dv_bottom(static_cast<std::size_t>(column_count),
-                                         0.0);
-  std::vector<PetscReal> local_dv_top(static_cast<std::size_t>(column_count),
-                                      0.0);
-  std::vector<PetscReal> global_dc_bottom(static_cast<std::size_t>(column_count),
-                                          0.0);
-  std::vector<PetscReal> global_dc_top(static_cast<std::size_t>(column_count),
-                                       0.0);
-  std::vector<PetscReal> global_dv_bottom(static_cast<std::size_t>(column_count),
-                                          0.0);
-  std::vector<PetscReal> global_dv_top(static_cast<std::size_t>(column_count),
-                                       0.0);
-  std::vector<PetscReal> filtered_dc_bottom;
-  std::vector<PetscReal> filtered_dc_top;
-  std::vector<PetscReal> filtered_dv_bottom;
-  std::vector<PetscReal> filtered_dv_top;
-
-  PetscCall(gather_h8_z_surface_variables(eda, rho_design, mask, opt,
-                                          &bottom, &top));
-  PetscCall(DMDAVecGetArrayRead(eda, dc_phys, &dc));
-  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
-  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
-  for (PetscInt k = zs; k < zs + zm; ++k) {
-    const PetscReal zf = h8_matlab_cell_coordinate(k, ez);
-    for (PetscInt j = ys; j < ys + ym; ++j) {
-      for (PetscInt i = xs; i < xs + xm; ++i) {
-        if (!h8_mask_is_design(PetscRealPart(m[k][j][i]))) continue;
-        const PetscInt id = h8_matlab_z_var_id(i, j, ey);
-        const std::size_t sid = static_cast<std::size_t>(id);
-        const PetscReal eta_lower = 1.0 - bottom[sid];
-        const PetscReal eta_upper = top[sid];
-        const PetscReal zt1 = h8_matlab_cut_value(zf, eta_lower, beta);
-        const PetscReal zt2 =
-            1.0 - h8_matlab_cut_value(zf, eta_upper, beta);
-        const PetscReal xy_factor =
-            h8_matlab_fixed_xy_factor(i, j, ex, ey, beta);
-        const PetscReal rho1 = xy_factor * zt1 * zt2;
-        const PetscReal outer =
-            h8_outer_projection_derivative(rho1, opt, outer_beta);
-        const PetscReal dzt1_db =
-            -h8_matlab_cut_deta(zf, eta_lower, beta);
-        const PetscReal dzt2_dt =
-            -h8_matlab_cut_deta(zf, eta_upper, beta);
-        const PetscReal deriv_bottom = outer * xy_factor * dzt1_db * zt2;
-        const PetscReal deriv_top = outer * xy_factor * zt1 * dzt2_dt;
-        local_dc_bottom[sid] += PetscRealPart(dc[k][j][i]) * deriv_bottom;
-        local_dc_top[sid] += PetscRealPart(dc[k][j][i]) * deriv_top;
-        local_dv_bottom[sid] += deriv_bottom;
-        local_dv_top[sid] += deriv_top;
-      }
-    }
-  }
-  PetscCall(DMDAVecRestoreArrayRead(eda, dc_phys, &dc));
-  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
-
-  PetscCallMPI(MPI_Allreduce(local_dc_bottom.data(), global_dc_bottom.data(),
-                             reduce_count, MPIU_REAL, MPI_SUM,
-                             PETSC_COMM_WORLD));
-  PetscCallMPI(MPI_Allreduce(local_dc_top.data(), global_dc_top.data(),
-                             reduce_count, MPIU_REAL, MPI_SUM,
-                             PETSC_COMM_WORLD));
-  PetscCallMPI(MPI_Allreduce(local_dv_bottom.data(), global_dv_bottom.data(),
-                             reduce_count, MPIU_REAL, MPI_SUM,
-                             PETSC_COMM_WORLD));
-  PetscCallMPI(MPI_Allreduce(local_dv_top.data(), global_dv_top.data(),
-                             reduce_count, MPIU_REAL, MPI_SUM,
-                             PETSC_COMM_WORLD));
-
-  filter_h8_z_surface_array(global_dc_bottom, ex, ey, opt.filter_radius,
-                            &filtered_dc_bottom);
-  filter_h8_z_surface_array(global_dc_top, ex, ey, opt.filter_radius,
-                            &filtered_dc_top);
-  filter_h8_z_surface_array(global_dv_bottom, ex, ey, opt.filter_radius,
-                            &filtered_dv_bottom);
-  filter_h8_z_surface_array(global_dv_top, ex, ey, opt.filter_radius,
-                            &filtered_dv_top);
-
-  PetscCall(VecSet(dc_design, 0.0));
-  PetscCall(VecSet(dv_design, 0.0));
-  PetscCall(DMDAVecGetArray(eda, dc_design, &dc_out));
-  PetscCall(DMDAVecGetArray(eda, dv_design, &dv_out));
-  PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
-  for (PetscInt k = zs; k < zs + zm; ++k) {
-    if (k != 0 && k != ez - 1) continue;
-    for (PetscInt j = ys; j < ys + ym; ++j) {
-      for (PetscInt i = xs; i < xs + xm; ++i) {
-        const PetscInt id = h8_matlab_z_var_id(i, j, ey);
-        const std::size_t sid = static_cast<std::size_t>(id);
-        if (k == 0) {
-          dc_out[k][j][i] = filtered_dc_bottom[sid];
-          dv_out[k][j][i] = PetscMax(0.0, filtered_dv_bottom[sid]);
-        } else {
-          dc_out[k][j][i] = filtered_dc_top[sid];
-          dv_out[k][j][i] = PetscMax(0.0, filtered_dv_top[sid]);
-        }
-      }
-    }
-  }
-  PetscCall(DMDAVecRestoreArray(eda, dc_design, &dc_out));
-  PetscCall(DMDAVecRestoreArray(eda, dv_design, &dv_out));
   return 0;
 }
 
@@ -1821,46 +1782,34 @@ PetscErrorCode write_h8_matlab_z_mma_variables(
     DM eda, Vec mask, const OptimizerOptions &opt,
     const std::vector<PetscReal> &x, Vec rho_design,
     PetscReal *max_change) {
-  PetscScalar ***r = nullptr, ***m = nullptr;
+  (void)mask;
+  PetscScalar ***r = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
   PetscInt ex = 0, ey = 0, ez = 0;
   PetscReal local_change = 0.0;
+  H8MatlabProjectionFlags flags;
 
   PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
-  const PetscInt column_count = ex * ey;
-  const PetscInt x_face_count = ey * ez;
-  const PetscInt y_face_count = ex * ez;
-  const PetscInt z_offset = 2 * x_face_count + 2 * y_face_count;
-  const PetscInt full_count = z_offset + 2 * column_count;
-  const PetscBool full_mma =
-      x.size() == static_cast<std::size_t>(full_count) ? PETSC_TRUE
-                                                       : PETSC_FALSE;
-  PetscCheck(full_mma || x.size() == static_cast<std::size_t>(2 * column_count),
+  const H8MatlabProjectionLayout layout =
+      h8_matlab_projection_layout(ex, ey, ez);
+  PetscCall(h8_matlab_projection_validate_capacity(layout));
+  PetscCall(h8_matlab_projection_flags(opt, &flags));
+  PetscCheck(x.size() == static_cast<std::size_t>(layout.full_count),
              PETSC_COMM_WORLD, PETSC_ERR_ARG_SIZ,
-             "MATLAB z MMA variable vector has the wrong length");
+             "MATLAB projection MMA variable vector has the wrong length");
   PetscCall(DMDAVecGetArray(eda, rho_design, &r));
-  PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
   PetscCall(DMDAGetCorners(eda, &xs, &ys, &zs, &xm, &ym, &zm));
   for (PetscInt k = zs; k < zs + zm; ++k) {
-    if (k != 0 && k != ez - 1) continue;
     for (PetscInt j = ys; j < ys + ym; ++j) {
       for (PetscInt i = xs; i < xs + xm; ++i) {
-        const PetscReal mask_value = PetscRealPart(m[k][j][i]);
         const PetscReal old_value = PetscRealPart(r[k][j][i]);
         PetscReal new_value = old_value;
-        if (h8_mask_is_design(mask_value) ||
-            h8_mask_is_fixed_solid(mask_value)) {
-          const PetscInt id = h8_matlab_z_var_id(i, j, ey);
-          if (k == 0) {
-            const PetscInt var_id = full_mma ? z_offset + id : id;
-            new_value = 1.0 - x[static_cast<std::size_t>(var_id)];
-          } else {
-            const PetscInt var_id =
-                full_mma ? z_offset + column_count + id : column_count + id;
-            new_value =
-                x[static_cast<std::size_t>(var_id)];
-          }
+        const PetscInt var = h8_matlab_pack_cell_id(i, j, k, layout);
+        if (var < layout.full_count) {
+          new_value = h8_matlab_var_is_active(var, layout, flags)
+                          ? x[static_cast<std::size_t>(var)]
+                          : h8_matlab_var_default(var, layout);
           new_value = h8_clamp(new_value, 0.0, 1.0);
         }
         r[k][j][i] = new_value;
@@ -1870,10 +1819,8 @@ PetscErrorCode write_h8_matlab_z_mma_variables(
     }
   }
   PetscCall(DMDAVecRestoreArray(eda, rho_design, &r));
-  PetscCall(DMDAVecRestoreArrayRead(eda, mask, &m));
   PetscCallMPI(MPI_Allreduce(&local_change, max_change, 1, MPIU_REAL, MPI_MAX,
                              PETSC_COMM_WORLD));
-  (void)opt;
   return 0;
 }
 
@@ -1946,52 +1893,23 @@ PetscErrorCode collect_h8_matlab_full_mma_data(
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
   PetscInt ex = 0, ey = 0, ez = 0;
   PetscMPIInt reduce_count = 0;
-  std::vector<PetscReal> bottom;
-  std::vector<PetscReal> top;
+  H8MatlabProjectionLayout layout;
+  H8MatlabProjectionFlags flags;
 
   PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
                         nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
-  const PetscInt x_face_count = ey * ez;
-  const PetscInt y_face_count = ex * ez;
-  const PetscInt z_face_count = ex * ey;
-  const PetscInt y_offset = 2 * x_face_count;
-  const PetscInt z_offset = y_offset + 2 * y_face_count;
-  const PetscInt n = z_offset + 2 * z_face_count;
   const PetscReal inv_total =
       1.0 / static_cast<PetscReal>(PetscMax(1, ex * ey * ez));
   const PetscReal beta = PetscMax(1.0e-12, opt.draft_beta);
+  PetscCall(collect_h8_matlab_projection_variables(
+      eda, rho_design, opt, x, &layout, &flags));
+  const PetscInt n = layout.full_count;
   PetscCall(PetscMPIIntCast(n, &reduce_count));
-  PetscCall(gather_h8_z_surface_variables(eda, rho_design, mask, opt,
-                                          &bottom, &top));
 
-  x->assign(static_cast<std::size_t>(n), 0.0);
   std::vector<PetscReal> local_df0dx(static_cast<std::size_t>(n), 0.0);
   std::vector<PetscReal> local_dfdx(static_cast<std::size_t>(n), 0.0);
   std::vector<PetscReal> global_df0dx(static_cast<std::size_t>(n), 0.0);
   std::vector<PetscReal> global_dfdx(static_cast<std::size_t>(n), 0.0);
-
-  for (PetscInt j = 0; j < ey; ++j) {
-    for (PetscInt k = 0; k < ez; ++k) {
-      const PetscInt id = j * ez + k;
-      (*x)[static_cast<std::size_t>(id)] = 0.0;
-      (*x)[static_cast<std::size_t>(x_face_count + id)] = 1.0;
-    }
-  }
-  for (PetscInt i = 0; i < ex; ++i) {
-    for (PetscInt k = 0; k < ez; ++k) {
-      const PetscInt id = i * ez + k;
-      (*x)[static_cast<std::size_t>(y_offset + id)] = 0.0;
-      (*x)[static_cast<std::size_t>(y_offset + y_face_count + id)] = 1.0;
-    }
-  }
-  for (PetscInt i = 0; i < ex; ++i) {
-    for (PetscInt j = 0; j < ey; ++j) {
-      const PetscInt id = h8_matlab_z_var_id(i, j, ey);
-      const std::size_t sid = static_cast<std::size_t>(id);
-      (*x)[static_cast<std::size_t>(z_offset + id)] = 1.0 - bottom[sid];
-      (*x)[static_cast<std::size_t>(z_offset + z_face_count + id)] = top[sid];
-    }
-  }
 
   PetscCall(DMDAVecGetArrayRead(eda, dc_phys, &dc));
   PetscCall(DMDAVecGetArrayRead(eda, mask, &m));
@@ -2003,26 +1921,34 @@ PetscErrorCode collect_h8_matlab_full_mma_data(
       for (PetscInt i = xs; i < xs + xm; ++i) {
         if (!h8_mask_is_design(PetscRealPart(m[k][j][i]))) continue;
         const PetscReal xf = h8_matlab_cell_coordinate(i, ex);
-        const PetscInt zid = h8_matlab_z_var_id(i, j, ey);
-        const std::size_t zsid = static_cast<std::size_t>(zid);
-        const PetscReal eta1_z = 1.0 - bottom[zsid];
-        const PetscReal eta2_z = top[zsid];
-        const PetscReal xt1 = h8_matlab_cut_value(xf, 0.0, beta);
-        const PetscReal xt2 = 1.0 - h8_matlab_cut_value(xf, 1.0, beta);
-        const PetscReal yt1 = h8_matlab_cut_value(yf, 0.0, beta);
-        const PetscReal yt2 = 1.0 - h8_matlab_cut_value(yf, 1.0, beta);
+        const PetscInt xid = h8_matlab_x_var_id(j, k, layout);
+        const PetscInt yid = h8_matlab_y_var_id(i, k, layout);
+        const PetscInt zid = h8_matlab_z_var_id(i, j, layout);
+        const PetscReal eta1_x = (*x)[static_cast<std::size_t>(xid)];
+        const PetscReal eta2_x =
+            (*x)[static_cast<std::size_t>(layout.x_face_count + xid)];
+        const PetscReal eta1_y =
+            (*x)[static_cast<std::size_t>(layout.y_offset + yid)];
+        const PetscReal eta2_y = (*x)[static_cast<std::size_t>(
+            layout.y_offset + layout.y_face_count + yid)];
+        const PetscReal eta1_z =
+            (*x)[static_cast<std::size_t>(layout.z_offset + zid)];
+        const PetscReal eta2_z = (*x)[static_cast<std::size_t>(
+            layout.z_offset + layout.z_face_count + zid)];
+        const PetscReal xt1 = h8_matlab_cut_value(xf, eta1_x, beta);
+        const PetscReal xt2 = 1.0 - h8_matlab_cut_value(xf, eta2_x, beta);
+        const PetscReal yt1 = h8_matlab_cut_value(yf, eta1_y, beta);
+        const PetscReal yt2 = 1.0 - h8_matlab_cut_value(yf, eta2_y, beta);
         const PetscReal zt1 = h8_matlab_cut_value(zf, eta1_z, beta);
         const PetscReal zt2 = 1.0 - h8_matlab_cut_value(zf, eta2_z, beta);
         const PetscReal rho1 = xt1 * xt2 * yt1 * yt2 * zt1 * zt2;
         const PetscReal outer =
             h8_outer_projection_derivative(rho1, opt, outer_beta);
         const PetscReal dc_value = PetscRealPart(dc[k][j][i]);
-        const PetscInt x_var = j * ez + k;
-        const PetscInt y_var = i * ez + k;
-        const PetscReal d_xt1 = h8_matlab_cut_deta(xf, 0.0, beta);
-        const PetscReal d_xt2 = -h8_matlab_cut_deta(xf, 1.0, beta);
-        const PetscReal d_yt1 = h8_matlab_cut_deta(yf, 0.0, beta);
-        const PetscReal d_yt2 = -h8_matlab_cut_deta(yf, 1.0, beta);
+        const PetscReal d_xt1 = h8_matlab_cut_deta(xf, eta1_x, beta);
+        const PetscReal d_xt2 = -h8_matlab_cut_deta(xf, eta2_x, beta);
+        const PetscReal d_yt1 = h8_matlab_cut_deta(yf, eta1_y, beta);
+        const PetscReal d_yt2 = -h8_matlab_cut_deta(yf, eta2_y, beta);
         const PetscReal d_zt1 = h8_matlab_cut_deta(zf, eta1_z, beta);
         const PetscReal d_zt2 = -h8_matlab_cut_deta(zf, eta2_z, beta);
         const PetscReal derivs[6] = {
@@ -2033,12 +1959,12 @@ PetscErrorCode collect_h8_matlab_full_mma_data(
             outer * d_zt1 * xt1 * xt2 * yt1 * yt2 * zt2,
             outer * d_zt2 * xt1 * xt2 * yt1 * yt2 * zt1};
         const PetscInt ids[6] = {
-            x_var,
-            x_face_count + x_var,
-            y_offset + y_var,
-            y_offset + y_face_count + y_var,
-            z_offset + zid,
-            z_offset + z_face_count + zid};
+            xid,
+            layout.x_face_count + xid,
+            layout.y_offset + yid,
+            layout.y_offset + layout.y_face_count + yid,
+            layout.z_offset + zid,
+            layout.z_offset + layout.z_face_count + zid};
         for (PetscInt q = 0; q < 6; ++q) {
           const std::size_t sid = static_cast<std::size_t>(ids[q]);
           local_df0dx[sid] += dc_value * derivs[q];
@@ -2059,6 +1985,7 @@ PetscErrorCode collect_h8_matlab_full_mma_data(
                                         opt.filter_radius, df0dx);
   filter_h8_matlab_full_mma_sensitivity(global_dfdx, ex, ey, ez,
                                         opt.filter_radius, dfdx);
+  (void)flags;
   return 0;
 }
 
@@ -2294,10 +2221,8 @@ void h8_matlab_mma_gensub(PetscInt iter, const std::vector<PetscReal> &x,
 
 PetscReal h8_matlab_mma_move_for_iter(const OptimizerOptions &opt,
                                       PetscInt iter) {
-  PetscReal move = PetscMax(0.01 - 0.0001 * static_cast<PetscReal>(iter),
-                            0.001);
-  if (opt.move > 0.0 && opt.move < 0.05) move = PetscMin(move, opt.move);
-  return move;
+  (void)opt;
+  return PetscMax(0.01 - 0.0001 * static_cast<PetscReal>(iter), 0.001);
 }
 
 PetscErrorCode h8_mma_update_matlab_z(
@@ -2449,12 +2374,16 @@ PetscErrorCode create_element_mask_and_density(DM eda, const Grid &grid,
   PetscScalar ***m = nullptr;
   PetscScalar ***r = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
-  PetscInt ez = 0;
+  PetscInt ex = 0, ey = 0, ez = 0;
   PetscBool matlab_z_projection = PETSC_FALSE;
+  H8MatlabProjectionLayout matlab_layout;
   PetscCall(h8_uses_matlab_z_projection(opt, &matlab_z_projection));
-  PetscCall(DMDAGetInfo(eda, nullptr, nullptr, nullptr, &ez, nullptr, nullptr,
-                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                        nullptr));
+  PetscCall(DMDAGetInfo(eda, nullptr, &ex, &ey, &ez, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  if (matlab_z_projection) {
+    matlab_layout = h8_matlab_projection_layout(ex, ey, ez);
+    PetscCall(h8_matlab_projection_validate_capacity(matlab_layout));
+  }
   PetscCall(DMCreateGlobalVector(eda, mask));
   PetscCall(VecDuplicate(*mask, rho));
   PetscCall(DMDAVecGetArray(eda, *mask, &m));
@@ -2470,18 +2399,24 @@ PetscErrorCode create_element_mask_and_density(DM eda, const Grid &grid,
                     density_options.mask_threshold
                 ? PETSC_TRUE
                 : PETSC_FALSE;
+        PetscReal initial_density = opt.volfrac;
+        if (matlab_z_projection) {
+          const PetscInt var = h8_matlab_pack_cell_id(i, j, k, matlab_layout);
+          initial_density =
+              var < matlab_layout.full_count
+                  ? h8_matlab_var_default(var, matlab_layout)
+                  : opt.rho_min;
+        }
         if (forced_solid) {
           m[k][j][i] = 2.0;
-          r[k][j][i] = 1.0;
+          r[k][j][i] = matlab_z_projection ? initial_density : 1.0;
         } else if (design) {
           m[k][j][i] = 1.0;
-          r[k][j][i] =
-              matlab_z_projection
-                  ? ((k == 0 || k == ez - 1) ? 1.0 : opt.rho_min)
-                  : opt.volfrac;
+          r[k][j][i] = initial_density;
         } else {
           m[k][j][i] = 0.0;
-          r[k][j][i] = density_options.void_density;
+          r[k][j][i] =
+              matlab_z_projection ? initial_density : density_options.void_density;
         }
       }
     }
@@ -5117,6 +5052,9 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(h8_get_load_options(&h8_load_case, &h8_include_spring_load));
   PetscCall(h8_uses_matlab_z_projection(optimizer_options,
                                         &matlab_z_projection));
+  PetscCheck(!matlab_z_projection || optimizer_options.use_mma,
+             PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+             "MATLAB projection mode requires -opt_use_mma true.");
   const PetscBool include_fixed_solid_volume =
       (!density_options.use_control_arm_mask &&
        benchmark_has_matlab_load_elements(optimizer_options.benchmark_case))
@@ -5130,7 +5068,8 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                             optimizer_options, &mask, &rho_design));
   PetscCall(VecDuplicate(mask, &update_mask));
   if (matlab_z_projection) {
-    PetscCall(create_h8_z_surface_update_mask(eda, mask, update_mask));
+    PetscCall(create_h8_z_surface_update_mask(eda, mask, optimizer_options,
+                                              update_mask));
   } else {
     PetscCall(VecCopy(mask, update_mask));
   }
@@ -5240,10 +5179,10 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                         "H8 optimizer update: %s%s\n",
                         (optimizer_options.use_mma && matlab_z_projection)
-                            ? "MATLAB-style MMA"
+                            ? "MATLAB-style six-face projection MMA"
                             : "OC",
                         (optimizer_options.use_mma && !matlab_z_projection)
-                            ? " (-opt_use_mma ignored outside MATLAB z projection)"
+                            ? " (-opt_use_mma ignored outside MATLAB projection)"
                             : ""));
   if (density_options.use_control_arm_mask) {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
@@ -5447,9 +5386,8 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                      include_fixed_solid_volume, dc_phys,
                                      &volume));
     if (matlab_z_projection) {
-      PetscCall(apply_h8_matlab_z_surface_sensitivity(
-          eda, dc_phys, mask, rho_design, density_options, projection_options,
-          current_beta, dc_design, dv_design));
+      PetscCall(VecSet(dc_design, 0.0));
+      PetscCall(VecSet(dv_design, 0.0));
     } else {
       PetscCall(apply_h8_heaviside_sensitivity(
           eda, dc_phys, rho_filtered, mask, optimizer_options, current_beta,
