@@ -545,6 +545,18 @@ int main(int argc, char **argv) {
                                 nullptr));
   PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_use_mma",
                                 &optimizer_options.use_mma, nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_cell_ss_closure",
+                                &optimizer_options.cell_ss_draft_closure,
+                                nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_density_ss_closure",
+                                &optimizer_options.cell_ss_draft_closure,
+                                nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_no_draft",
+                                &optimizer_options.no_draft_traditional_simp,
+                                nullptr));
+  PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_traditional_simp",
+                                &optimizer_options.no_draft_traditional_simp,
+                                nullptr));
   PetscCall(PetscOptionsGetBool(nullptr, nullptr, "-opt_matlab_z_projection",
                                 &optimizer_options.matlab_z_projection,
                                 nullptr));
@@ -618,6 +630,17 @@ int main(int argc, char **argv) {
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-opt_checkpoint_prefix",
                                   optimizer_options.checkpoint_prefix,
                                   sizeof(optimizer_options.checkpoint_prefix), nullptr));
+  if (optimizer_options.cell_ss_draft_closure) {
+    optimizer_options.z_draft_closure = PETSC_TRUE;
+    optimizer_options.matlab_z_projection = PETSC_FALSE;
+    optimizer_options.projected_volume_correction = PETSC_TRUE;
+  }
+  if (optimizer_options.no_draft_traditional_simp) {
+    optimizer_options.z_draft_closure = PETSC_FALSE;
+    optimizer_options.matlab_z_projection = PETSC_FALSE;
+    optimizer_options.cell_ss_draft_closure = PETSC_FALSE;
+    optimizer_options.projected_volume_correction = PETSC_TRUE;
+  }
   PetscCall(PetscOptionsGetString(nullptr, nullptr, "-opt_vtk_file",
                                   opt_vtk_file, sizeof(opt_vtk_file),
                                   &has_opt_vtk_file));

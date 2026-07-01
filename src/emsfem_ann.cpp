@@ -993,6 +993,7 @@ PetscErrorCode create_fine_mask_and_density(DM fda,
                                             PetscInt sub_n,
                                             Vec *mask,
                                             Vec *rho) {
+  (void)opt;
   PetscScalar ***m = nullptr;
   PetscScalar ***r = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
@@ -1016,7 +1017,7 @@ PetscErrorCode create_fine_mask_and_density(DM fda,
           r[k][j][i] = 1.0;
         } else {
           m[k][j][i] = design ? 1.0 : 0.0;
-          r[k][j][i] = design ? opt.volfrac : density_options.void_density;
+          r[k][j][i] = design ? 1.0 : density_options.void_density;
         }
       }
     }

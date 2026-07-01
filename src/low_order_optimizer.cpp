@@ -43,6 +43,7 @@ PetscErrorCode create_mask_and_density(DM sda, const Grid &grid,
                                        const DensityOptions &density_options,
                                        const OptimizerOptions &opt,
                                        Vec *mask, Vec *rho) {
+  (void)opt;
   PetscScalar ***m = nullptr;
   PetscScalar ***r = nullptr;
   PetscInt xs = 0, ys = 0, zs = 0, xm = 0, ym = 0, zm = 0;
@@ -62,7 +63,7 @@ PetscErrorCode create_mask_and_density(DM sda, const Grid &grid,
                 ? PETSC_TRUE
                 : PETSC_FALSE;
         m[k][j][i] = in_design ? 1.0 : 0.0;
-        r[k][j][i] = in_design ? opt.volfrac : density_options.void_density;
+        r[k][j][i] = in_design ? 1.0 : density_options.void_density;
       }
     }
   }

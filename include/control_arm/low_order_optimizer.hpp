@@ -16,7 +16,9 @@ struct OptimizerOptions {
   PetscReal max_compliance_increase = 0.10;
   PetscBool stability_guard = PETSC_TRUE;
   PetscBool projected_volume_correction = PETSC_TRUE;
+  PetscBool no_draft_traditional_simp = PETSC_FALSE;
   PetscBool use_mma = PETSC_FALSE;
+  PetscBool cell_ss_draft_closure = PETSC_FALSE;
   PetscBool matlab_z_projection = PETSC_TRUE;
   PetscReal rho_min = 1.0e-3;
   PetscBool heaviside_projection = PETSC_FALSE;
