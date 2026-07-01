@@ -535,19 +535,9 @@ void compute_matlab_lk_h8(PetscReal nu, PetscReal *ke) {
   set_block(3, 2, K2, PETSC_FALSE);
   set_block(3, 3, K1, PETSC_TRUE);
 
-  // MATLAB initiMesh uses a y-reversed local node order for lk_H8.
-  // Reorder once into the C++ kernels' local node convention.
-  const PetscInt cpp_to_matlab_node[8] = {3, 2, 1, 0, 7, 6, 5, 4};
-  PetscInt cpp_to_matlab_dof[24]{};
-  for (PetscInt node = 0; node < 8; ++node) {
-    for (PetscInt d = 0; d < 3; ++d) {
-      cpp_to_matlab_dof[3 * node + d] = 3 * cpp_to_matlab_node[node] + d;
-    }
-  }
   for (PetscInt r = 0; r < 24; ++r) {
     for (PetscInt c = 0; c < 24; ++c) {
-      ke[24 * r + c] =
-          matlab_ke[24 * cpp_to_matlab_dof[r] + cpp_to_matlab_dof[c]];
+      ke[24 * r + c] = matlab_ke[24 * r + c];
     }
   }
 }
@@ -3066,17 +3056,20 @@ PetscErrorCode h8_mma_update_matlab_z(
     diag->xmma_values = xmma;
     diag->df0dx_values = df0dx;
     diag->dfdx_values = dfdx;
-    diag->x_change = 0.0;
+    diag->x_change = iter > 5 ? 0.0 : 1.0;
     const PetscInt n =
         static_cast<PetscInt>(PetscMin(x.size(), xmma.size()));
-    for (PetscInt q = 0; q < n; ++q) {
-      const std::size_t sid = static_cast<std::size_t>(q);
-      diag->x_change =
-          PetscMax(diag->x_change, PetscAbsReal(xmma[sid] - x[sid]));
+    if (iter > 5) {
+      for (PetscInt q = 0; q < n; ++q) {
+        const std::size_t sid = static_cast<std::size_t>(q);
+        diag->x_change =
+            PetscMax(diag->x_change, PetscAbsReal(xmma[sid] - x[sid]));
+      }
     }
   }
   PetscCall(write_h8_matlab_z_mma_variables(eda, mask, opt, xmma, rho_design,
                                             max_change));
+  if (iter <= 5 && max_change != nullptr) *max_change = 1.0;
   return 0;
 }
 
@@ -5897,6 +5890,7 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   Vec dc_filtered = nullptr, dc_design = nullptr;
   Vec dv_design = nullptr;
   Vec filter_denom = nullptr;
+  Vec matlab_vtk_u = nullptr, matlab_vtk_rho_phys = nullptr;
   Mat A = nullptr;
   Mat P = nullptr;
   KSP ksp = nullptr;
@@ -5983,6 +5977,8 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   }
   PetscCall(DMCreateGlobalVector(uda, &u));
   PetscCall(VecDuplicate(u, &b));
+  PetscCall(VecDuplicate(u, &matlab_vtk_u));
+  PetscCall(VecDuplicate(rho_phys, &matlab_vtk_rho_phys));
   PetscCall(DMCreateGlobalVector(eda, &dc_phys));
   PetscCall(VecDuplicate(dc_phys, &dc_preclosure));
   PetscCall(VecDuplicate(dc_phys, &dc_filtered));
@@ -6298,6 +6294,10 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
                                      include_fixed_solid_volume, dc_phys,
                                      &volume));
     if (matlab_z_projection) {
+      PetscCall(VecCopy(u, matlab_vtk_u));
+      PetscCall(VecCopy(rho_phys, matlab_vtk_rho_phys));
+    }
+    if (matlab_z_projection) {
       PetscCall(VecSet(dc_design, 0.0));
       PetscCall(VecSet(dv_design, 0.0));
     } else {
@@ -6556,7 +6556,11 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
     PetscCheck(node_count(grid) <= optimizer_options.vtk_max_points,
                PETSC_COMM_WORLD, PETSC_ERR_ARG_OUTOFRANGE,
                "H8 optimization VTK output exceeds -opt_vtk_max_points; disable -opt_write_final_vtk for production runs");
-    PetscCall(write_h8_opt_vtk(uda, eda, final_vtk_file, grid, u, rho_phys, mask));
+    PetscCall(write_h8_opt_vtk(uda, eda, final_vtk_file, grid,
+                               matlab_z_projection ? matlab_vtk_u : u,
+                               matlab_z_projection ? matlab_vtk_rho_phys
+                                                   : rho_phys,
+                               mask));
   } else if (optimizer_options.write_final_vtk && stopped_on_ksp_divergence) {
     PetscCall(PetscPrintf(PETSC_COMM_WORLD,
                           "Final VTK skipped because the last displacement field came from a divergent linear solve.\n"));
@@ -6576,6 +6580,8 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
   PetscCall(VecDestroy(&dc_preclosure));
   PetscCall(VecDestroy(&dc_phys));
   PetscCall(VecDestroy(&dv_design));
+  PetscCall(VecDestroy(&matlab_vtk_u));
+  PetscCall(VecDestroy(&matlab_vtk_rho_phys));
   PetscCall(VecDestroy(&b));
   PetscCall(VecDestroy(&u));
   PetscCall(VecDestroy(&filter_denom));
