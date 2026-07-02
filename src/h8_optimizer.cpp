@@ -155,16 +155,47 @@ PetscBool h8_is_c_support_node(PetscInt i, PetscInt j, PetscInt k,
       PetscSqrtReal((X - C[0]) * (X - C[0]) + (Y - C[1]) * (Y - C[1]));
   return (PetscAbsReal(rr - r) <= tol && PetscAbsReal(Z - C[2]) <= axial)
              ? PETSC_TRUE
+              : PETSC_FALSE;
+}
+
+PetscBool benchmark_is_cube_center(const char *benchmark_case) {
+  return (std::strcmp(benchmark_case, "cube_center") == 0 ||
+          std::strcmp(benchmark_case, "center_cube") == 0 ||
+          std::strcmp(benchmark_case, "plate_center") == 0 ||
+          std::strcmp(benchmark_case, "four_corner_cube") == 0 ||
+          std::strcmp(benchmark_case, "four_corner_plate") == 0)
+             ? PETSC_TRUE
              : PETSC_FALSE;
+}
+
+PetscInt h8_cube_center_support_span(const Grid &grid) {
+  const PetscInt ex = PetscMax(static_cast<PetscInt>(1), grid.nx - 1);
+  const PetscInt ey = PetscMax(static_cast<PetscInt>(1), grid.ny - 1);
+  const PetscInt ez = PetscMax(static_cast<PetscInt>(1), grid.nz - 1);
+  const PetscInt min_elem = PetscMin(PetscMin(ex, ey), ez);
+  return PetscMax(static_cast<PetscInt>(1),
+                  PetscMin(static_cast<PetscInt>(4), min_elem / 15));
+}
+
+PetscBool h8_is_cube_center_support_node(PetscInt i, PetscInt j, PetscInt k,
+                                         const Grid &grid) {
+  if (k != 0) return PETSC_FALSE;
+  const PetscInt span = h8_cube_center_support_span(grid);
+  const bool x_corner = (i <= span || i >= grid.nx - 1 - span);
+  const bool y_corner = (j <= span || j >= grid.ny - 1 - span);
+  return (x_corner && y_corner) ? PETSC_TRUE : PETSC_FALSE;
 }
 
 PetscBool h8_is_fixed_node(PetscInt i, PetscInt j, PetscInt k,
                             const Grid &grid,
                             const DensityOptions &options) {
   if (!options.use_control_arm_mask) {
+    if (benchmark_is_cube_center(options.benchmark_case)) {
+      return h8_is_cube_center_support_node(i, j, k, grid);
+    }
     if (std::strcmp(options.benchmark_case, "bridge") == 0) {
       return (k == 0 && (i == 0 || i == grid.nx - 1)) ? PETSC_TRUE
-                                                        : PETSC_FALSE;
+                                                         : PETSC_FALSE;
     }
     if (std::strcmp(options.benchmark_case, "tri") == 0) {
       const bool left_lower_corner = (i == 0 && j == 0 && k == 0);
@@ -233,6 +264,7 @@ PetscBool benchmark_is_cantilever(const char *benchmark_case) {
 
 PetscBool benchmark_has_matlab_load_elements(const char *benchmark_case) {
   return (benchmark_is_cantilever(benchmark_case) ||
+          benchmark_is_cube_center(benchmark_case) ||
           benchmark_is_bridge(benchmark_case) ||
           benchmark_is_mbb(benchmark_case) ||
           benchmark_is_tri(benchmark_case) ||
@@ -307,7 +339,7 @@ PetscBool h8_cell_has_ab_load_node(PetscInt ex, PetscInt ey, PetscInt ez,
 }
 
 PetscBool h8_cell_has_spring_load_node(PetscInt ex, PetscInt ey, PetscInt ez,
-                                       const Grid &grid) {
+                                        const Grid &grid) {
   for (PetscInt node = 0; node < 8; ++node) {
     PetscInt i = 0, j = 0, k = 0;
     h8_node_coords(ex, ey, ez, node, &i, &j, &k);
@@ -357,6 +389,24 @@ PetscBool h8_cell_is_forced_solid(PetscInt i, PetscInt j, PetscInt k,
     const PetscInt ey = grid.ny - 1;
     const PetscInt ez = grid.nz - 1;
     if (ex <= 0 || ey <= 0 || ez <= 0) return PETSC_FALSE;
+    if (benchmark_is_cube_center(opt.benchmark_case)) {
+      const PetscInt support_span = h8_cube_center_support_span(grid);
+      const bool x_corner =
+          (i < support_span || i >= ex - support_span);
+      const bool y_corner =
+          (j < support_span || j >= ey - support_span);
+      const bool support_cell = (k < support_span && x_corner && y_corner);
+      const PetscInt mid_i = ex / 2;
+      const PetscInt lower_i = PetscMax(static_cast<PetscInt>(0), mid_i - 1);
+      const PetscInt upper_i = PetscMin(ex - 1, mid_i);
+      const PetscInt mid_j = ey / 2;
+      const PetscInt lower_j = PetscMax(static_cast<PetscInt>(0), mid_j - 1);
+      const PetscInt upper_j = PetscMin(ey - 1, mid_j);
+      const bool load_cell = (k == ez - 1 &&
+                              (i == lower_i || i == upper_i) &&
+                              (j == lower_j || j == upper_j));
+      return (support_cell || load_cell) ? PETSC_TRUE : PETSC_FALSE;
+    }
     if (benchmark_is_bridge(opt.benchmark_case)) {
       return k == ez - 1 ? PETSC_TRUE : PETSC_FALSE;
     }
@@ -4437,12 +4487,18 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
   const PetscBool bridge = benchmark_is_bridge(optimizer_options.benchmark_case);
   const PetscBool mbb = benchmark_is_mbb(optimizer_options.benchmark_case);
   const PetscBool tri = benchmark_is_tri(optimizer_options.benchmark_case);
+  const PetscBool cube_center =
+      benchmark_is_cube_center(optimizer_options.benchmark_case);
   const PetscBool bottom_point =
       benchmark_is_bottom_point_cantilever(optimizer_options.benchmark_case);
   const PetscBool tip_center =
       benchmark_is_tip_center_cantilever(optimizer_options.benchmark_case);
+  const PetscInt load_i0 = PetscMax(static_cast<PetscInt>(0), (grid.nx - 1) / 2);
+  const PetscInt load_i1 = PetscMax(static_cast<PetscInt>(0), grid.nx / 2);
   const PetscInt load_j0 = PetscMax(static_cast<PetscInt>(0), (grid.ny - 1) / 2);
   const PetscInt load_j1 = PetscMax(static_cast<PetscInt>(0), grid.ny / 2);
+  const PetscInt cube_center_load_nodes =
+      ((load_i0 == load_i1) ? 1 : 2) * ((load_j0 == load_j1) ? 1 : 2);
   const PetscInt cantilever_load_nodes = (load_j0 == load_j1) ? 1 : 2;
   const PetscInt load_k0 = PetscMax(static_cast<PetscInt>(0), (grid.nz - 1) / 2);
   const PetscInt load_k1 = PetscMax(static_cast<PetscInt>(0), grid.nz / 2);
@@ -4451,10 +4507,10 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
   const PetscInt matlab_load_k =
       PetscMax(static_cast<PetscInt>(0), (grid.nz - 1) / 2);
 
-  PetscCheck(torsion || torsion_edge || bridge || mbb || tri ||
+  PetscCheck(torsion || torsion_edge || bridge || mbb || tri || cube_center ||
                  benchmark_is_cantilever(optimizer_options.benchmark_case),
-             PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
-             "-benchmark_case must be cantilever, cant, bottom_point, tip_center, bridge, mbb, tri, torsion, or torsion_edge");
+              PETSC_COMM_WORLD, PETSC_ERR_ARG_WRONG,
+              "-benchmark_case must be cantilever, cant, bottom_point, tip_center, cube_center, bridge, mbb, tri, torsion, or torsion_edge");
 
   PetscCall(VecSet(b, 0.0));
   PetscCall(DMDAGetCorners(uda, &xs, &ys, &zs, &xm, &ym, &zm));
@@ -4506,6 +4562,16 @@ PetscErrorCode fill_h8_benchmark_load(DM uda, const Grid &grid,
           if (i != 0 || j != grid.ny - 1 || k != grid.nz - 1) continue;
           bg[k][j][i][0] += -optimizer_options.load;
           bg[k][j][i][1] += -optimizer_options.load;
+        } else if (cube_center) {
+          // Four-corner-supported cube benchmark: concentrated -Z load at the
+          // top-face center node(s), split evenly when the center falls between
+          // nodes.
+          if (k != grid.nz - 1) continue;
+          if ((i != load_i0 && i != load_i1) ||
+              (j != load_j0 && j != load_j1)) continue;
+          bg[k][j][i][2] +=
+              -optimizer_options.load /
+              static_cast<PetscReal>(cube_center_load_nodes);
         } else if (torsion || torsion_edge) {
           if (i != grid.nx - 1) continue;
           if (torsion_edge &&
@@ -6118,6 +6184,14 @@ PetscErrorCode run_h8_optimizer(const Grid &grid,
       PetscCall(PetscPrintf(
           PETSC_COMM_WORLD,
           "H8 rectangular benchmark: case=tri, fixed nodes match MATLAB [1,nely+1,(nely+1)*(nelx+1)], z-top y-high x-left corner loaded in -x/-y; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.z_draft_closure ? "true" : "false",
+          optimizer_options.draft_axes,
+          static_cast<double>(optimizer_options.z_draft_eta)));
+    } else if (benchmark_is_cube_center(optimizer_options.benchmark_case)) {
+      PetscCall(PetscPrintf(
+          PETSC_COMM_WORLD,
+          "H8 rectangular benchmark: case=%s, bottom four corner support patches fixed, top-face center point loaded in -Z; draft_closure=%s axes=%s eta=%g\n",
+          optimizer_options.benchmark_case,
           optimizer_options.z_draft_closure ? "true" : "false",
           optimizer_options.draft_axes,
           static_cast<double>(optimizer_options.z_draft_eta)));
